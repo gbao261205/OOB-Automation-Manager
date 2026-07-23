@@ -302,8 +302,8 @@ def print_options(options: dict):
 # Vong lap thu thap (Chay tren Terminal Daemon)
 # ---------------------------------------------------------------------------
 
-def input_with_timeout(prompt_text: str, timeout: int = 5) -> str:
-    """Hàm lấy input có giới hạn thời gian, hỗ trợ cả Windows và Linux/WSL2."""
+def input_with_timeout(prompt_text: str, timeout: int = 5):
+    """Hàm lấy input có giới hạn thời gian, trả về str nếu có nhập, hoặc None nếu timeout."""
     _con.print(prompt_text, end="")
     
     if platform.system() == "Windows":
@@ -317,18 +317,17 @@ def input_with_timeout(prompt_text: str, timeout: int = 5) -> str:
                     print()
                     return input_str
                 input_str += char
-            time.sleep(0.05) # Tránh ngốn CPU
-        print() # Xuống dòng khi hết thời gian
-        return ""
+            time.sleep(0.05)
+        print() 
+        return None  # Đổi thành None
     else:
         import select
-        # Chờ dữ liệu từ stdin trong tối đa 'timeout' giây (Linux/macOS)
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
         if ready:
             return sys.stdin.readline().strip()
         else:
             print()
-            return ""
+            return None 
 
 def run_daemon(cfg):
     """Vong lap giam sat chay truc tiep tren luong chinh cua Terminal 2."""
@@ -345,8 +344,14 @@ def run_daemon(cfg):
             hosts = load_ip_list(cfg["ip_list"])
             if not hosts:
                 _mprint("[yellow][!][/] Danh sach IP trong. Doi them thiet bi...")
-                time.sleep(cfg["interval"])
-                continue
+                # Thay vì dùng time.sleep cứng ngắc, ta dùng input_with_timeout
+            	prompt_skip = f"[dim][zzz] Dang cho {cfg['interval']}s... (An Enter de quet luon)[/]: "
+            	skip_cmd = input_with_timeout(prompt_skip, timeout=cfg["interval"])
+            
+            	# Nếu skip_cmd trả về chuỗi (nghĩa là user có ấn Enter, không bị timeout)
+            	if skip_cmd is not None:
+                	_mprint("[*] Da bo qua thoi gian cho. Tien hanh quet ngay lap tuc!")
+                	continue
 
             for ip, alias in hosts:
                 _mprint(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
@@ -378,7 +383,7 @@ def run_daemon(cfg):
                     # Đã thay _con.input bằng input_with_timeout
                     prompt_msg = f"  Xac nhan day la CHUAN cho {alias}? (y/N) [Bo qua sau 5s]: "
                     ans_raw = input_with_timeout(prompt_msg, timeout=5)
-                    ans = ans_raw.strip().lower() if ans_raw else ""
+					ans = ans_raw.strip().lower() if ans_raw is not None else ""
                     
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
@@ -484,6 +489,82 @@ def search_device(cfg):
         pt = entry.get("port", 22 if pr == "ssh" else 23)
         _con.print(f"    [cyan]→[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [[bold cyan]{key}[/]] {entry.get('description', '')} [dim]→ {pr}://{entry['ip']}:{pt}[/]")
 
+# ---------------------------------------------------------------------------
+# Quet theo chi dinh (Terminal 1)
+# ---------------------------------------------------------------------------
+def scan_specific_devices(cfg):
+    targets_input = _con.input("  [cyan]Nhap IP hoac Alias can quet (cach nhau dau phay)[/]: ").strip()
+    if not targets_input:
+        return
+
+    # Tách chuỗi người dùng nhập thành list
+    target_list = [t.strip().lower() for t in targets_input.split(",")]
+    all_hosts = load_ip_list(cfg["ip_list"])
+    
+    # Lọc ra các thiết bị khớp IP hoặc Alias
+    hosts_to_scan = []
+    for ip, alias in all_hosts:
+        if ip.lower() in target_list or alias.lower() in target_list:
+            hosts_to_scan.append((ip, alias))
+
+    if not hosts_to_scan:
+        _con.print("  [yellow][!][/] Khong co IP/Alias nao khop voi danh sach 'oob_ips.txt'.")
+        return
+
+    _con.print(f"\n  [green][*] Bat dau quet tuc thi {len(hosts_to_scan)} thiet bi...[/]")
+    
+    for ip, alias in hosts_to_scan:
+        _con.print(f"\n  [cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
+        try:
+            hostname, menu_name, snapshot = poll_host(
+                ip, cfg["telnet_port"], cfg["username"], cfg["password"],
+                cfg["enable_password"], menu_name=cfg.get("menu_name_override") or None,
+                ssh_port=cfg.get("ssh_port", 22),
+            )
+        except Exception as exc:
+            _con.print(f"  [red][LOI][/] {alias} ({ip}): {exc}")
+            continue
+
+        hn_label = f"hostname=[bold]{hostname}[/]" if hostname else "hostname=?"
+        menu_n   = len(snapshot)
+
+        if not menu_name or not snapshot:
+            _con.print(f"  [yellow][!][/] {alias}: Khong parse duoc menu hop le tren thiet bi.")
+            continue
+
+        save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
+        _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+
+        if baseline is None:
+            _con.print(f"  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
+            _con.print(f"      {hn_label} | {menu_n} option:")
+            print_options(snapshot)
+            ans = _con.input(f"  Xac nhan day la CHUAN cho {alias}? (y/N): ").strip().lower()
+            if ans == "y":
+                save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
+                _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
+            else:
+                _con.print("  [dim][--] Bo qua.[/]")
+            continue
+
+        if options_equal(baseline, snapshot):
+            _con.print(f"  [green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
+            continue
+
+        _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
+        print_diff(baseline, snapshot)
+        _con.print("  [dim]--- Baseline (chuan) ---[/]")
+        print_options(baseline)
+        _con.print("  [yellow]--- Hien tai tren thiet bi ---[/]")
+        print_options(snapshot)
+        
+        # Ở Menu Quản lý thì dùng _con.input bình thường, chờ xác nhận thoải mái không cần timeout
+        ans = _con.input(f"  Cap nhat baseline theo trang thai hien tai cua {alias}? (y/N): ").strip().lower()
+        if ans == "y":
+            save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
+            _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
+        else:
+            _con.print(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}.")
 
 # ---------------------------------------------------------------------------
 # Man hinh Quan ly (Terminal 1)
@@ -507,6 +588,7 @@ def _show_menu(cfg):
     grid.add_row("[4]", "Xem danh sach thiet bi")
     grid.add_row("[5]", "Xem baseline (Chuan)")
     grid.add_row("[6]", "Tim kiem thiet bi")
+	grid.add_row("[7]", "[bold green]Quet kiem tra tuc thi (Chi dinh IP/Ten)[/]")
     grid.add_row("", "")
     grid.add_row("[0]", "[bold red]Thoat[/]")
 
@@ -543,6 +625,8 @@ def main_menu(cfg, config_path):
             view_baseline(cfg)
         elif choice == "6":
             search_device(cfg)
+		elif choice == "7":
+            scan_specific_devices(cfg)
         elif choice == "0":
             _con.print("\n[dim]Tam biet.[/]")
             sys.exit(0)
