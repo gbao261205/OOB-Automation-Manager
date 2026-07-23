@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "ssh_port": 22,
     "telnet_port": 23,
     "interval": 30,
+    "verify_interval": 3600,  # Mac dinh 1 tieng check vat ly 1 lan
     "ip_list": "oob_ips.txt",
     "baseline_db": "baseline.db",
     "snapshot_db": "snapshot.db",
@@ -121,6 +122,7 @@ def settings_menu(cfg, config_path):
 5. SSH port (uu tien)   : {cfg.get('ssh_port', 22)}
 6. Telnet port (du phong): {cfg['telnet_port']}
 7. Chu ky thu thap (s)  : {cfg['interval']}
+v. Chu ky Verify vat ly (s): {cfg.get('verify_interval', 3600)}
 8. File danh sach IP    : {cfg['ip_list']}
 9. File baseline DB     : {cfg['baseline_db']}
 a. File snapshot DB     : {cfg['snapshot_db']}
@@ -147,6 +149,9 @@ a. File snapshot DB     : {cfg['snapshot_db']}
         elif choice == "7":
             val = input(f"  Chu ky thu thap, giay (hien tai: {cfg['interval']}): ").strip()
             if val.isdigit(): cfg["interval"] = int(val)
+        elif choice == "v":
+            val = input(f"  Chu ky Verify vat ly, giay (hien tai: {cfg.get('verify_interval', 3600)}): ").strip()
+            if val.isdigit(): cfg["verify_interval"] = int(val)
         elif choice == "8":
             val = input(f"  File danh sach IP moi: ").strip()
             if val: cfg["ip_list"] = val
@@ -325,7 +330,7 @@ def print_options(options: dict):
 
 
 # ---------------------------------------------------------------------------
-# Module Deep Verify (Background Thread)
+# Module Deep Verify (Background Thread Độc lập)
 # ---------------------------------------------------------------------------
 
 def extract_hostname(output: str) -> str:
@@ -339,10 +344,9 @@ def extract_hostname(output: str) -> str:
     return None
 
 def run_deep_verify(alias, options):
-    """Tiến trình ngầm để verify thiết bị vật lý đầu cuối và lưu file log."""
+    """Thực thi verify vật lý cho 1 thiết bị OOB và xuất log."""
     log_verify(f"[*] Bat dau kiem tra vat ly thiet bi cho OOB: [bold]{alias}[/]")
     
-    # Chuẩn bị file log
     os.makedirs("verify-logs", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
@@ -397,13 +401,35 @@ def run_deep_verify(alias, options):
     log_lines.append(f"-----------------------------------------")
     log_lines.append(f"HOAN THANH KET XUAT LOG.\n")
     
-    # Ghi file log
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
+def run_verify_daemon(cfg):
+    """Tiến trình Daemon thứ 2 chuyên lặp lịch Deep Verify độc lập."""
+    verify_interval = cfg.get("verify_interval", 3600)
+    log_verify(f"[green][START][/] Khoi dong chu ky Verify vat ly moi {verify_interval}s.")
+    
+    # Cho đợt chạy đầu tiên đợi 15s để luồng cấu hình kịp tạo Baseline mới nếu cần
+    time.sleep(15)
+    
+    while True:
+        hosts = load_ip_list(cfg["ip_list"])
+        if not hosts:
+            time.sleep(verify_interval)
+            continue
+            
+        for ip, alias in hosts:
+            # Lấy baseline hiện tại từ DB để lấy IP/Port đem đi quét vật lý
+            _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+            if baseline:
+                run_deep_verify(alias, baseline)
+                
+        log_verify(f"[dim][zzz] Dang cho {verify_interval}s cho dot Verify tiep theo...[/]")
+        time.sleep(verify_interval)
+
 
 # ---------------------------------------------------------------------------
-# Vòng lặp giám sát (Chạy trên Terminal Daemon)
+# Vòng lặp giám sát Cấu hình (Terminal Daemon)
 # ---------------------------------------------------------------------------
 
 def input_with_timeout(prompt_text: str, timeout: int = 5):
@@ -442,9 +468,12 @@ def run_daemon(cfg):
 
     update_ui()
     
+    # Bắn luồng Verify Độc lập chạy ngầm phía dưới
+    threading.Thread(target=run_verify_daemon, args=(cfg,), daemon=True).start()
+    
     with Live(layout, refresh_per_second=4, screen=False) as live:
         _live_ui = live
-        log_oob(f"[green][START][/] Khoi dong chu ky {cfg['interval']}s.")
+        log_oob(f"[green][START][/] Khoi dong chu ky Config moi {cfg['interval']}s.")
         
         try:
             while True:
@@ -490,7 +519,6 @@ def run_daemon(cfg):
                         if ans == "y":
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
-                            threading.Thread(target=run_deep_verify, args=(alias, snapshot), daemon=True).start()
                         else:
                             _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
                             
@@ -499,7 +527,6 @@ def run_daemon(cfg):
 
                     if options_equal(baseline, snapshot):
                         log_oob(f"[green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
-                        threading.Thread(target=run_deep_verify, args=(alias, baseline), daemon=True).start()
                         continue
 
                     live.stop()
@@ -517,7 +544,6 @@ def run_daemon(cfg):
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
-                        threading.Thread(target=run_deep_verify, args=(alias, snapshot), daemon=True).start()
                     else:
                         _con.print(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
                     
@@ -548,7 +574,6 @@ def view_latest_verify_log():
         _con.print("\n  [yellow][!][/] Thu muc 'verify-logs' dang trong.")
         return
         
-    # Lấy file mới nhất dựa trên thời gian sửa đổi (Modified Time)
     latest_file = max(files, key=os.path.getmtime)
     
     try:
@@ -565,7 +590,6 @@ def view_latest_verify_log():
     except Exception as e:
         _con.print(f"  [red][LOI][/] Khong doc duoc file {latest_file}: {e}")
 
-# ... (Các hàm list_devices, view_baseline, search_device, scan_specific_devices giữ nguyên)
 def list_devices(cfg):
     hosts = load_ip_list(cfg["ip_list"])
     if not hosts:
