@@ -302,6 +302,34 @@ def print_options(options: dict):
 # Vong lap thu thap (Chay tren Terminal Daemon)
 # ---------------------------------------------------------------------------
 
+def input_with_timeout(prompt_text: str, timeout: int = 5) -> str:
+    """Hàm lấy input có giới hạn thời gian, hỗ trợ cả Windows và Linux/WSL2."""
+    _con.print(prompt_text, end="")
+    
+    if platform.system() == "Windows":
+        import msvcrt
+        start_time = time.time()
+        input_str = ""
+        while time.time() - start_time < timeout:
+            if msvcrt.kbhit():
+                char = msvcrt.getwche()
+                if char in ('\r', '\n'):
+                    print()
+                    return input_str
+                input_str += char
+            time.sleep(0.05) # Tránh ngốn CPU
+        print() # Xuống dòng khi hết thời gian
+        return ""
+    else:
+        import select
+        # Chờ dữ liệu từ stdin trong tối đa 'timeout' giây (Linux/macOS)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            return sys.stdin.readline().strip()
+        else:
+            print()
+            return ""
+
 def run_daemon(cfg):
     """Vong lap giam sat chay truc tiep tren luong chinh cua Terminal 2."""
     _con.print(Panel("[bold green]OOB MONITOR DAEMON[/]\n[dim]Dang giam sat lien tuc. Nhan Ctrl+C de dung.[/]", border_style="green"))
@@ -342,9 +370,6 @@ def run_daemon(cfg):
                 save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
                 _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
 
-                # ========================================================
-                # FIX: Thay [y/N] thanh (y/N) de rich khong hieu nham la tag
-                # ========================================================
                 if baseline is None:
                     _con.print(f"\n  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
                     _con.print(f"      {hn_label} | {menu_n} option:")
@@ -367,13 +392,18 @@ def run_daemon(cfg):
                 print_options(baseline)
                 _con.print("  [yellow]--- Hien tai tren thiet bi ---[/]")
                 print_options(snapshot)
-                ans = _con.input(f"  Cap nhat baseline theo trang thai hien tai cua {alias}? (y/N): ").strip().lower()
+                
+                # Gọi hàm có timeout 5 giây
+                prompt_msg = f"  Cap nhat baseline theo hien tai cua {alias}? (y/N) [Bo qua sau 5s]: "
+                ans_raw = input_with_timeout(prompt_msg, timeout=5)
+                ans = ans_raw.strip().lower() if ans_raw else ""
 
                 if ans == "y":
                     save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                     _mprint(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
                 else:
-                    _mprint(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}.")
+                    # Nếu user gõ n, hoặc quá 5s (ans = "") thì báo giữ nguyên
+                    _mprint(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
 
             _mprint(f"[dim][zzz] Dang cho {cfg['interval']}s...[/]")
             time.sleep(cfg["interval"])
@@ -473,7 +503,7 @@ def _show_menu(cfg):
     grid.add_row("[5]", "Xem baseline (Chuan)")
     grid.add_row("[6]", "Tim kiem thiet bi")
     grid.add_row("", "")
-    grid.add_row("[q]", "[bold red]Thoat[/]")
+    grid.add_row("[0]", "[bold red]Thoat[/]")
 
     _con.print()
     _con.print(Panel(
@@ -508,7 +538,7 @@ def main_menu(cfg, config_path):
             view_baseline(cfg)
         elif choice == "6":
             search_device(cfg)
-        elif choice == "q":
+        elif choice == "0":
             _con.print("\n[dim]Tam biet.[/]")
             sys.exit(0)
         else:
