@@ -2,15 +2,17 @@
 """
 oob_monitor.py
 
-Cong cu quan ly va giam sat menu OOB tren nhieu thiet bi (R0, R0-2, ...).
+Cong cu giam sat (READ-ONLY) menu OOB tren nhieu thiet bi (R0, R0-2, ...).
+Chi doc du lieu tu thiet bi de doi chieu voi baseline; KHONG sua/day cau hinh
+nguoc lai thiet bi trong bat ky truong hop nao.
 
 Chi can chay:
     python3 oob_monitor.py
 
 Khong can truyen tham so dong lenh nao. Toan bo cau hinh (username,
-password, enable password, ten menu, chu ky thu thap, duong dan file
-danh sach IP / database ...) duoc luu trong 1 file JSON (mac dinh
-"oob_config.json") va co the chinh sua ngay trong menu (lua chon 4).
+password, enable password, ten menu ep dung (neu co), chu ky thu thap,
+duong dan file danh sach IP / database ...) duoc luu trong 1 file JSON
+(mac dinh "oob_config.json") va co the chinh sua ngay trong menu (lua chon 4).
 
 Man hinh chinh:
     1. Them IP thiet bi OOB vao danh sach
@@ -23,16 +25,16 @@ Man hinh chinh:
     q. Thoat
 
 Vong thu thap (lua chon 3): moi N giay (mac dinh 30s), voi tung IP trong
-danh sach: telnet vao, lay + parse cau hinh "menu <menu_name>", luu vao
-"snapshot.db" (db thu 2), roi so sanh voi "baseline.db" (db thu 1 - chuan):
+danh sach: dang nhap, tu dong do ten menu + lay cau hinh menu bang
+"show running-config | include menu" (chi doc), luu vao "snapshot.db"
+(db thu 2), roi so sanh voi "baseline.db" (db thu 1 - chuan):
     - Chua co baseline cho thiet bi  -> dung lai, hien du lieu vua lay,
       hoi admin co xac nhan lam CHUAN khong.
-    - Snapshot == baseline            -> bo qua, sang thiet bi tiep theo.
-    - Snapshot != baseline            -> canh bao chi tiet (option nao bi
-      them la, bi mat, hay bi doi noi dung), hoi admin:
-        * Xac nhan la CHUAN MOI  -> ghi de baseline bang snapshot.
-        * Khong phai             -> day lai cau hinh len thiet bi dung
-                                     nhu baseline (bao gom xoa option la).
+    - Snapshot == baseline            -> bao KHOP chuan, sang thiet bi tiep theo.
+    - Snapshot != baseline            -> CANH BAO chi tiet (option nao bi
+      them la, bi mat, hay bi doi noi dung) va hoi admin co muon cap nhat
+      baseline theo trang thai hien tai khong. Neu khong, chi ghi nhan canh
+      bao va giu nguyen baseline cu - KHONG sua gi tren thiet bi.
 """
 
 import getpass
@@ -51,7 +53,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from oob_lib import poll_host, push_menu_config
+from oob_lib import poll_host
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
 
@@ -478,7 +480,7 @@ def monitor_loop(cfg, stop_event: threading.Event):
                 # [VERIFY - TAM THOI TAT] check_option_hostnames(alias, snapshot, cfg)
                 continue
 
-            # Phat hien thay doi
+            # Phat hien thay doi -> chi canh bao va bao cao, KHONG tu dong sua thiet bi
             with _print_lock:
                 _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
                 print_diff(baseline, snapshot)
@@ -486,25 +488,16 @@ def monitor_loop(cfg, stop_event: threading.Event):
                 print_options(baseline)
                 _con.print("  [yellow]--- Hien tai tren thiet bi ---[/]")
                 print_options(snapshot)
-                ans = _con.input(f"  Day la CHUAN MOI cho {alias}? [y=cap nhat / n=khoi phuc]: ").strip().lower()
+                ans = _con.input(
+                    f"  Cap nhat baseline theo trang thai hien tai cua {alias}? [y/N]: "
+                ).strip().lower()
 
             if ans == "y":
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 _mprint(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
             else:
-                _mprint(f"  [blue][>>][/] Dang khoi phuc menu tren {alias} ve baseline ...")
-                try:
-                    push_menu_config(
-                        ip, cfg["telnet_port"], cfg["username"], cfg["password"],
-                        cfg["enable_password"], menu_name, baseline,
-                        current_options=snapshot,
-                        ssh_port=cfg.get("ssh_port", 22),
-                    )
-                    _mprint(f"  [green][OK][/] Da khoi phuc {alias} ve baseline.")
-                except Exception as exc:
-                    _mprint(f"  [red][LOI][/] Khoi phuc that bai tren {ip}: {exc}")
-
-            # [VERIFY - TAM THOI TAT] check_option_hostnames(alias, snapshot, cfg)
+                _mprint(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}. "
+                        f"Thiet bi VAN DANG khac chuan - se canh bao lai o chu ky sau.")
 
         if not stop_event.is_set():
             _mprint(f"[dim][zzz] Cho {cfg['interval']}s ...[/]")

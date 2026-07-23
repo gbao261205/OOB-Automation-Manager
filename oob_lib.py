@@ -2,13 +2,14 @@
 oob_lib.py
 
 Thu vien dung chung: ket noi SSH (uu tien) hoac Telnet (du phong) toi thiet bi
-Cisco IOS, dang nhap, lay va parse cau hinh "menu OOB_MENU", va day (push) lai
-cau hinh menu de khoi phuc ve mot trang thai da luu truoc do.
+Cisco IOS, dang nhap, lay va parse cau hinh "menu OOB_MENU" de doi chieu (verify)
+voi baseline da luu. CHI DOC (read-only) - khong con chuc nang day/sua cau hinh
+nguoc lai thiet bi.
 
 Tat ca ket noi deu dung connect_auto():
     - Thu SSH truoc (paramiko) -> neu that bai -> fallback Telnet (MiniTelnet).
     - MiniSSH va MiniTelnet co cung interface (read_until / write / close) nen
-      cac ham ben tren (fetch_hostname, detect_and_fetch_menu, push_menu_config, ...)
+      cac ham ben tren (fetch_hostname, detect_and_fetch_menu, ...)
       khong can biet dang dung protocol nao.
 
 Phu thuoc ben ngoai:
@@ -451,52 +452,6 @@ def poll_host(host, telnet_port, username, password, enable_password,
             pass
         tn.close()
 
-
-
-def push_menu_config(host, telnet_port, username, password, enable_password,
-                     menu_name, baseline_options, current_options=None,
-                     ssh_port=22, timeout=10):
-    """Day lai cau hinh 'menu <menu_name> text/command ...' theo dung 'baseline_options'
-    (dict giong parse_menu tra ve) de khoi phuc thiet bi ve trang thai chuan da luu.
-
-    Neu 'current_options' duoc truyen vao (du lieu dang thuc te tren thiet bi), cac
-    option ton tai trong current_options nhung KHONG co trong baseline_options ("option
-    la") se bi xoa bang lenh 'no menu ... text/command <key>' truoc khi ghi lai baseline.
-    """
-    tn = connect_auto(host, ssh_port, telnet_port,
-                      username, password, enable_password, timeout=timeout)
-    try:
-        tn.write("configure terminal")
-        tn.read_until("(config)#", timeout=8)
-
-        if current_options:
-            extra_keys = [k for k in current_options if k not in baseline_options]
-            for key in extra_keys:
-                tn.write(f"no menu {menu_name} command {key}")
-                tn.read_until("(config)#", timeout=5)
-                tn.write(f"no menu {menu_name} text {key}")
-                tn.read_until("(config)#", timeout=5)
-
-        for key, entry in baseline_options.items():
-            proto = entry.get("protocol", "telnet")
-            tn.write(f"menu {menu_name} text {key} {entry.get('description', '')}")
-            tn.read_until("(config)#", timeout=5)
-            if proto == "ssh":
-                # Day lai lenh ssh -l <username> <ip> (port SSH mac dinh la 22)
-                tn.write(f"menu {menu_name} command {key} ssh -l {username} {entry['ip']}")
-            else:
-                tn.write(f"menu {menu_name} command {key} telnet {entry['ip']} {entry.get('port', 23)}")
-            tn.read_until("(config)#", timeout=5)
-        tn.write("end")
-        tn.read_until("#", timeout=5)
-        tn.write("write memory")
-        tn.read_until("#", timeout=10)
-    finally:
-        try:
-            tn.write("exit")
-        except OSError:
-            pass
-        tn.close()
 
 
 def fetch_hostname_via_auto(host, ssh_port, telnet_port,
