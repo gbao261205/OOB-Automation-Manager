@@ -373,19 +373,24 @@ def parse_menu(output: str, menu_name: str) -> dict:
     Bo qua option khong co IP dich (vi du 'q'/menu-exit/resume).
     Ho tro ca lenh telnet lan ssh trong menu."""
     options = {}
+    
+    # Hàm con để làm sạch key (biến "[3]" thành "3")
+    def clean_key(raw_key: str) -> str:
+        return re.sub(r'\W+', '', raw_key)
+        
     for raw_line in output.splitlines():
         line = raw_line.strip()
 
         m = TEXT_RE.match(line)
         if m and m.group(1) == menu_name:
-            key = m.group(2)
+            key = clean_key(m.group(2))
             options.setdefault(key, {})["description"] = m.group(3).strip()
             continue
 
         # Thu telnet truoc
         m = CMD_TELNET_RE.match(line)
         if m and m.group(1) == menu_name:
-            key   = m.group(2)
+            key   = clean_key(m.group(2))
             entry = options.setdefault(key, {})
             entry["ip"]       = m.group(3)
             entry["port"]     = int(m.group(4)) if m.group(4) else 23
@@ -395,7 +400,7 @@ def parse_menu(output: str, menu_name: str) -> dict:
         # Thu ssh
         m = CMD_SSH_RE.match(line)
         if m and m.group(1) == menu_name:
-            key   = m.group(2)
+            key   = clean_key(m.group(2))
             entry = options.setdefault(key, {})
             entry["ip"]       = m.group(3)
             entry["port"]     = int(m.group(4)) if m.group(4) else 22
