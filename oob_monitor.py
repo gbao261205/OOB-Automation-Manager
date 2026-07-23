@@ -16,7 +16,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+import re
+import threading
 from datetime import datetime
+from collections import deque
 
 from rich import box as rbox
 from rich.console import Console, Group
@@ -24,8 +27,11 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+from rich.layout import Layout
+from rich.live import Live
 
-from oob_lib import poll_host
+# Nạp MiniTelnet từ thư viện của bạn để thực hiện Deep Verify
+from oob_lib import poll_host, MiniTelnet
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
 
@@ -43,18 +49,47 @@ DEFAULT_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
-# Rich console
+# Hệ thống UI đa luồng (Chia đôi màn hình)
 # ---------------------------------------------------------------------------
 
 _con = Console(highlight=False)
 
-def _mprint(msg: str = "", **kwargs):
-    """In log voi timestamp dung cho trinh giam sat (Daemon)."""
+MAX_LOG = 15
+oob_logs = deque(maxlen=MAX_LOG)
+verify_logs = deque(maxlen=MAX_LOG)
+ui_lock = threading.Lock()
+
+# Bố cục màn hình
+layout = Layout()
+layout.split_column(
+    Layout(name="upper"),
+    Layout(name="lower")
+)
+
+_live_ui = None
+
+def update_ui():
+    """Cập nhật dữ liệu vào 2 khung panel."""
+    with ui_lock:
+        layout["upper"].update(Panel(Text.from_markup("\n".join(oob_logs)), title="[bold cyan]🔍 OOB MONITORING (Cấu hình)[/]", border_style="cyan"))
+        layout["lower"].update(Panel(Text.from_markup("\n".join(verify_logs)), title="[bold magenta]⚡ DEEP VERIFY (Thiết bị cuối)[/]", border_style="magenta"))
+        if _live_ui and _live_ui.is_started:
+            _live_ui.update(layout)
+
+def log_oob(msg: str):
+    """Ghi log cho nửa trên màn hình (Daemon cấu hình)."""
     ts = datetime.now().strftime("%H:%M:%S")
-    _con.print(f"[dim]\\[{ts}][/] {msg}", **kwargs)
+    oob_logs.append(f"[dim]\\[{ts}][/] {msg}")
+    update_ui()
+
+def log_verify(msg: str):
+    """Ghi log cho nửa dưới màn hình (Verify vật lý)."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    verify_logs.append(f"[dim]\\[{ts}][/] {msg}")
+    update_ui()
 
 # ---------------------------------------------------------------------------
-# Cau hinh (luu trong file JSON)
+# Các hàm tiện ích, cấu hình và Database (Giữ nguyên logic của bạn)
 # ---------------------------------------------------------------------------
 
 def load_config(path):
@@ -132,10 +167,6 @@ a. File snapshot DB     : {cfg['snapshot_db']}
         save_config(config_path, cfg)
 
 
-# ---------------------------------------------------------------------------
-# Quan ly danh sach IP (text file)
-# ---------------------------------------------------------------------------
-
 def load_ip_list(path):
     hosts = []
     try:
@@ -172,10 +203,6 @@ def remove_ip(path, ip):
             f.write(f"{h_ip} {alias}\n")
     _con.print(f"  [green]✓[/] Da xoa {ip}")
 
-
-# ---------------------------------------------------------------------------
-# Baseline DB & Snapshot DB
-# ---------------------------------------------------------------------------
 
 def _init_db(path, table):
     conn = sqlite3.connect(path)
@@ -299,7 +326,63 @@ def print_options(options: dict):
 
 
 # ---------------------------------------------------------------------------
-# Vong lap thu thap (Chay tren Terminal Daemon)
+# Module Deep Verify (Background Thread)
+# ---------------------------------------------------------------------------
+
+def extract_hostname(output: str) -> str:
+    """Lọc hostname từ luồng ký tự trả về của Console."""
+    # Loại bỏ mã màu ANSI nếu có
+    output = re.sub(r'\x1b\[.*?m', '', output)
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        # Tìm các dạng prompt phổ biến: Router>, Switch#, [HNI-R1]>
+        m = re.search(r'([A-Za-z0-9_\-\.]+)[>#]', line)
+        if m:
+            return m.group(1)
+    return None
+
+def run_deep_verify(alias, options):
+    """Tiến trình ngầm để verify thiết bị vật lý đầu cuối."""
+    log_verify(f"[*] Bat dau kiem tra vat ly thiet bi cho OOB: [bold]{alias}[/]")
+    
+    for key, opt in options.items():
+        desc = opt.get("description", "")
+        if not desc:
+            continue
+            
+        ip = opt.get("ip")
+        port = opt.get("port", 23)
+        
+        try:
+            # Giao thức reverse console chủ yếu là telnet
+            session = MiniTelnet(ip, port, timeout=4)
+            # Gửi 2 lần Enter để đánh thức prompt (AutoCommand behavior)
+            session.write("\r\n\r\n")
+            
+            # Đọc cho đến khi thấy dấu hiệu của prompt mạng
+            output = session.read_until([">", "#", "login:", "Password:"], timeout=4)
+            session.close()
+            
+            act_host = extract_hostname(output)
+            
+            if not act_host:
+                log_verify(f"[dim][-][/] {alias} (Opt {key}): Timeout hoac khong the doc prompt.")
+                continue
+            
+            # Verify Rule: Description == Hostname
+            if act_host.lower() == desc.lower():
+                log_verify(f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})")
+            else:
+                log_verify(f"[bold red]CANH BAO[/] Phat hien thiet bi noi line console ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!")
+                
+        except Exception as e:
+            log_verify(f"[dim][LOI][/] {alias} (Opt {key}): Khong the ket noi den port {port} ({str(e)})")
+            
+    log_verify(f"[green]✓[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
+
+
+# ---------------------------------------------------------------------------
+# Vòng lặp giám sát (Chạy trên Terminal Daemon)
 # ---------------------------------------------------------------------------
 
 def input_with_timeout(prompt_text: str, timeout: int = 5):
@@ -330,94 +413,116 @@ def input_with_timeout(prompt_text: str, timeout: int = 5):
             return None 
 
 def run_daemon(cfg):
-    """Vong lap giam sat chay truc tiep tren luong chinh cua Terminal 2."""
+    """Vòng lặp giám sát hiển thị đa luồng chia đôi màn hình."""
+    global _live_ui
     _con.print(Panel("[bold green]OOB MONITOR DAEMON[/]\n[dim]Dang giam sat lien tuc. Nhan Ctrl+C de dung.[/]", border_style="green"))
     
     if not cfg.get("password"):
-        _mprint("[red][!][/] Chua cau hinh password! Vui long cau hinh truoc.")
+        _con.print("[red][!][/] Chua cau hinh password! Vui long cau hinh truoc.")
         return
 
-    _mprint(f"[green][START][/] Khoi dong chu ky {cfg['interval']}s.")
+    update_ui()
     
-    try:
-        while True:
-            hosts = load_ip_list(cfg["ip_list"])
-            
-            # Quét vòng lặp tự động (Đã xóa quét tay qua Enter)
-            if not hosts:
-                _mprint("[yellow][!][/] Danh sach IP trong. Doi them thiet bi...")
-                time.sleep(cfg["interval"])
-                continue
-
-            for ip, alias in hosts:
-                _mprint(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
-                try:
-                    hostname, menu_name, snapshot = poll_host(
-                        ip, cfg["telnet_port"], cfg["username"], cfg["password"],
-                        cfg["enable_password"], menu_name=cfg.get("menu_name_override") or None,
-                        ssh_port=cfg.get("ssh_port", 22),
-                    )
-                except Exception as exc:
-                    _mprint(f"  [red][LOI][/] {alias} ({ip}): {exc}")
+    # Khởi chạy giao diện Live
+    with Live(layout, refresh_per_second=4, screen=False) as live:
+        _live_ui = live
+        log_oob(f"[green][START][/] Khoi dong chu ky {cfg['interval']}s.")
+        
+        try:
+            while True:
+                hosts = load_ip_list(cfg["ip_list"])
+                
+                if not hosts:
+                    log_oob("[yellow][!][/] Danh sach IP trong. Doi them thiet bi...")
+                    time.sleep(cfg["interval"])
                     continue
 
-                hn_label = f"hostname=[bold]{hostname}[/]" if hostname else "hostname=?"
-                menu_n   = len(snapshot)
+                for ip, alias in hosts:
+                    log_oob(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
+                    try:
+                        hostname, menu_name, snapshot = poll_host(
+                            ip, cfg["telnet_port"], cfg["username"], cfg["password"],
+                            cfg["enable_password"], menu_name=cfg.get("menu_name_override") or None,
+                            ssh_port=cfg.get("ssh_port", 22),
+                        )
+                    except Exception as exc:
+                        log_oob(f"[red][LOI][/] {alias} ({ip}): {exc}")
+                        continue
 
-                if not menu_name or not snapshot:
-                    _mprint(f"  [yellow][!][/] {alias}: Khong the parse menu hop le tren thiet bi.")
-                    continue
+                    hn_label = f"hostname=[bold]{hostname}[/]" if hostname else "hostname=?"
+                    menu_n   = len(snapshot)
 
-                save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
-                _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+                    if not menu_name or not snapshot:
+                        log_oob(f"[yellow][!][/] {alias}: Khong the parse menu hop le tren thiet bi.")
+                        continue
 
-                if baseline is None:
-                    _con.print(f"\n  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
-                    _con.print(f"      {hn_label} | {menu_n} option:")
+                    save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
+                    _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+
+                    if baseline is None:
+                        # Tạm ngưng Live để tránh nhiễu I/O khi nhập
+                        live.stop() 
+                        _con.print(f"\n  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
+                        _con.print(f"      {hn_label} | {menu_n} option:")
+                        print_options(snapshot)
+                        
+                        prompt_msg = f"  Xac nhan day la CHUAN cho {alias}? (y/N) [Bo qua sau 5s]: "
+                        ans_raw = input_with_timeout(prompt_msg, timeout=5)
+                        ans = ans_raw.strip().lower() if ans_raw is not None else ""
+                        
+                        if ans == "y":
+                            save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
+                            _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
+                            # Kích hoạt Deep Verify cho thiết bị vừa xác nhận
+                            threading.Thread(target=run_deep_verify, args=(alias, snapshot), daemon=True).start()
+                        else:
+                            _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
+                            
+                        # Mở lại Live
+                        live.start() 
+                        continue
+
+                    if options_equal(baseline, snapshot):
+                        log_oob(f"[green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
+                        # Thiết bị OK -> Bắn luồng Verify vật lý song song
+                        threading.Thread(target=run_deep_verify, args=(alias, baseline), daemon=True).start()
+                        continue
+
+                    # Tạm ngưng Live để xử lý cảnh báo
+                    live.stop()
+                    _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
+                    print_diff(baseline, snapshot)
+                    _con.print("  [dim]--- Baseline (chuan) ---[/]")
+                    print_options(baseline)
+                    _con.print("  [yellow]--- Hien tai tren thiet bi ---[/]")
                     print_options(snapshot)
                     
-                    prompt_msg = f"  Xac nhan day la CHUAN cho {alias}? (y/N) [Bo qua sau 5s]: "
+                    prompt_msg = f"  Cap nhat baseline theo hien tai cua {alias}? (y/N) (Bo qua sau 5s): "
                     ans_raw = input_with_timeout(prompt_msg, timeout=5)
-                    ans = ans_raw.strip().lower() if ans_raw is not None else ""
-                    
+                    ans = ans_raw.strip().lower() if ans_raw else ""
+
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
-                        _mprint(f"  [green][OK][/] Da luu baseline cho {alias}.")
+                        _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
+                        # Kích hoạt Verify cấu hình mới
+                        threading.Thread(target=run_deep_verify, args=(alias, snapshot), daemon=True).start()
                     else:
-                        _mprint("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
-                    continue
+                        _con.print(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
+                    
+                    live.start() # Mở lại Live
 
-                if options_equal(baseline, snapshot):
-                    _mprint(f"  [green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
-                    continue
+                log_oob(f"[dim][zzz] Dang cho {cfg['interval']}s de quet lai...[/]")
+                # Sleep hoàn toàn bình thường, luồng Verify bên dưới vẫn tự do báo cáo lên UI
+                time.sleep(cfg["interval"])
 
-                _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
-                print_diff(baseline, snapshot)
-                _con.print("  [dim]--- Baseline (chuan) ---[/]")
-                print_options(baseline)
-                _con.print("  [yellow]--- Hien tai tren thiet bi ---[/]")
-                print_options(snapshot)
-                
-                # Gọi hàm có timeout 5 giây
-                prompt_msg = f"  Cap nhat baseline theo hien tai cua {alias}? (y/N) (Bo qua sau 5s): "
-                ans_raw = input_with_timeout(prompt_msg, timeout=5)
-                ans = ans_raw.strip().lower() if ans_raw else ""
-
-                if ans == "y":
-                    save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
-                    _mprint(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
-                else:
-                    _mprint(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
-
-            _mprint(f"[dim][zzz] Dang cho {cfg['interval']}s...[/]")
-            time.sleep(cfg["interval"])
-
-    except KeyboardInterrupt:
-        _con.print("\n[yellow][STOP][/] Da nhan Ctrl+C. Dung Daemon.")
+        except KeyboardInterrupt:
+            pass
+            
+    _con.print("\n[yellow][STOP][/] Da nhan Ctrl+C. Dung Daemon.")
 
 
 # ---------------------------------------------------------------------------
-# Chuc nang Xem/Tim Kiem
+# Chuc nang Xem/Tim Kiem & Quản lý (Giữ nguyên)
 # ---------------------------------------------------------------------------
 
 def list_devices(cfg):
@@ -483,9 +588,7 @@ def search_device(cfg):
         pt = entry.get("port", 22 if pr == "ssh" else 23)
         _con.print(f"    [cyan]→[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [[bold cyan]{key}[/]] {entry.get('description', '')} [dim]→ {pr}://{entry['ip']}:{pt}[/]")
 
-# ---------------------------------------------------------------------------
-# Quet theo chi dinh (Terminal 1)
-# ---------------------------------------------------------------------------
+
 def scan_specific_devices(cfg):
     targets_input = _con.input("  [cyan]Nhap IP/Alias (cach nhau dau phay, de trong de quet TAT CA)[/]: ").strip()
     all_hosts = load_ip_list(cfg["ip_list"])
@@ -496,7 +599,6 @@ def scan_specific_devices(cfg):
 
     hosts_to_scan = []
 
-    # Logic quét tất cả nếu để trống, hoặc lọc theo danh sách nếu có nhập
     if not targets_input:
         hosts_to_scan = all_hosts
     else:
@@ -556,7 +658,6 @@ def scan_specific_devices(cfg):
         _con.print("  [yellow]--- Hien tai tren thiet bi ---[/]")
         print_options(snapshot)
         
-        # Ở Menu Quản lý thì dùng _con.input bình thường, chờ xác nhận thoải mái không cần timeout
         ans = _con.input(f"  Cap nhat baseline theo trang thai hien tai cua {alias}? (y/N): ").strip().lower()
         if ans == "y":
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
@@ -564,9 +665,6 @@ def scan_specific_devices(cfg):
         else:
             _con.print(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}.")
 
-# ---------------------------------------------------------------------------
-# Man hinh Quan ly (Terminal 1)
-# ---------------------------------------------------------------------------
 
 def _show_menu(cfg):
     hosts_n = len(load_ip_list(cfg["ip_list"]))
@@ -632,13 +730,8 @@ def main_menu(cfg, config_path):
             _con.print("  [red][!][/] Lua chon khong hop le.")
 
 
-# ---------------------------------------------------------------------------
-# Launcher & Entry Point
-# ---------------------------------------------------------------------------
-
 def main():
     config_path = CONFIG_FILE_DEFAULT
-    # Cho phep truyen duong dan file config (Bo qua cac flag)
     for arg in sys.argv[1:]:
         if not arg.startswith("--"):
             config_path = arg
@@ -648,7 +741,6 @@ def main():
     if not os.path.exists(config_path):
         save_config(config_path, cfg)
 
-    # 1. Chay theo chi dinh tu dong lenh
     if "--daemon" in sys.argv:
         run_daemon(cfg)
         return
@@ -656,7 +748,6 @@ def main():
         main_menu(cfg, config_path)
         return
 
-    # 2. Giao dien Launcher (Khi khong co tham so)
     _con.print(Panel(
         "[bold cyan]1.[/] Mo Menu Quan Ly (Them/Sua IP, Xem danh sach)\n"
         "[bold cyan]2.[/] Mo Trinh Giam Sat (Chay log Daemon o terminal nay)\n"
