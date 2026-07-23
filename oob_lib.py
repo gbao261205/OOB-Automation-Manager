@@ -1,0 +1,489 @@
+"""
+oob_lib.py
+
+Thu vien dung chung: ket noi SSH (uu tien) hoac Telnet (du phong) toi thiet bi
+Cisco IOS, dang nhap, lay va parse cau hinh "menu OOB_MENU", va day (push) lai
+cau hinh menu de khoi phuc ve mot trang thai da luu truoc do.
+
+Tat ca ket noi deu dung connect_auto():
+    - Thu SSH truoc (paramiko) -> neu that bai -> fallback Telnet (MiniTelnet).
+    - MiniSSH va MiniTelnet co cung interface (read_until / write / close) nen
+      cac ham ben tren (fetch_hostname, fetch_menu_config, push_menu_config, ...)
+      khong can biet dang dung protocol nao.
+
+Phu thuoc ben ngoai:
+    pip install paramiko
+"""
+
+import re
+import socket
+import time
+
+try:
+    import logging
+    import paramiko
+    # Tat log noi bo cua paramiko (tranh in traceback/exception ra console)
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+    _PARAMIKO_OK = True
+except ImportError:
+    _PARAMIKO_OK = False
+
+IAC  = 255
+DONT = 254
+DO   = 253
+WONT = 252
+WILL = 251
+SB   = 250
+SE   = 240
+
+TEXT_RE       = re.compile(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)',                          re.IGNORECASE)
+CMD_TELNET_RE = re.compile(r'menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)(?:\s+(\d+))?',  re.IGNORECASE)
+# SSH: bao gom 'ssh -l user IP', 'ssh user@IP', 'ssh IP'
+CMD_SSH_RE    = re.compile(
+    r'menu\s+(\S+)\s+command\s+(\S+)\s+ssh\s+'
+    r'(?:-l\s+\S+\s+|\S+@)?'                            # -l username  hoac  user@
+    r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'           # IP
+    r'(?:\s+(\d+))?',                                   # port tuy chon
+    re.IGNORECASE
+)
+
+
+# ---------------------------------------------------------------------------
+# MiniTelnet — Telnet client toi gian (du phong khi SSH khong duoc)
+# ---------------------------------------------------------------------------
+
+class MiniTelnet:
+    """Telnet client toi gian: connect / read_until / write."""
+
+    def __init__(self, host, port=23, timeout=10):
+        self.sock   = socket.create_connection((host, port), timeout=timeout)
+        self.buffer = b""
+
+    def _strip_iac(self, data: bytes) -> bytes:
+        out = bytearray()
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if b == IAC:
+                if i + 1 >= n:
+                    break
+                cmd = data[i + 1]
+                if cmd in (DO, DONT, WILL, WONT):
+                    if i + 2 < n:
+                        opt   = data[i + 2]
+                        reply = WONT if cmd == DO else DONT
+                        try:
+                            self.sock.sendall(bytes([IAC, reply, opt]))
+                        except OSError:
+                            pass
+                        i += 3
+                    else:
+                        i += 2
+                    continue
+                elif cmd == SB:
+                    j = i + 2
+                    while j < n - 1 and not (data[j] == IAC and data[j + 1] == SE):
+                        j += 1
+                    i = j + 2
+                    continue
+                else:
+                    i += 2
+                    continue
+            else:
+                out.append(b)
+                i += 1
+        return bytes(out)
+
+    def read_until(self, patterns, timeout=10):
+        if isinstance(patterns, (str, bytes)):
+            patterns = [patterns]
+        patterns = [p.encode() if isinstance(p, str) else p for p in patterns]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.sock.settimeout(max(0.3, deadline - time.time()))
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buffer += self._strip_iac(chunk)
+            for p in patterns:
+                idx = self.buffer.find(p)
+                if idx != -1:
+                    matched      = self.buffer[: idx + len(p)]
+                    self.buffer  = self.buffer[idx + len(p):]
+                    return matched.decode(errors="ignore")
+        data, self.buffer = self.buffer, b""
+        return data.decode(errors="ignore")
+
+    def write(self, text: str):
+        self.sock.sendall((text + "\r\n").encode())
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# MiniSSH — SSH client voi cung interface voi MiniTelnet
+# ---------------------------------------------------------------------------
+
+class MiniSSH:
+    """SSH client (paramiko invoke_shell) voi cung interface voi MiniTelnet.
+    Khong goi truc tiep — dung thong qua connect_auto()."""
+
+    def __init__(self):
+        if not _PARAMIKO_OK:
+            raise RuntimeError("paramiko chua duoc cai dat. Chay: pip install paramiko")
+        self._client = paramiko.SSHClient()
+        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._shell  = None
+        self.buffer  = b""
+
+    def _connect(self, host, port, username, password, timeout):
+        """Goi boi connect_auto() de thiet lap ket noi thuc su."""
+        self._client.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        # term='dumb' de IOS khong gui ANSI escape codes (mau, con tro, ...)
+        # width lon de tranh xuong dong gia (line-wrap) lam hong cac dong dai
+        self._shell = self._client.invoke_shell(term='dumb', width=250, height=0)
+        self._shell.settimeout(timeout)
+
+    # Pattern loai bo ANSI escape codes (ESC[...m, ESC[...H, ESC c, ...)
+    _ANSI_RE = re.compile(
+        rb'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|[\r]'
+    )
+
+    @classmethod
+    def _strip_ansi(cls, data: bytes) -> bytes:
+        """Xoa ANSI escape codes va \r khoi raw bytes nhan tu SSH shell."""
+        return cls._ANSI_RE.sub(b'', data)
+
+    def read_until(self, patterns, timeout=10):
+        if isinstance(patterns, (str, bytes)):
+            patterns = [patterns]
+        patterns = [p.encode() if isinstance(p, str) else p for p in patterns]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.3, deadline - time.time())
+            self._shell.settimeout(remaining)
+            try:
+                chunk = self._shell.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buffer += self._strip_ansi(chunk)
+            for p in patterns:
+                idx = self.buffer.find(p)
+                if idx != -1:
+                    matched     = self.buffer[: idx + len(p)]
+                    self.buffer = self.buffer[idx + len(p):]
+                    return matched.decode(errors="ignore")
+        data, self.buffer = self.buffer, b""
+        return data.decode(errors="ignore")
+
+    def _drain_pending(self):
+        """Xoa buffer noi bo va doc bo du lieu ton dong tren kenh SSH.
+        Goi truoc moi lenh moi de tranh du lieu cu (extra prompts, echo thua)
+        gay nhieu loan cho read_until tiep theo."""
+        self.buffer = b""
+        self._shell.settimeout(0.15)
+        try:
+            while True:
+                pending = self._shell.recv(4096)
+                if not pending:
+                    break
+        except (socket.timeout, OSError):
+            pass
+
+    def write(self, text: str):
+        # Drain buffer truoc khi gui lenh moi — tranh stale data lam hong read_until ke tiep
+        self._drain_pending()
+        self._shell.send((text + "\r\n").encode())
+
+    def close(self):
+        try:
+            self._client.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Ket noi thong nhat: SSH truoc, fallback Telnet
+# ---------------------------------------------------------------------------
+
+def connect_auto(host, ssh_port, telnet_port,
+                 username, password, enable_password, timeout=10):
+    """Ket noi vao thiet bi: thu SSH truoc (ssh_port), fallback sang Telnet (telnet_port).
+    Tra ve session (MiniSSH hoac MiniTelnet) da dang nhap va o enable mode ('#').
+    Nem ngoai le neu ca hai deu that bai."""
+
+    # --- Thu SSH ---
+    if _PARAMIKO_OK:
+        try:
+            session = MiniSSH()
+            session._connect(host, ssh_port, username, password, timeout)
+            # paramiko xu ly xac thuc username/password; doc prompt ban dau
+            banner = session.read_until([">", "#"], timeout=8)
+            if banner.rstrip().endswith(">"):
+                session.write("enable")
+                resp = session.read_until(["assword:", "#"], timeout=8)
+                if "assword:" in resp:
+                    session.write(enable_password or "")
+                    session.read_until("#", timeout=8)
+            return session
+        except Exception as ssh_err:
+            err_str = str(ssh_err)
+            # Phan loai loi SSH de goi y nguyen nhan cu the
+            if "Incompatible version" in err_str or "1.5" in err_str:
+                print(f"    [~] SSH that bai: thiet bi {host} dang chay SSHv1 (version 1.5).")
+                print(f"         Giai phap tren thiet bi:")
+                print(f"           crypto key zeroize rsa")
+                print(f"           crypto key generate rsa modulus 2048")
+                print(f"           ip ssh version 2")
+            elif "Authentication" in err_str or "auth" in err_str.lower():
+                print(f"    [~] SSH that bai: sai username/password ({err_str}).")
+                print(f"         Kiem tra lai muc 1 (Username) va 2 (Password) trong cai dat.")
+            elif "timed out" in err_str or "timeout" in err_str.lower():
+                print(f"    [~] SSH that bai: timeout khi ket noi {host}:{ssh_port}.")
+                print(f"         Kiem tra 'transport input ssh' va SSH co bat tren thiet bi.")
+            elif "Connection refused" in err_str:
+                print(f"    [~] SSH that bai: port {ssh_port} bi tu choi tren {host}.")
+                print(f"         Kiem tra 'line vty 0 4 / transport input ssh'.")
+            else:
+                print(f"    [~] SSH that bai: {err_str}")
+            print(f"         -> Thu Telnet du phong port {telnet_port} ...")
+    else:
+        print("    [~] paramiko khong co san, dung Telnet ...")
+
+    # --- Fallback: Telnet ---
+    session = MiniTelnet(host, telnet_port, timeout)
+    banner  = session.read_until(["sername:", "assword:", ">", "#"], timeout=8)
+
+    if "sername:" in banner:
+        session.write(username or "")
+        banner = session.read_until(["assword:", ">", "#"], timeout=8)
+
+    if "assword:" in banner:
+        session.write(password)
+        banner = session.read_until([">", "#"], timeout=8)
+
+    if banner.rstrip().endswith(">"):
+        session.write("enable")
+        resp = session.read_until(["assword:", "#"], timeout=8)
+        if "assword:" in resp:
+            session.write(enable_password or "")
+            session.read_until("#", timeout=8)
+
+    return session
+
+
+def connect_and_login(host, port, username, password, enable_password, timeout=10):
+    """Deprecated: wrapper tuong thich nguoc. Dung connect_auto() thay the."""
+    return connect_auto(
+        host,
+        ssh_port=22,
+        telnet_port=port,
+        username=username,
+        password=password,
+        enable_password=enable_password,
+        timeout=timeout,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lay thong tin tu thiet bi
+# ---------------------------------------------------------------------------
+
+def fetch_hostname(tn):
+    """Lay hostname da cau hinh tren thiet bi (tu 'hostname <ten>' trong running-config).
+
+    Dung ^ (dau dau dong, voi re.MULTILINE) de chi khop dong cau hinh thuc su
+    ("hostname R0-CORE"), tranh nham voi chinh dong lenh duoc echo lai
+    ("show running-config | include ^hostname") cung chua chu "hostname".
+    """
+    tn.write("show running-config | include ^hostname")
+    output = tn.read_until("#", timeout=8)
+    m = re.search(r'^hostname\s+(\S+)', output, re.IGNORECASE | re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def fetch_menu_config(tn, menu_name: str) -> str:
+    """Tat phan trang va lay phan cau hinh 'menu <menu_name>' tu running-config."""
+    tn.write("terminal length 0")
+    tn.read_until("#", timeout=5)
+    tn.write(f"show running-config | section menu {menu_name}")
+    return tn.read_until("#", timeout=15)
+
+
+# ---------------------------------------------------------------------------
+# Kiem tra hostname khop description (word-boundary)
+# ---------------------------------------------------------------------------
+
+def _hostname_matches_desc(hostname: str, description: str) -> bool:
+    """Kiem tra hostname co xuat hien nhu mot TU DOC LAP trong description khong.
+    Tach description theo khoang trang (khong tach theo '-') de tranh false positive:
+        "Ket noi R1"   , hostname="R1"   -> {'Ket','noi','R1'}   -> True
+        "Ket noi R123" , hostname="R1"   -> {'Ket','noi','R123'} -> False (chinh xac!)
+        "Ket noi R123" , hostname="R123" -> {'Ket','noi','R123'} -> True
+        "Ket noi R1-SW", hostname="R1"   -> {'Ket','noi','R1-SW'}-> False
+    """
+    tokens = {t.upper() for t in description.split() if t}
+    return hostname.upper() in tokens
+
+
+# ---------------------------------------------------------------------------
+# Parse menu
+# ---------------------------------------------------------------------------
+
+def parse_menu(output: str, menu_name: str) -> dict:
+    """{option_key: {"description":..., "ip":..., "port":..., "protocol":...}}
+    Bo qua option khong co IP dich (vi du 'q'/menu-exit/resume).
+    Ho tro ca lenh telnet lan ssh trong menu."""
+    options = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+
+        m = TEXT_RE.match(line)
+        if m and m.group(1) == menu_name:
+            key = m.group(2)
+            options.setdefault(key, {})["description"] = m.group(3).strip()
+            continue
+
+        # Thu telnet truoc
+        m = CMD_TELNET_RE.match(line)
+        if m and m.group(1) == menu_name:
+            key   = m.group(2)
+            entry = options.setdefault(key, {})
+            entry["ip"]       = m.group(3)
+            entry["port"]     = int(m.group(4)) if m.group(4) else 23
+            entry["protocol"] = "telnet"
+            continue
+
+        # Thu ssh
+        m = CMD_SSH_RE.match(line)
+        if m and m.group(1) == menu_name:
+            key   = m.group(2)
+            entry = options.setdefault(key, {})
+            entry["ip"]       = m.group(3)
+            entry["port"]     = int(m.group(4)) if m.group(4) else 22
+            entry["protocol"] = "ssh"
+
+    return {k: v for k, v in options.items() if "ip" in v}
+
+
+# ---------------------------------------------------------------------------
+# Poll va Push
+# ---------------------------------------------------------------------------
+
+def poll_host(host, telnet_port, username, password, enable_password,
+              menu_name, ssh_port=22, timeout=10, debug=False):
+    """Ket noi (SSH-first, fallback Telnet), lay hostname va parse menu cua 1 thiet bi OOB.
+    Tra ve (hostname, options). Luon dong ket noi khi xong.
+    debug=True: in raw output truoc khi parse de chan doan loi."""
+    tn = connect_auto(host, ssh_port, telnet_port,
+                      username, password, enable_password, timeout=timeout)
+    try:
+        hostname = fetch_hostname(tn)
+        raw      = fetch_menu_config(tn, menu_name)
+
+        if debug:
+            print(f"\n    ===== [DEBUG] RAW OUTPUT TU SSH/TELNET ({len(raw)} chars) =====")
+            # In repr() de thay ro escape codes, \r, \n, ky tu an
+            for i, chunk in enumerate([raw[j:j+120] for j in range(0, min(len(raw), 1200), 120)]):
+                print(f"    {repr(chunk)}")
+            if len(raw) > 1200:
+                print(f"    ... (con {len(raw)-1200} chars nua, bi cat bot)")
+            print(f"    ===== [DEBUG] KET THUC RAW OUTPUT =====\n")
+
+        options = parse_menu(raw, menu_name)
+
+        if debug:
+            print(f"    [DEBUG] parse_menu -> {len(options)} option(s): {list(options.keys())}")
+
+        return hostname, options
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
+
+
+
+def push_menu_config(host, telnet_port, username, password, enable_password,
+                     menu_name, baseline_options, current_options=None,
+                     ssh_port=22, timeout=10):
+    """Day lai cau hinh 'menu <menu_name> text/command ...' theo dung 'baseline_options'
+    (dict giong parse_menu tra ve) de khoi phuc thiet bi ve trang thai chuan da luu.
+
+    Neu 'current_options' duoc truyen vao (du lieu dang thuc te tren thiet bi), cac
+    option ton tai trong current_options nhung KHONG co trong baseline_options ("option
+    la") se bi xoa bang lenh 'no menu ... text/command <key>' truoc khi ghi lai baseline.
+    """
+    tn = connect_auto(host, ssh_port, telnet_port,
+                      username, password, enable_password, timeout=timeout)
+    try:
+        tn.write("configure terminal")
+        tn.read_until("(config)#", timeout=8)
+
+        if current_options:
+            extra_keys = [k for k in current_options if k not in baseline_options]
+            for key in extra_keys:
+                tn.write(f"no menu {menu_name} command {key}")
+                tn.read_until("(config)#", timeout=5)
+                tn.write(f"no menu {menu_name} text {key}")
+                tn.read_until("(config)#", timeout=5)
+
+        for key, entry in baseline_options.items():
+            proto = entry.get("protocol", "telnet")
+            tn.write(f"menu {menu_name} text {key} {entry.get('description', '')}")
+            tn.read_until("(config)#", timeout=5)
+            if proto == "ssh":
+                # Day lai lenh ssh -l <username> <ip> (port SSH mac dinh la 22)
+                tn.write(f"menu {menu_name} command {key} ssh -l {username} {entry['ip']}")
+            else:
+                tn.write(f"menu {menu_name} command {key} telnet {entry['ip']} {entry.get('port', 23)}")
+            tn.read_until("(config)#", timeout=5)
+        tn.write("end")
+        tn.read_until("#", timeout=5)
+        tn.write("write memory")
+        tn.read_until("#", timeout=10)
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
+
+
+def fetch_hostname_via_auto(host, ssh_port, telnet_port,
+                            username, password, enable_password, timeout=10):
+    """Ket noi vao thiet bi dich (option target) va chi lay hostname.
+    Dung connect_auto() nen tu dong thu SSH truoc, fallback Telnet neu SSH that bai.
+    Tra ve hostname (str) hoac None neu khong lay duoc."""
+    tn = connect_auto(host, ssh_port, telnet_port,
+                      username, password, enable_password, timeout=timeout)
+    try:
+        return fetch_hostname(tn)
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
