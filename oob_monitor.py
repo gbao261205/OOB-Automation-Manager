@@ -374,12 +374,17 @@ def run_daemon(cfg):
                     _con.print(f"\n  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
                     _con.print(f"      {hn_label} | {menu_n} option:")
                     print_options(snapshot)
-                    ans = _con.input(f"  Xac nhan day la CHUAN cho {alias}? (y/N): ").strip().lower()
+                    
+                    # Đã thay _con.input bằng input_with_timeout
+                    prompt_msg = f"  Xac nhan day la CHUAN cho {alias}? (y/N) [Bo qua sau 5s]: "
+                    ans_raw = input_with_timeout(prompt_msg, timeout=5)
+                    ans = ans_raw.strip().lower() if ans_raw else ""
+                    
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         _mprint(f"  [green][OK][/] Da luu baseline cho {alias}.")
                     else:
-                        _mprint("  [dim][--] Bo qua, se hoi lai chu ky sau.[/]")
+                        _mprint("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
                     continue
 
                 if options_equal(baseline, snapshot):
@@ -394,7 +399,7 @@ def run_daemon(cfg):
                 print_options(snapshot)
                 
                 # Gọi hàm có timeout 5 giây
-                prompt_msg = f"  Cap nhat baseline theo hien tai cua {alias}? (y/N) [Bo qua sau 5s]: "
+                prompt_msg = f"  Cap nhat baseline theo hien tai cua {alias}? (y/N) (Bo qua sau 5s): "
                 ans_raw = input_with_timeout(prompt_msg, timeout=5)
                 ans = ans_raw.strip().lower() if ans_raw else ""
 
