@@ -59,7 +59,10 @@ DEFAULT_CONFIG = {
     "username": "",
     "password": "",
     "enable_password": "",
-    "menu_name": "OOB_MENU",
+    # Rong ("") -> TU DONG DO ten menu tren tung thiet bi bang lenh
+    # 'show running-config | include menu'. Chi dat gia tri o day neu muon EP
+    # dung 1 ten menu cu the cho MOI thiet bi (bo qua ten tu dong do duoc).
+    "menu_name_override": "",
     "ssh_port": 22,
     "telnet_port": 23,
     "interval": 30,
@@ -122,7 +125,7 @@ def settings_menu(cfg, config_path):
 1. Username           : {cfg['username'] or '(khong dung)'}
 2. Password            : {mask(cfg['password'])}
 3. Enable password     : {mask(cfg['enable_password'])}
-4. Ten menu (menu-name): {cfg['menu_name']}
+4. Ten menu (rong=tu dong do): {cfg['menu_name_override'] or '(tu dong do)'}
 5. SSH port (uu tien)   : {cfg.get('ssh_port', 22)}
 6. Telnet port (du phong): {cfg['telnet_port']}
 7. Chu ky thu thap (s)  : {cfg['interval']}
@@ -140,9 +143,11 @@ a. File snapshot DB     : {cfg['snapshot_db']}
         elif choice == "3":
             cfg["enable_password"] = getpass.getpass("  Enable password moi (khong hien khi go): ").strip()
         elif choice == "4":
-            val = input(f"  Ten menu moi (hien tai: {cfg['menu_name']}): ").strip()
-            if val:
-                cfg["menu_name"] = val
+            cur = cfg['menu_name_override'] or '(tu dong do)'
+            val = input(
+                f"  Ten menu ep dung, de trong = tu dong do (hien tai: {cur}): "
+            ).strip()
+            cfg["menu_name_override"] = val  # rong -> ve lai che do tu dong do
         elif choice == "5":
             val = input(f"  SSH port moi (hien tai: {cfg.get('ssh_port', 22)}): ").strip()
             if val.isdigit():
@@ -266,6 +271,38 @@ def get_options(db_path, table, host, menu_name):
         for key, _dn, desc, ip, port in rows
     }
     return device_name, options
+
+
+def get_options_by_host(db_path, table, host):
+    """Giong get_options() nhung KHONG can biet truoc menu_name - vi menu_name gio
+    duoc TU DONG DO rieng cho tung thiet bi (co the khac nhau giua cac thiet bi).
+    Tra ve (menu_name, device_name, options_dict). Ca ba la None neu chua co du lieu."""
+    conn = _init_db(db_path, table)
+    cur = conn.execute(
+        f"SELECT menu_name, option_key, device_name, description, target_ip, target_port "
+        f"FROM {table} WHERE host=?",
+        (host,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return None, None, None
+    menu_name   = rows[0][0]
+    device_name = rows[0][2]
+    options = {
+        key: {"description": desc, "ip": ip, "port": port}
+        for _mn, key, _dn, desc, ip, port in rows
+    }
+    return menu_name, device_name, options
+
+
+def get_updated_at_by_host(db_path, table, host):
+    """Giong get_updated_at() nhung khong can biet truoc menu_name."""
+    conn = _init_db(db_path, table)
+    cur = conn.execute(f"SELECT MAX(updated_at) FROM {table} WHERE host=?", (host,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
 
 
 def get_updated_at(db_path, table, host, menu_name):
@@ -397,9 +434,10 @@ def monitor_loop(cfg, stop_event: threading.Event):
 
             _mprint(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
             try:
-                hostname, snapshot = poll_host(
+                hostname, menu_name, snapshot = poll_host(
                     ip, cfg["telnet_port"], cfg["username"], cfg["password"],
-                    cfg["enable_password"], cfg["menu_name"],
+                    cfg["enable_password"],
+                    menu_name=cfg.get("menu_name_override") or None,  # rong -> tu dong do
                     ssh_port=cfg.get("ssh_port", 22),
                 )
             except Exception as exc:
@@ -409,12 +447,18 @@ def monitor_loop(cfg, stop_event: threading.Event):
             hn_label = f"hostname=[bold]{hostname}[/]" if hostname else "hostname=?"
             menu_n   = len(snapshot)
 
-            if not snapshot:
-                _mprint(f"  [yellow][!][/] {alias}: Khong parse duoc option tu menu '{cfg['menu_name']}'.")
+            if not menu_name:
+                _mprint(f"  [yellow][!][/] {alias}: Khong tim thay cau hinh menu nao tren thiet bi "
+                        f"('show running-config | include menu' rong).")
                 continue
 
-            save_options(cfg["snapshot_db"], "snapshot_menu", ip, cfg["menu_name"], hostname, snapshot)
-            _baseline_name, baseline = get_options(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"])
+            if not snapshot:
+                _mprint(f"  [yellow][!][/] {alias}: Da tim thay menu '{menu_name}' nhung khong parse duoc option nao.")
+                continue
+
+            _mprint(f"  [dim]Ten menu tu dong do duoc: '{menu_name}'.[/]")
+            save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
+            _baseline_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
 
             if baseline is None:
                 with _print_lock:
@@ -423,7 +467,7 @@ def monitor_loop(cfg, stop_event: threading.Event):
                     print_options(snapshot)
                     ans = _con.input(f"  Xac nhan day la CHUAN cho {alias}? [y/N]: ").strip().lower()
                 if ans == "y":
-                    save_options(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"], hostname, snapshot)
+                    save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                     _mprint(f"  [green][OK][/] Da luu baseline cho {alias}.")
                 else:
                     _mprint("  [dim][--] Bo qua, se hoi lai o chu ky sau.[/]")
@@ -445,14 +489,14 @@ def monitor_loop(cfg, stop_event: threading.Event):
                 ans = _con.input(f"  Day la CHUAN MOI cho {alias}? [y=cap nhat / n=khoi phuc]: ").strip().lower()
 
             if ans == "y":
-                save_options(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"], hostname, snapshot)
+                save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 _mprint(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
             else:
                 _mprint(f"  [blue][>>][/] Dang khoi phuc menu tren {alias} ve baseline ...")
                 try:
                     push_menu_config(
                         ip, cfg["telnet_port"], cfg["username"], cfg["password"],
-                        cfg["enable_password"], cfg["menu_name"], baseline,
+                        cfg["enable_password"], menu_name, baseline,
                         current_options=snapshot,
                         ssh_port=cfg.get("ssh_port", 22),
                     )
@@ -518,10 +562,10 @@ def list_devices(cfg):
     table.add_column("Cap nhat luc",                    min_width=20)
 
     for ip, alias in hosts:
-        device_name, baseline = get_options(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"])
-        updated_at = get_updated_at(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"])
+        _mn, device_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        updated_at = get_updated_at_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if device_name is None:
-            device_name, _ = get_options(cfg["snapshot_db"], "snapshot_menu", ip, cfg["menu_name"])
+            _mn, device_name, _ = get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
         bl = "[green]✓ Co[/]" if baseline else "[yellow]✗ Chua[/]"
         table.add_row(
             alias, ip,
@@ -543,17 +587,20 @@ def view_baseline(cfg):
     _con.print(Rule("[bold]BASELINE (CHUAN) DA LUU[/]", style="cyan"))
     found_any = False
     for ip, alias in hosts:
-        device_name, baseline = get_options(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"])
+        menu_name, device_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if baseline is None:
             _con.print(f"  [dim]>> {alias} ({ip}): chua co baseline duoc xac nhan.[/]")
             continue
         found_any = True
         if not device_name:
-            device_name, _ = get_options(cfg["snapshot_db"], "snapshot_menu", ip, cfg["menu_name"])
+            _mn, device_name, _ = get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
         if not device_name:
             device_name = alias
-        updated_at = get_updated_at(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"])
-        _con.print(f"\n  [bold cyan]{alias}[/] ({ip})  hostname: [bold]{device_name}[/]  cap nhat: [dim]{updated_at or '-'}[/]")
+        updated_at = get_updated_at_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        _con.print(
+            f"\n  [bold cyan]{alias}[/] ({ip})  hostname: [bold]{device_name}[/]  "
+            f"menu: [dim]{menu_name}[/]  cap nhat: [dim]{updated_at or '-'}[/]"
+        )
         print_options(baseline)
 
     if not found_any:
@@ -574,15 +621,15 @@ def search_device(cfg):
 
     found = []
     for ip, alias in hosts:
-        device_name, source = get_options(cfg["baseline_db"], "baseline_menu", ip, cfg["menu_name"])
+        _mn, device_name, source = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if source is None:
             # Chua co baseline duoc xac nhan -> tam thoi tim trong snapshot gan nhat
-            device_name, source = get_options(cfg["snapshot_db"], "snapshot_menu", ip, cfg["menu_name"])
+            _mn, device_name, source = get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
         if not source:
             continue
         # Neu khong lay duoc hostname tu DB, fallback sang snapshot roi alias
         if not device_name:
-            snap_name, _ = get_options(cfg["snapshot_db"], "snapshot_menu", ip, cfg["menu_name"])
+            _mn2, snap_name, _ = get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
             device_name = snap_name or alias
         for key, entry in source.items():
             target_ip = entry.get("ip", "")
@@ -619,9 +666,10 @@ def _show_menu(cfg):
     )
     user = f"[bold]{cfg['username']}[/]" if cfg["username"] else "[dim yellow](chua dat)[/]"
 
+    menu_label = cfg['menu_name_override'] or "tu dong do"
     info = Text.from_markup(
         f"Status   : {status}\n"
-        f"Thiet bi : [bold]{hosts_n}[/]   Menu: [bold]{cfg['menu_name']}[/]   User: {user}"
+        f"Thiet bi : [bold]{hosts_n}[/]   Menu: [bold]{menu_label}[/]   User: {user}"
     )
 
     grid = Table.grid(padding=(0, 2))

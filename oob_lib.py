@@ -8,7 +8,7 @@ cau hinh menu de khoi phuc ve mot trang thai da luu truoc do.
 Tat ca ket noi deu dung connect_auto():
     - Thu SSH truoc (paramiko) -> neu that bai -> fallback Telnet (MiniTelnet).
     - MiniSSH va MiniTelnet co cung interface (read_until / write / close) nen
-      cac ham ben tren (fetch_hostname, fetch_menu_config, push_menu_config, ...)
+      cac ham ben tren (fetch_hostname, detect_and_fetch_menu, push_menu_config, ...)
       khong can biet dang dung protocol nao.
 
 Phu thuoc ben ngoai:
@@ -323,12 +323,28 @@ def fetch_hostname(tn):
     return m.group(1) if m else None
 
 
-def fetch_menu_config(tn, menu_name: str) -> str:
-    """Tat phan trang va lay phan cau hinh 'menu <menu_name>' tu running-config."""
+MENU_NAME_RE = re.compile(r'^\s*menu\s+(\S+)\s+(?:text|command)\b', re.IGNORECASE | re.MULTILINE)
+
+
+def detect_and_fetch_menu(tn):
+    """Tat phan trang, chay 'show running-config | include menu' MOT LAN DUY NHAT:
+    vua lay toan bo cac dong cau hinh 'menu ...' tren thiet bi, vua TU DONG DO ten
+    menu (menu_name) tu dong dau tien khop dang 'menu <ten> text|command ...'.
+
+    Khong con can biet truoc menu_name de build lenh 'section menu <ten>' nhu truoc.
+
+    Tra ve (menu_name, raw_output):
+        menu_name  -> str neu tim thay, None neu thiet bi khong co cau hinh menu nao.
+        raw_output -> toan bo output tho (dung lai duoc cho parse_menu(), khong can
+                       goi show lan thu 2).
+    """
     tn.write("terminal length 0")
     tn.read_until("#", timeout=5)
-    tn.write(f"show running-config | section menu {menu_name}")
-    return tn.read_until("#", timeout=15)
+    tn.write("show running-config | include menu")
+    output = tn.read_until("#", timeout=15)
+    m = MENU_NAME_RE.search(output)
+    menu_name = m.group(1) if m else None
+    return menu_name, output
 
 
 # ---------------------------------------------------------------------------
@@ -392,15 +408,25 @@ def parse_menu(output: str, menu_name: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def poll_host(host, telnet_port, username, password, enable_password,
-              menu_name, ssh_port=22, timeout=10, debug=False):
+              menu_name=None, ssh_port=22, timeout=10, debug=False):
     """Ket noi (SSH-first, fallback Telnet), lay hostname va parse menu cua 1 thiet bi OOB.
-    Tra ve (hostname, options). Luon dong ket noi khi xong.
-    debug=True: in raw output truoc khi parse de chan doan loi."""
+
+    menu_name:
+        - None (mac dinh) -> TU DONG DO ten menu tren thiet bi bang
+          'show running-config | include menu' (xem detect_and_fetch_menu()).
+        - Truyen mot chuoi cu the -> ep dung ten do de loc, bo qua ten tu dong do
+          duoc (huu ich neu thiet bi co nhieu menu va chi muon lay 1 menu cu the).
+
+    Tra ve (hostname, menu_name_da_dung, options). menu_name_da_dung co the None
+    neu khong tim thay cau hinh menu nao tren thiet bi.
+    Luon dong ket noi khi xong. debug=True: in raw output truoc khi parse de chan doan loi.
+    """
     tn = connect_auto(host, ssh_port, telnet_port,
                       username, password, enable_password, timeout=timeout)
     try:
         hostname = fetch_hostname(tn)
-        raw      = fetch_menu_config(tn, menu_name)
+        detected_name, raw = detect_and_fetch_menu(tn)
+        effective_name = menu_name or detected_name
 
         if debug:
             print(f"\n    ===== [DEBUG] RAW OUTPUT TU SSH/TELNET ({len(raw)} chars) =====")
@@ -410,13 +436,14 @@ def poll_host(host, telnet_port, username, password, enable_password,
             if len(raw) > 1200:
                 print(f"    ... (con {len(raw)-1200} chars nua, bi cat bot)")
             print(f"    ===== [DEBUG] KET THUC RAW OUTPUT =====\n")
+            print(f"    [DEBUG] menu_name tu dong do duoc: {detected_name!r} (dang dung: {effective_name!r})")
 
-        options = parse_menu(raw, menu_name)
+        options = parse_menu(raw, effective_name) if effective_name else {}
 
         if debug:
             print(f"    [DEBUG] parse_menu -> {len(options)} option(s): {list(options.keys())}")
 
-        return hostname, options
+        return hostname, effective_name, options
     finally:
         try:
             tn.write("exit")
