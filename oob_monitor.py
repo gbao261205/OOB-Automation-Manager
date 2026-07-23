@@ -460,7 +460,9 @@ def monitor_loop(cfg, stop_event: threading.Event):
 
             _mprint(f"  [dim]Ten menu tu dong do duoc: '{menu_name}'.[/]")
             save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
-            _baseline_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+            _baseline_menu_name, _baseline_device_name, baseline = get_options_by_host(
+                cfg["baseline_db"], "baseline_menu", ip
+            )
 
             if baseline is None:
                 with _print_lock:
