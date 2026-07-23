@@ -30,7 +30,6 @@ from rich.text import Text
 from rich.layout import Layout
 from rich.live import Live
 
-# Nạp MiniTelnet từ thư viện của bạn để thực hiện Deep Verify
 from oob_lib import poll_host, MiniTelnet
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
@@ -59,7 +58,6 @@ oob_logs = deque(maxlen=MAX_LOG)
 verify_logs = deque(maxlen=MAX_LOG)
 ui_lock = threading.Lock()
 
-# Bố cục màn hình
 layout = Layout()
 layout.split_column(
     Layout(name="upper"),
@@ -88,8 +86,9 @@ def log_verify(msg: str):
     verify_logs.append(f"[dim]\\[{ts}][/] {msg}")
     update_ui()
 
+
 # ---------------------------------------------------------------------------
-# Các hàm tiện ích, cấu hình và Database (Giữ nguyên logic của bạn)
+# Các hàm tiện ích, cấu hình và Database
 # ---------------------------------------------------------------------------
 
 def load_config(path):
@@ -331,19 +330,28 @@ def print_options(options: dict):
 
 def extract_hostname(output: str) -> str:
     """Lọc hostname từ luồng ký tự trả về của Console."""
-    # Loại bỏ mã màu ANSI nếu có
     output = re.sub(r'\x1b\[.*?m', '', output)
     for line in reversed(output.splitlines()):
         line = line.strip()
-        # Tìm các dạng prompt phổ biến: Router>, Switch#, [HNI-R1]>
         m = re.search(r'([A-Za-z0-9_\-\.]+)[>#]', line)
         if m:
             return m.group(1)
     return None
 
 def run_deep_verify(alias, options):
-    """Tiến trình ngầm để verify thiết bị vật lý đầu cuối."""
+    """Tiến trình ngầm để verify thiết bị vật lý đầu cuối và lưu file log."""
     log_verify(f"[*] Bat dau kiem tra vat ly thiet bi cho OOB: [bold]{alias}[/]")
+    
+    # Chuẩn bị file log
+    os.makedirs("verify-logs", exist_ok=True)
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
+    
+    log_lines = []
+    log_lines.append(f"========== KET QUA DEEP VERIFY ==========")
+    log_lines.append(f"OOB Alias : {alias}")
+    log_lines.append(f"Thoi gian : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_lines.append(f"-----------------------------------------")
     
     for key, opt in options.items():
         desc = opt.get("description", "")
@@ -354,31 +362,44 @@ def run_deep_verify(alias, options):
         port = opt.get("port", 23)
         
         try:
-            # Giao thức reverse console chủ yếu là telnet
             session = MiniTelnet(ip, port, timeout=4)
-            # Gửi 2 lần Enter để đánh thức prompt (AutoCommand behavior)
             session.write("\r\n\r\n")
-            
-            # Đọc cho đến khi thấy dấu hiệu của prompt mạng
             output = session.read_until([">", "#", "login:", "Password:"], timeout=4)
             session.close()
             
             act_host = extract_hostname(output)
             
             if not act_host:
-                log_verify(f"[dim][-][/] {alias} (Opt {key}): Timeout hoac khong the doc prompt.")
+                msg_ui = f"[dim][-][/] {alias} (Opt {key}): Timeout hoac khong the doc prompt."
+                msg_file = f"[-] Option {key}: TIMEOUT hoac khong thay prompt (Desc: {desc} | Port: {port})"
+                log_verify(msg_ui)
+                log_lines.append(msg_file)
                 continue
             
-            # Verify Rule: Description == Hostname
             if act_host.lower() == desc.lower():
-                log_verify(f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})")
+                msg_ui = f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})"
+                msg_file = f"[OK] Option {key}: Khop chuan (Hostname: {act_host} | Port: {port})"
+                log_verify(msg_ui)
+                log_lines.append(msg_file)
             else:
-                log_verify(f"[bold red]CANH BAO[/] Phat hien thiet bi noi line console ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!")
+                msg_ui = f"[bold red]CANH BAO[/] Phat hien thiet bi noi line console ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!"
+                msg_file = f"[CANH BAO] Option {key}: SAI LECH! (Thuc te noi vao: {act_host} | Description: {desc} | Port: {port})"
+                log_verify(msg_ui)
+                log_lines.append(msg_file)
                 
         except Exception as e:
-            log_verify(f"[dim][LOI][/] {alias} (Opt {key}): Khong the ket noi den port {port} ({str(e)})")
+            msg_ui = f"[dim][LOI][/] {alias} (Opt {key}): Khong the ket noi den port {port} ({str(e)})"
+            msg_file = f"[LOI] Option {key}: Khong the ket noi port {port} ({str(e)})"
+            log_verify(msg_ui)
+            log_lines.append(msg_file)
             
     log_verify(f"[green]✓[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
+    log_lines.append(f"-----------------------------------------")
+    log_lines.append(f"HOAN THANH KET XUAT LOG.\n")
+    
+    # Ghi file log
+    with open(log_file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(log_lines))
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +407,7 @@ def run_deep_verify(alias, options):
 # ---------------------------------------------------------------------------
 
 def input_with_timeout(prompt_text: str, timeout: int = 5):
-    """Hàm lấy input có giới hạn thời gian, trả về str nếu có nhập, hoặc None nếu timeout."""
     _con.print(prompt_text, end="")
-    
     if platform.system() == "Windows":
         import msvcrt
         start_time = time.time()
@@ -423,7 +442,6 @@ def run_daemon(cfg):
 
     update_ui()
     
-    # Khởi chạy giao diện Live
     with Live(layout, refresh_per_second=4, screen=False) as live:
         _live_ui = live
         log_oob(f"[green][START][/] Khoi dong chu ky {cfg['interval']}s.")
@@ -460,7 +478,6 @@ def run_daemon(cfg):
                     _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
 
                     if baseline is None:
-                        # Tạm ngưng Live để tránh nhiễu I/O khi nhập
                         live.stop() 
                         _con.print(f"\n  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
                         _con.print(f"      {hn_label} | {menu_n} option:")
@@ -473,22 +490,18 @@ def run_daemon(cfg):
                         if ans == "y":
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
-                            # Kích hoạt Deep Verify cho thiết bị vừa xác nhận
                             threading.Thread(target=run_deep_verify, args=(alias, snapshot), daemon=True).start()
                         else:
                             _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
                             
-                        # Mở lại Live
                         live.start() 
                         continue
 
                     if options_equal(baseline, snapshot):
                         log_oob(f"[green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
-                        # Thiết bị OK -> Bắn luồng Verify vật lý song song
                         threading.Thread(target=run_deep_verify, args=(alias, baseline), daemon=True).start()
                         continue
 
-                    # Tạm ngưng Live để xử lý cảnh báo
                     live.stop()
                     _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
                     print_diff(baseline, snapshot)
@@ -504,15 +517,13 @@ def run_daemon(cfg):
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
-                        # Kích hoạt Verify cấu hình mới
                         threading.Thread(target=run_deep_verify, args=(alias, snapshot), daemon=True).start()
                     else:
                         _con.print(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
                     
-                    live.start() # Mở lại Live
+                    live.start() 
 
                 log_oob(f"[dim][zzz] Dang cho {cfg['interval']}s de quet lai...[/]")
-                # Sleep hoàn toàn bình thường, luồng Verify bên dưới vẫn tự do báo cáo lên UI
                 time.sleep(cfg["interval"])
 
         except KeyboardInterrupt:
@@ -522,9 +533,39 @@ def run_daemon(cfg):
 
 
 # ---------------------------------------------------------------------------
-# Chuc nang Xem/Tim Kiem & Quản lý (Giữ nguyên)
+# Chuc nang Xem/Tim Kiem & Quản lý
 # ---------------------------------------------------------------------------
 
+def view_latest_verify_log():
+    """Doc va hien thi file log verify gan nhat."""
+    log_dir = "verify-logs"
+    if not os.path.exists(log_dir):
+        _con.print("\n  [yellow][!][/] Chua co thu muc 'verify-logs'. Chua co ket qua quet nao.")
+        return
+        
+    files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith('.log')]
+    if not files:
+        _con.print("\n  [yellow][!][/] Thu muc 'verify-logs' dang trong.")
+        return
+        
+    # Lấy file mới nhất dựa trên thời gian sửa đổi (Modified Time)
+    latest_file = max(files, key=os.path.getmtime)
+    
+    try:
+        with open(latest_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        _con.print()
+        _con.print(Panel(
+            content, 
+            title=f"[bold magenta]📝 LOG VERIFY GAN NHAT: {os.path.basename(latest_file)}[/]", 
+            border_style="magenta", 
+            padding=(1, 2)
+        ))
+    except Exception as e:
+        _con.print(f"  [red][LOI][/] Khong doc duoc file {latest_file}: {e}")
+
+# ... (Các hàm list_devices, view_baseline, search_device, scan_specific_devices giữ nguyên)
 def list_devices(cfg):
     hosts = load_ip_list(cfg["ip_list"])
     if not hosts:
@@ -587,7 +628,6 @@ def search_device(cfg):
         pr = _norm_proto(entry.get("protocol"))
         pt = entry.get("port", 22 if pr == "ssh" else 23)
         _con.print(f"    [cyan]→[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [[bold cyan]{key}[/]] {entry.get('description', '')} [dim]→ {pr}://{entry['ip']}:{pt}[/]")
-
 
 def scan_specific_devices(cfg):
     targets_input = _con.input("  [cyan]Nhap IP/Alias (cach nhau dau phay, de trong de quet TAT CA)[/]: ").strip()
@@ -685,6 +725,7 @@ def _show_menu(cfg):
     grid.add_row("[5]", "Xem baseline (Chuan)")
     grid.add_row("[6]", "Tim kiem thiet bi")
     grid.add_row("[7]", "[bold green]Quet kiem tra tuc thi (Chi dinh hoac Tat ca)[/]")
+    grid.add_row("[8]", "[bold magenta]Xem ket qua Verify vat ly gan nhat[/]")
     grid.add_row("", "")
     grid.add_row("[0]", "[bold red]Thoat[/]")
 
@@ -723,6 +764,8 @@ def main_menu(cfg, config_path):
             search_device(cfg)
         elif choice == "7":
             scan_specific_devices(cfg)
+        elif choice == "8":
+            view_latest_verify_log()
         elif choice == "0":
             _con.print("\n[dim]Tam biet.[/]")
             sys.exit(0)
