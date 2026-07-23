@@ -319,7 +319,7 @@ def input_with_timeout(prompt_text: str, timeout: int = 5):
                 input_str += char
             time.sleep(0.05)
         print() 
-        return None  # Đổi thành None
+        return None
     else:
         import select
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -342,16 +342,12 @@ def run_daemon(cfg):
     try:
         while True:
             hosts = load_ip_list(cfg["ip_list"])
+            
+            # Quét vòng lặp tự động (Đã xóa quét tay qua Enter)
             if not hosts:
                 _mprint("[yellow][!][/] Danh sach IP trong. Doi them thiet bi...")
-                # Thay vì dùng time.sleep cứng ngắc, ta dùng input_with_timeout
-            	prompt_skip = f"[dim][zzz] Dang cho {cfg['interval']}s... (An Enter de quet luon)[/]: "
-            	skip_cmd = input_with_timeout(prompt_skip, timeout=cfg["interval"])
-            
-            	# Nếu skip_cmd trả về chuỗi (nghĩa là user có ấn Enter, không bị timeout)
-            	if skip_cmd is not None:
-                	_mprint("[*] Da bo qua thoi gian cho. Tien hanh quet ngay lap tuc!")
-                	continue
+                time.sleep(cfg["interval"])
+                continue
 
             for ip, alias in hosts:
                 _mprint(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
@@ -380,10 +376,9 @@ def run_daemon(cfg):
                     _con.print(f"      {hn_label} | {menu_n} option:")
                     print_options(snapshot)
                     
-                    # Đã thay _con.input bằng input_with_timeout
                     prompt_msg = f"  Xac nhan day la CHUAN cho {alias}? (y/N) [Bo qua sau 5s]: "
                     ans_raw = input_with_timeout(prompt_msg, timeout=5)
-					ans = ans_raw.strip().lower() if ans_raw is not None else ""
+                    ans = ans_raw.strip().lower() if ans_raw is not None else ""
                     
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
@@ -412,7 +407,6 @@ def run_daemon(cfg):
                     save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                     _mprint(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
                 else:
-                    # Nếu user gõ n, hoặc quá 5s (ans = "") thì báo giữ nguyên
                     _mprint(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
 
             _mprint(f"[dim][zzz] Dang cho {cfg['interval']}s...[/]")
@@ -493,19 +487,23 @@ def search_device(cfg):
 # Quet theo chi dinh (Terminal 1)
 # ---------------------------------------------------------------------------
 def scan_specific_devices(cfg):
-    targets_input = _con.input("  [cyan]Nhap IP hoac Alias can quet (cach nhau dau phay)[/]: ").strip()
-    if not targets_input:
-        return
-
-    # Tách chuỗi người dùng nhập thành list
-    target_list = [t.strip().lower() for t in targets_input.split(",")]
+    targets_input = _con.input("  [cyan]Nhap IP/Alias (cach nhau dau phay, de trong de quet TAT CA)[/]: ").strip()
     all_hosts = load_ip_list(cfg["ip_list"])
     
-    # Lọc ra các thiết bị khớp IP hoặc Alias
+    if not all_hosts:
+        _con.print("  [yellow][!][/] Danh sach IP hien dang trong. Vui long them IP truoc.")
+        return
+
     hosts_to_scan = []
-    for ip, alias in all_hosts:
-        if ip.lower() in target_list or alias.lower() in target_list:
-            hosts_to_scan.append((ip, alias))
+
+    # Logic quét tất cả nếu để trống, hoặc lọc theo danh sách nếu có nhập
+    if not targets_input:
+        hosts_to_scan = all_hosts
+    else:
+        target_list = [t.strip().lower() for t in targets_input.split(",")]
+        for ip, alias in all_hosts:
+            if ip.lower() in target_list or alias.lower() in target_list:
+                hosts_to_scan.append((ip, alias))
 
     if not hosts_to_scan:
         _con.print("  [yellow][!][/] Khong co IP/Alias nao khop voi danh sach 'oob_ips.txt'.")
@@ -588,7 +586,7 @@ def _show_menu(cfg):
     grid.add_row("[4]", "Xem danh sach thiet bi")
     grid.add_row("[5]", "Xem baseline (Chuan)")
     grid.add_row("[6]", "Tim kiem thiet bi")
-	grid.add_row("[7]", "[bold green]Quet kiem tra tuc thi (Chi dinh IP/Ten)[/]")
+    grid.add_row("[7]", "[bold green]Quet kiem tra tuc thi (Chi dinh hoac Tat ca)[/]")
     grid.add_row("", "")
     grid.add_row("[0]", "[bold red]Thoat[/]")
 
@@ -625,7 +623,7 @@ def main_menu(cfg, config_path):
             view_baseline(cfg)
         elif choice == "6":
             search_device(cfg)
-		elif choice == "7":
+        elif choice == "7":
             scan_specific_devices(cfg)
         elif choice == "0":
             _con.print("\n[dim]Tam biet.[/]")
