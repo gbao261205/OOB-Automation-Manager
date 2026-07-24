@@ -480,32 +480,31 @@ def fetch_hostname_via_auto(host, ssh_port, telnet_port,
             pass
         tn.close()
 
-def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, menu_name, updates, timeout=10):
+def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, updates_list, timeout=10):
     """
-    Kết nối, vào config mode, ghi đè toàn bộ description bị sai trong 1 phiên.
-    THOÁT RA và KHÔNG LƯU (no write memory).
-    updates: dict dạng {option_key: new_description_string}
+    Kết nối, ghi đè cấu hình và BẮT LỖI TỪ CISCO IOS.
+    updates_list: danh sách các tuple (real_menu_name, real_key, new_desc)
     """
-    if not updates: 
+    if not updates_list: 
         return True
         
     tn = connect_auto(host, ssh_port, telnet_port, username, password, enable_password, timeout=timeout)
     try:
-        # Vào chế độ cấu hình toàn cục
         tn.write("configure terminal")
         tn.read_until("(config)#", timeout=5)
         
-        # Ghi đè từng line bị sai
-        for key, new_desc in updates.items():
-            # Cú pháp chuẩn của IOS: menu <name> text <key> <text>
-            tn.write(f"menu {menu_name} text {key} {new_desc}")
-            tn.read_until("(config)#", timeout=5)
-            
-        # Thoát an toàn (Không write memory)
+        all_success = True
+        for m_name, k, new_desc in updates_list:
+            tn.write(f"menu {m_name} text {k} {new_desc}")
+            out = tn.read_until("(config)#", timeout=5)
+            # Kiểm tra xem thiết bị Cisco có từ chối lệnh không
+            if "%" in out:
+                all_success = False
+                
         tn.write("end")
         tn.read_until("#", timeout=5)
-        return True
-    except Exception as e:
+        return all_success
+    except Exception:
         return False
     finally:
         try:

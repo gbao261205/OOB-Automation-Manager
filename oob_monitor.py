@@ -708,14 +708,14 @@ def check_ip_collision(cfg, target_ip, current_oob_ip):
     return len(hosts - {current_oob_ip}) > 0
 
 def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, print_fn=None):
-    """Xử lý đẩy cấu hình tự động cho các Option báo CANH BAO."""
+    """Xử lý đẩy cấu hình tự động và tách chuỗi Menu/Key chuẩn."""
     if print_fn is None: print_fn = log_verify
     
     warnings = [r for r in verify_results if r["status"] == "CANH BAO"]
     if not warnings:
         return
 
-    updates = {}
+    updates_list = []
     push_log_entries = []
     
     mn, dn, _ = get_options_by_host(cfg["baseline_db"], "baseline_menu", oob_ip)
@@ -732,25 +732,44 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
             continue
             
         new_desc = f"----> {act_host}"
-        updates[key] = new_desc
+        
+        # --- BÓC TÁCH MENU NAME VÀ KEY THẬT ---
+        real_menu_name = mn
+        real_key = key
+        # Nếu key có chứa ngoặc vuông (VD: "OOB-CTO-02 [1]")
+        if " [" in key and key.endswith("]"):
+            parts = key.split(" [")
+            real_menu_name = parts[0]       # Lấy "OOB-CTO-02"
+            real_key = parts[1][:-1]        # Lấy "1" (bỏ dấu ngoặc ']')
+            
+        updates_list.append((real_menu_name, real_key, new_desc))
+        
         push_log_entries.append({
-            "key": key, "target_ip": target_ip,
-            "old": w["desc"], "new": new_desc
+            "key": key, 
+            "real_menu_name": real_menu_name,
+            "real_key": real_key,
+            "target_ip": target_ip,
+            "old": w["desc"], 
+            "new": new_desc
         })
 
-    if not updates: return
+    if not updates_list: return
 
-    print_fn(f"[*] Dang tu dong PUSH sua loi {len(updates)} option cho {alias}...")
+    print_fn(f"[*] Dang tu dong PUSH sua loi {len(updates_list)} option cho {alias}...")
+    
+    # Gửi mảng dữ liệu đã làm sạch xuống thư viện
     success = push_menu_descriptions(
         oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"],
         cfg["username"], cfg["password"], cfg["enable_password"],
-        mn, updates, timeout=10
+        updates_list, timeout=10
     )
 
     if not success:
-        print_fn(f"[red][LOI][/] {alias}: Push cau hinh that bai.")
+        print_fn(f"[red][LOI][/] {alias}: Push cau hinh that bai (Cisco tu choi lenh hoac mat ket noi).")
+        # Dừng lại ngay, không update memory hay file DB để không sinh ra Ảo ảnh
         return
 
+    # CHỈ CẬP NHẬT DB VÀ LOG KHI SWITCH THỰC SỰ CHẤP NHẬN LỆNH
     os.makedirs("push-logs", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join("push-logs", f"Push_{alias}_{ts_str}.log")
@@ -760,19 +779,21 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
         f.write(f"Thoi gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
         for entry in push_log_entries:
+            # Cập nhật Baseline vào RAM
             key = entry["key"]
             baseline[key]["description"] = entry["new"] 
             
             f.write(f"- Option [{key}] (Target IP: {entry['target_ip']}):\n")
             f.write(f"  + Cu : {entry['old']}\n")
             f.write(f"  + Moi: {entry['new']}\n")
-            f.write(f"  + REVERT CMD (Hồi phục): menu {mn} text {key} {entry['old']}\n\n")
+            f.write(f"  + REVERT CMD: menu {entry['real_menu_name']} text {entry['real_key']} {entry['old']}\n\n")
 
+    # Lưu Baseline mới xuống File DB
     save_options(cfg["baseline_db"], "baseline_menu", oob_ip, mn, dn, baseline)
     print_fn(f"[green]✓[/] Da cap nhat cau hinh & Baseline (Khong Auto-save write memory).")
 
     print_fn(f"[*] Tu dong Re-Verify lai cac option vua sua tren {alias}...")
-    subset_options = {k: baseline[k] for k in updates.keys()}
+    subset_options = {entry["key"]: baseline[entry["key"]] for entry in push_log_entries}
     run_deep_verify(cfg, alias, oob_ip, subset_options, print_fn=print_fn)
 
 
