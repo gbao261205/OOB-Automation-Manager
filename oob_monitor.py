@@ -352,7 +352,7 @@ CMD_TELNET_RE = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)
 CMD_SSH_RE    = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+ssh\s+(?:-l\s+\S+\s+|\S+@)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:\s+(\d+))?', re.IGNORECASE)
 
 def clean_key(raw_key: str) -> str:
-    return re.sub(r'\W+', '', raw_key)
+    return raw_key.strip()
 
 def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_name_override=None, ssh_port=22, timeout=10):
     tn = connect_auto(ip, ssh_port, telnet_port, username, password, enable_password, timeout=timeout)
@@ -738,9 +738,9 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
         real_key = key
         # Nếu key có chứa ngoặc vuông (VD: "OOB-CTO-02 [1]")
         if " [" in key and key.endswith("]"):
-            parts = key.split(" [")
-            real_menu_name = parts[0]       # Lấy "OOB-CTO-02"
-            real_key = parts[1][:-1]        # Lấy "1" (bỏ dấu ngoặc ']')
+            parts = key.rsplit(" [", 1)
+            real_menu_name = parts[0]       # Lấy tên menu (VD: "KTHT")
+            real_key = parts[1][:-1]
             
         updates_list.append((real_menu_name, real_key, new_desc))
         
