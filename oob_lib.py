@@ -381,7 +381,7 @@ def parse_menu(output: str, menu_name: str) -> dict:
     
     # Hàm con để làm sạch key (biến "[3]" thành "3")
     def clean_key(raw_key: str) -> str:
-        return re.sub(r'\W+', '', raw_key)
+        return raw_key.strip()
         
     for raw_line in output.splitlines():
         line = raw_line.strip()
