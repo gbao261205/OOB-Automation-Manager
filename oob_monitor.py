@@ -18,7 +18,7 @@ import sys
 import time
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 
 from rich import box as rbox
@@ -53,6 +53,13 @@ DEFAULT_CONFIG = {
     "snapshot_db": "snapshot.db",
     "auto_verify": True,        
     "auto_push_desc": True,     
+    # Lich chay Deep Verify tu dong (run_verify_daemon). "interval" = giu
+    # hanh vi cu (lap lai moi verify_interval giay). "daily" = chay 1 lan/ngay
+    # vao dung gio verify_schedule_time. "weekly" = chay 1 lan/tuan vao dung
+    # thu + gio da chon.
+    "verify_schedule_mode": "interval",   # "interval" | "daily" | "weekly"
+    "verify_schedule_time": "01:00",      # "HH:MM", dung cho "daily"/"weekly"
+    "verify_schedule_weekday": "mon",     # mon/tue/wed/thu/fri/sat/sun, dung cho "weekly"
 }
 
 # ---------------------------------------------------------------------------
@@ -114,6 +121,108 @@ def save_config(path, cfg):
 def mask(value):
     return "******" if value else "(chua dat)"
 
+
+# ---------------------------------------------------------------------------
+# Lich chay theo gio/thu trong ngay (dung cho Deep Verify tu dong)
+# ---------------------------------------------------------------------------
+
+_WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_WEEKDAY_LABELS = {
+    "mon": "Thu 2", "tue": "Thu 3", "wed": "Thu 4", "thu": "Thu 5",
+    "fri": "Thu 6", "sat": "Thu 7", "sun": "Chu nhat",
+}
+
+
+def _parse_hhmm(text, default="01:00"):
+    """Doc chuoi 'HH:MM' -> (gio, phut). Tra ve gia tri mac dinh neu sai dinh dang."""
+    try:
+        h_str, m_str = str(text).strip().split(":")
+        h, m = int(h_str), int(m_str)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except (ValueError, AttributeError):
+        pass
+    dh, dm = default.split(":")
+    return int(dh), int(dm)
+
+
+def compute_next_scheduled_run(mode, time_str, weekday_str, now=None):
+    """Tinh thoi diem (datetime) cua lan chay TIEP THEO dua tren lich da cau
+    hinh - dung cho Deep Verify tu dong khi 'verify_schedule_mode' la 'daily'
+    hoac 'weekly' (thay vi lap lai theo 'verify_interval' giay nhu truoc).
+
+    - mode='daily' : chay moi ngay dung vao gio 'time_str' (VD '01:00' = 1h sang).
+    - mode='weekly': chay 1 lan/tuan, dung thu 'weekday_str' (mon..sun) va gio
+      'time_str'.
+    """
+    now = now or datetime.now()
+    hh, mm = _parse_hhmm(time_str)
+    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    if mode == "weekly":
+        target_wd = _WEEKDAY_MAP.get((weekday_str or "mon").strip().lower()[:3], 0)
+        days_ahead = (target_wd - now.weekday()) % 7
+        candidate = candidate + timedelta(days=days_ahead)
+        if candidate <= now:
+            candidate += timedelta(days=7)
+        return candidate
+
+    # mode == "daily" (mac dinh khi cau hinh khong hop le)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+def _describe_verify_schedule(cfg):
+    mode = cfg.get("verify_schedule_mode", "interval")
+    if mode == "daily":
+        return f"Hang ngay luc {cfg.get('verify_schedule_time', '01:00')}"
+    if mode == "weekly":
+        wd = (cfg.get("verify_schedule_weekday", "mon") or "mon").strip().lower()[:3]
+        wd_label = _WEEKDAY_LABELS.get(wd, wd)
+        return f"Hang tuan vao {wd_label} luc {cfg.get('verify_schedule_time', '01:00')}"
+    return f"Lap lai moi {cfg.get('verify_interval', 3600)}s (che do interval)"
+
+
+def _edit_verify_schedule(cfg):
+    print(f"""
+  --- Lich chay Deep Verify tu dong ---
+  Hien tai: {_describe_verify_schedule(cfg)}
+  1. Lap lai theo chu ky (interval, giay) - hanh vi mac dinh cu
+  2. Hang ngay, vao 1 gio co dinh (VD 01:00 = 1 gio sang)
+  3. Hang tuan, vao 1 thu + gio co dinh (VD Thu 2 luc 01:00)
+""")
+    mode_choice = input("  Chon che do (1/2/3): ").strip()
+
+    if mode_choice == "1":
+        cfg["verify_schedule_mode"] = "interval"
+        print("  [*] Da chuyen ve che do lap lai theo chu ky (muc 'v' o menu Cau hinh).")
+        return
+
+    if mode_choice == "2":
+        cfg["verify_schedule_mode"] = "daily"
+        val = input(f"  Gio chay moi ngay, dinh dang HH:MM (hien tai: {cfg.get('verify_schedule_time', '01:00')}): ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        print(f"  [*] Da dat lich: Hang ngay luc {cfg.get('verify_schedule_time', '01:00')}.")
+        return
+
+    if mode_choice == "3":
+        cfg["verify_schedule_mode"] = "weekly"
+        print("  Chon thu trong tuan: mon=Thu2 tue=Thu3 wed=Thu4 thu=Thu5 fri=Thu6 sat=Thu7 sun=CN")
+        wd_val = input(f"  Thu (hien tai: {cfg.get('verify_schedule_weekday', 'mon')}): ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP:
+            cfg["verify_schedule_weekday"] = wd_val[:3]
+        val = input(f"  Gio chay, dinh dang HH:MM (hien tai: {cfg.get('verify_schedule_time', '01:00')}): ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        print(f"  [*] Da dat lich: {_describe_verify_schedule(cfg)}.")
+        return
+
+    print("  [!] Lua chon khong hop le, giu nguyen lich cu.")
+
+
 def settings_menu(cfg, config_path):
     while True:
         print(f"""
@@ -133,6 +242,7 @@ v. Chu ky Verify vat ly (s): {cfg.get('verify_interval', 3600)}
 a. File snapshot DB     : {cfg['snapshot_db']}
 b. Tu dong Verify ngam  : {'[BAT]' if cfg.get('auto_verify', True) else '[TAT]'}
 c. Tu dong Sua loi ngam : {'[BAT]' if cfg.get('auto_push_desc', True) else '[TAT]'}
+d. Lich chay Verify     : {_describe_verify_schedule(cfg)}
 0. Quay lai menu chinh
 --------------------------------------------------""")
         choice = input("Chon muc can sua: ").strip().lower()
@@ -172,6 +282,8 @@ c. Tu dong Sua loi ngam : {'[BAT]' if cfg.get('auto_push_desc', True) else '[TAT
             cfg["auto_verify"] = not cfg.get("auto_verify", True)
         elif choice == "c":
             cfg["auto_push_desc"] = not cfg.get("auto_push_desc", True)
+        elif choice == "d":
+            _edit_verify_schedule(cfg)
         elif choice == "0":
             save_config(config_path, cfg)
             print(f"[*] Da luu cau hinh vao {config_path}")
@@ -862,26 +974,47 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
 # ---------------------------------------------------------------------------
 
 def run_verify_daemon(cfg):
-    """Tiến trình Daemon thứ 2 chuyên lặp lịch Deep Verify độc lập & Tự động phục hồi."""
-    verify_interval = cfg.get("verify_interval", 3600)
-    log_verify(f"[green][START][/] Khoi dong chu ky Verify vat ly moi {verify_interval}s.")
-    
-    time.sleep(15) 
-    
+    """Tiến trình Daemon thứ 2 chuyên lặp lịch Deep Verify độc lập & Tự động phục hồi.
+
+    Hỗ trợ 3 chế độ lập lịch qua cfg['verify_schedule_mode']:
+      - "interval" (mặc định, giữ nguyên hành vi cũ): lặp lại mỗi
+        cfg['verify_interval'] giây.
+      - "daily": chạy 1 lần/ngày, đúng giờ cfg['verify_schedule_time'] (VD
+        "01:00" = chạy lúc 1 giờ sáng mỗi ngày).
+      - "weekly": chạy 1 lần/tuần, đúng thứ cfg['verify_schedule_weekday'] +
+        giờ cfg['verify_schedule_time'] (VD Thứ 2 lúc 01:00).
+    """
+    schedule_mode = cfg.get("verify_schedule_mode", "interval")
+    log_verify(f"[green][START][/] Khoi dong Verify vat ly - lich: {_describe_verify_schedule(cfg)}.")
+
+    time.sleep(15)
+
     while True:
         hosts = load_ip_list(cfg["ip_list"])
-        if not hosts:
-            time.sleep(verify_interval)
-            continue
-            
-        for ip, alias in hosts:
-            _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-            if baseline:
-                results = run_deep_verify(cfg, alias, ip, baseline)
-                process_push_and_reverify(cfg, alias, ip, baseline, results)
-                
-        log_verify(f"[dim][zzz] Dang cho {verify_interval}s cho dot Verify tiep theo...[/]")
-        time.sleep(verify_interval)
+        if hosts:
+            for ip, alias in hosts:
+                _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+                if baseline:
+                    results = run_deep_verify(cfg, alias, ip, baseline)
+                    process_push_and_reverify(cfg, alias, ip, baseline, results)
+
+        # Doc lai lich moi lan (cho phep nhan thay doi neu cfg duoc cap nhat
+        # trong cung tien trinh) roi tinh thoi gian cho toi lan chay tiep theo.
+        schedule_mode = cfg.get("verify_schedule_mode", "interval")
+        if schedule_mode in ("daily", "weekly"):
+            next_run = compute_next_scheduled_run(
+                schedule_mode,
+                cfg.get("verify_schedule_time", "01:00"),
+                cfg.get("verify_schedule_weekday", "mon"),
+            )
+            sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()))
+            log_verify(f"[dim][zzz] Lan Verify tiep theo: {next_run.strftime('%Y-%m-%d %H:%M')} "
+                       f"(con {sleep_seconds}s)...[/]")
+        else:
+            sleep_seconds = cfg.get("verify_interval", 3600)
+            log_verify(f"[dim][zzz] Dang cho {sleep_seconds}s cho dot Verify tiep theo...[/]")
+
+        time.sleep(sleep_seconds)
 
 def input_with_timeout(prompt_text: str, timeout: int = 5):
     _con.print(prompt_text, end="")
