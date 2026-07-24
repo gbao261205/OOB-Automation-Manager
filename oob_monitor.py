@@ -239,14 +239,18 @@ def _init_db(path, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN device_name TEXT")
     if "protocol" not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN protocol TEXT DEFAULT 'telnet'")
+    if "raw_key" not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN raw_key TEXT")
+    if "real_menu_name" not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN real_menu_name TEXT")
     conn.commit()
     return conn
 
 def get_options_by_host(db_path, table, host):
     conn = _init_db(db_path, table)
     cur = conn.execute(
-        f"SELECT menu_name, option_key, device_name, description, target_ip, target_port, protocol "
-        f"FROM {table} WHERE host=?", (host,)
+        f"SELECT menu_name, option_key, device_name, description, target_ip, target_port, protocol, "
+        f"raw_key, real_menu_name FROM {table} WHERE host=?", (host,)
     )
     rows = cur.fetchall()
     conn.close()
@@ -254,10 +258,15 @@ def get_options_by_host(db_path, table, host):
         return None, None, None
     menu_name   = rows[0][0]
     device_name = rows[0][2]
-    options = {
-        key: {"description": desc, "ip": ip, "port": port, "protocol": proto}
-        for _mn, key, _dn, desc, ip, port, proto in rows
-    }
+    options = {}
+    for _mn, key, _dn, desc, ip, port, proto, raw_key, real_menu_name in rows:
+        entry = {"description": desc, "ip": ip, "port": port, "protocol": proto}
+        # _raw_key/_menu_name giu CHINH XAC cu phap key that tren thiet bi (vd
+        # "[4]" khac "4") va ten menu thuc su cua option nay - dung khi push
+        # cau hinh, KHONG duoc tu suy dien lai tu chuoi hien thi (option_key).
+        entry["_raw_key"] = raw_key if raw_key else key
+        entry["_menu_name"] = real_menu_name if real_menu_name else _mn
+        options[key] = entry
     return menu_name, device_name, options
 
 def get_updated_at_by_host(db_path, table, host):
@@ -274,9 +283,11 @@ def save_options(db_path, table, host, menu_name, device_name, options):
     for key, entry in options.items():
         conn.execute(
             f"INSERT INTO {table} (host, menu_name, option_key, device_name, description, "
-            f"target_ip, target_port, protocol, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"target_ip, target_port, protocol, raw_key, real_menu_name, updated_at) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (host, menu_name, key, device_name, entry.get("description", ""), entry["ip"],
-             entry.get("port", 23), entry.get("protocol", "telnet"), now),
+             entry.get("port", 23), entry.get("protocol", "telnet"),
+             entry.get("_raw_key", key), entry.get("_menu_name", menu_name), now),
         )
     conn.commit()
     conn.close()
@@ -423,14 +434,21 @@ def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_n
                 real_key = cmd_k
                 desc = ""
                 
-            # Render ra key để hiển thị UI (có kèm tên Menu nếu có nhiều Menu)
-            ui_key = f"{m_name} [{real_key}]" if len(menu_names) > 1 else real_key
-            
+            # Render ra key để hiển thị UI (có kèm tên Menu nếu có nhiều Menu).
+            # LUU Y: real_key co the DA la "[4]" (nhan ngoac vuong) hoac "4"
+            # (nhan tran) - phai giu CHINH XAC dinh dang nay rieng cho push cau
+            # hinh sau nay; chuoi hien thi (ui_key) chi de con nguoi doc, khong
+            # duoc dung de suy nguoc ra cu phap that (se gay nham "[4]" <-> "4").
+            display_key = real_key[1:-1] if real_key.startswith("[") and real_key.endswith("]") else real_key
+            ui_key = f"{m_name} [{display_key}]" if len(menu_names) > 1 else display_key
+
             final_options[ui_key] = {
                 "description": desc,
                 "ip": cmd_data["ip"],
                 "port": cmd_data["port"],
-                "protocol": cmd_data["protocol"]
+                "protocol": cmd_data["protocol"],
+                "_raw_key": real_key,      # cu phap that: "4" hoac "[4]"
+                "_menu_name": m_name,      # ten menu that (khong phai chuoi gop)
             }
             
         combined_menu_name = " + ".join(sorted(menu_names))
@@ -741,7 +759,11 @@ def check_ip_collision(cfg, target_ip, current_oob_ip):
 def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, print_fn=None):
     """Xử lý đẩy cấu hình tự động và tách chuỗi Menu/Key chuẩn."""
     if print_fn is None: print_fn = log_verify
-    
+
+    # CHI push tu dong khi tinh nang nay dang duoc BAT trong cau hinh.
+    if not cfg.get("auto_push_desc", True):
+        return
+
     warnings = [r for r in verify_results if r["status"] == "CANH BAO"]
     if not warnings:
         return
@@ -756,7 +778,8 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
     for w in warnings:
         key = w["key"]
         act_host = w["act_host"]
-        target_ip = baseline[key].get("ip")
+        opt = baseline.get(key, {})
+        target_ip = opt.get("ip")
         
         if check_ip_collision(cfg, target_ip, oob_ip):
             print_fn(f"[yellow][!][/] {alias} (Opt {key}): Nghi ngo trung IP {target_ip} tren nhieu OOB. Bo qua tu dong sua.")
@@ -764,15 +787,21 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
             
         new_desc = f"----> {act_host}"
         
-        # --- BÓC TÁCH MENU NAME VÀ KEY THẬT ---
-        real_menu_name = mn
-        real_key = key
-        # Nếu key có chứa ngoặc vuông (VD: "OOB-CTO-02 [1]")
-        if " [" in key and key.endswith("]"):
-            parts = key.rsplit(" [", 1)
-            real_menu_name = parts[0]       # Lấy tên menu (VD: "KTHT")
-            real_key = parts[1][:-1]
-            
+        # --- DUNG CHINH XAC MENU NAME / KEY THAT DA LUU TU LUC QUET ---
+        # opt["_menu_name"]/opt["_raw_key"] duoc poll_host_multi() ghi lai dung
+        # cu phap tren thiet bi (vd key that su la "[4]" chu khong phai "4").
+        # KHONG duoc tu suy dien lai tu chuoi hien thi 'key' - do la nguyen
+        # nhan gay ra loi push nham "4" thay vi "[4]" (tao option moi thay vi
+        # sua option cu).
+        real_menu_name = opt.get("_menu_name")
+        real_key = opt.get("_raw_key")
+        if not real_menu_name or not real_key:
+            # Baseline cu (luu truoc khi co _menu_name/_raw_key) - khong the
+            # biet chac cu phap that, bo qua de an toan thay vi doan mo.
+            print_fn(f"[yellow][!][/] {alias} (Opt {key}): Baseline cu khong co thong tin key that, "
+                     f"bo qua tu dong sua (hay quet lai Option 7 de cap nhat baseline).")
+            continue
+
         updates_list.append((real_menu_name, real_key, new_desc))
         
         push_log_entries.append({
