@@ -424,49 +424,42 @@ def clear_stuck_line(cfg, oob_ip, console_port):
     except Exception:
         return False
 
+# ---------------------------------------------------------------------------
+# Module Deep Verify (Background Thread Độc lập & Pivot qua OOB)
+# ---------------------------------------------------------------------------
+
 def extract_hostname(output: str) -> str:
     """Lọc hostname từ luồng ký tự trả về của Console."""
     output = re.sub(r'\x1b\[.*?m', '', output)
     lines = [line.strip() for line in output.splitlines() if line.strip()]
-    
     auth_seen = False
     
-    # Quét ngược từ dưới lên để lấy prompt/banner mới nhất
     for line in reversed(lines):
-        # 1. Bắt các prompt chuẩn (VD: R1>, Switch#, [HNI-R1]>)
+        # BỎ QUA các dòng log phản hồi hệ thống (Echo lệnh) từ OOB
+        if "telnet " in line or "ssh " in line or "Trying " in line or "Open" in line or "Connection refused" in line or "disconnect" in line:
+            continue
+            
         m = re.search(r'([A-Za-z0-9_\-\.]+)[>#]', line)
-        if m:
-            return m.group(1)
+        if m: return m.group(1)
             
-        # 2. Bắt prompt đăng nhập có kèm hostname (VD: R1 login:)
         m_login = re.search(r'^([A-Za-z0-9_\-\.]+)\s+login:', line, re.IGNORECASE)
-        if m_login:
-            return m_login.group(1)
+        if m_login: return m_login.group(1)
             
-        # 3. Bắt banner của FreeBSD/Juniper (VD: FreeBSD/amd64 (CTO-BRAS-CTR-02-08) (ttyu0))
         m_bsd = re.search(r'\(([A-Za-z0-9_\-\.]+)\)\s*\(tty', line, re.IGNORECASE)
-        if m_bsd:
-            return m_bsd.group(1)
+        if m_bsd: return m_bsd.group(1)
             
-        # NẾU THẤY ĐÒI PASS/USER: Đánh dấu lại nhưng KHÔNG thoát, tiếp tục quét ngược lên tìm banner
         if re.search(r'Username:|Password:|login:', line, re.IGNORECASE):
             auth_seen = True
             
-    # Nếu quét đến tận cùng mà không thấy hostname, nhưng lại có dấu hiệu đòi đăng nhập
-    if auth_seen:
-        return "AUTH_REQUIRED"
-        
+    if auth_seen: return "AUTH_REQUIRED"
     return None
 
 def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
-    """Thực thi verify vật lý (co kem Smart Clear) va xuat log.
-    print_fn: Hàm in tùy biến. Nếu gọi từ Daemon dùng log_verify (hiển thị nửa dưới).
-              Nếu gọi từ giao diện Menu, dùng _con.print để hiển thị trực tiếp.
-    """
+    """Thực thi verify vật lý (PIVOT + Smart Clear) va xuat log."""
     if print_fn is None:
         print_fn = log_verify
         
-    print_fn(f"[*] Bat dau kiem tra vat ly thiet bi cho OOB: [bold]{alias}[/]")
+    print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
     
     os.makedirs("verify-logs", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -477,69 +470,100 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     log_lines.append(f"OOB Alias : {alias} ({oob_ip})")
     log_lines.append(f"Thoi gian : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log_lines.append(f"-----------------------------------------")
-    
+
+    # BƯỚC 1: ĐĂNG NHẬP VÀO OOB
+    try:
+        print_fn(f"    [dim]Dang dang nhap vao OOB de pivot...[/]")
+        session = connect_auto(
+            oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], 
+            cfg["username"], cfg["password"], cfg["enable_password"], timeout=10
+        )
+        session.write("terminal length 0")
+        session.read_until("#", timeout=3)
+    except Exception as e:
+        msg = f"[red][LOI][/] Khong the dang nhap de pivot vao OOB {alias}: {e}"
+        print_fn(msg)
+        log_lines.append(msg)
+        return
+
+    # HÀM PHỤ THỰC THI PIOVOT TELNET
+    def check_port_via_oob(t_ip, t_port, proto):
+        session.write("\r\n")
+        cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
+        
+        session.write(cmd)
+        time.sleep(1.5) # Cho telnet khởi tạo
+        session.write("\r\n\r\n") # Wake up prompt
+        
+        # Đọc phản hồi (Bao gồm cả các thông báo kết nối)
+        out = session.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
+        
+        # THOÁT HIỂM: Gửi \x1ex (Ctrl+Shift+6, x) để trả về OOB Prompt
+        session.write("\x1ex")
+        time.sleep(0.5)
+        session.write("\r\n")
+        session.read_until("#", timeout=2)
+        
+        # DỌN DẸP RÁC: Disconnect session lơ lửng
+        session.write("disconnect\n")
+        time.sleep(0.5)
+        session.write("\n") # Bấm Enter xác nhận [confirm]
+        session.read_until("#", timeout=2)
+        
+        return out
+
+    # BƯỚC 2: QUÉT TỪNG LINE TỪ TRONG OOB
     for key, opt in options.items():
         desc = opt.get("description", "")
-        if not desc:
-            continue
+        if not desc: continue
             
         target_ip = opt.get("ip")
         port = opt.get("port", 23)
+        proto = opt.get("protocol", "telnet")
         
         act_host = None
         conn_error = ""
 
-        def try_fetch_prompt(t_ip, t_port):
-            """Hàm phụ thử kết nối và gõ Enter mồi prompt có độ trễ cho Serial"""
-            session = MiniTelnet(t_ip, t_port, timeout=5)
-            # FIX TIMING: Chờ 1.5s cho line serial ổn định rồi mới gõ phím
-            time.sleep(1.5) 
-            session.write("\r\n")
-            time.sleep(0.5)
-            session.write("\r\n")
-            out = session.read_until([">", "#", "login:", "Username:", "Password:"], timeout=5)
-            session.close()
-            return out
-
-        # LẦN 1: Thu ket noi binh thuong
+        # LẦN 1: Pivot qua OOB
         try:
-            output = try_fetch_prompt(target_ip, port)
+            output = check_port_via_oob(target_ip, port, proto)
             act_host = extract_hostname(output)
         except Exception as e:
             conn_error = str(e)
             
-        # NẾU LẦN 1 THẤT BẠI (Do Line kẹt hoặc không phản hồi)
+        # NẾU LẦN 1 THẤT BẠI (Line kẹt hoặc Connection Refused)
         if not act_host:
-            # Chi clear line doi voi port reverse telnet (2000+)
             if port > 2000:
                 line_to_clear = port - 2000
-                print_fn(f"[yellow][!][/] {alias} (Opt {key}): Line {line_to_clear} dang ket hoac timeout. Dang clear line...")
+                print_fn(f"[yellow][!][/] {alias} (Opt {key}): Line {line_to_clear} dang ket. Dang clear line {line_to_clear}...")
                 log_lines.append(f"[*] Option {key}: Phat hien ket line {line_to_clear}. Dang clear line...")
                 
-                if clear_stuck_line(cfg, oob_ip, port):
-                    time.sleep(2) # Cho line reset hoan toan
-                    
-                    # LẦN 2: Thu lai sau khi clear
-                    try:
-                        output = try_fetch_prompt(target_ip, port)
-                        act_host = extract_hostname(output)
-                    except Exception as e:
-                        conn_error = str(e)
-                else:
-                    print_fn(f"[dim][-][/] {alias}: Khong the clear line {line_to_clear} vao luc nay.")
+                # Thực hiện Clear Line trực tiếp trên Session đang mở!
+                session.write(f"clear line {line_to_clear}")
+                session.read_until("[confirm]", timeout=3)
+                session.write("\n")
+                session.read_until("#", timeout=3)
+                time.sleep(2) # Chờ switch reset line
+                
+                # LẦN 2: Thử lại sau khi clear
+                try:
+                    output = check_port_via_oob(target_ip, port, proto)
+                    act_host = extract_hostname(output)
+                except Exception as e:
+                    conn_error = str(e)
             else:
-                log_lines.append(f"[*] Option {key}: Port {port} la Direct Access, bo qua thao tac clear line tren OOB.")
-        
+                log_lines.append(f"[*] Option {key}: Port {port} la Direct Access, bo qua thao tac clear line.")
+
         # ĐÁNH GIÁ KẾT QUẢ CUỐI CÙNG
         if not act_host:
-            msg_ui = f"[dim][-][/] {alias} (Opt {key}): TIMEOUT hoac Lỗi mạng ({conn_error})"
+            msg_ui = f"[dim][-][/] {alias} (Opt {key}): TIMEOUT hoac Loi mang"
             msg_file = f"[-] Option {key}: TIMEOUT hoac khong the truy cap (Desc: {desc} | Port: {port})"
             print_fn(msg_ui)
             log_lines.append(msg_file)
             continue
             
         if act_host == "AUTH_REQUIRED":
-            msg_ui = f"[yellow][?][/] {alias} (Opt {key}): Yeu cau dang nhap nhung khong hien Hostname"
+            msg_ui = f"[yellow][?][/] {alias} (Opt {key}): Thiet bi yeu cau dang nhap (Khong thay hostname)"
             msg_file = f"[?] Option {key}: YEU CAU DANG NHAP, khong the xac minh (Desc: {desc} | Port: {port})"
             print_fn(msg_ui)
             log_lines.append(msg_file)
@@ -556,10 +580,17 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             print_fn(msg_ui)
             log_lines.append(msg_file)
             
+    # BƯỚC 3: KẾT THÚC & DỌN DẸP PHIÊN
     print_fn(f"[green]✓[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
     log_lines.append(f"-----------------------------------------")
     log_lines.append(f"HOAN THANH KET XUAT LOG.\n")
     
+    try:
+        #session.write("exit\n")
+        session.close()
+    except Exception:
+        pass
+        
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
