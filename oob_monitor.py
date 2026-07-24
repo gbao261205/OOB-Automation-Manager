@@ -2,10 +2,10 @@
 """
 oob_monitor.py
 
-Cong cu giam sat (READ-ONLY) menu OOB va Verify vat ly.
+Cong cu giam sat, Verify vat ly va Tu dong phuc hoi (Self-healing) menu OOB.
 Kien truc Multi-Terminal:
-    - Terminal 1: Giam sat lien tuc (Daemon) + Deep Verify (Smart Clear).
-    - Terminal 2: Menu Quan ly - Them/Xoa IP, Cau hinh, Xem danh sach, Log.
+    - Terminal 1: Giam sat lien tuc (Daemon) + Deep Verify (Smart Clear) + Auto Push.
+    - Terminal 2: Menu Quan ly - Them/Xoa IP, Cau hinh, Xem danh sach, Log, Manual Push.
 """
 
 import getpass
@@ -30,10 +30,11 @@ from rich.text import Text
 from rich.layout import Layout
 from rich.live import Live
 
-# Import the connect_auto, MiniTelnet, fetch_hostname
+# Import tu oob_lib: Them ham push_menu_descriptions o cuoi
 from oob_lib import (
     poll_host, MiniTelnet, connect_auto, fetch_hostname,
     fetch_hostname_via_auto, hostname_matches_description,
+    push_menu_descriptions
 )
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
@@ -403,7 +404,7 @@ def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_n
 
 
 # ---------------------------------------------------------------------------
-# Module Deep Verify (Background Thread Độc lập & Smart Clear Line)
+# Module Deep Verify & Smart Clear Line
 # ---------------------------------------------------------------------------
 
 def clear_stuck_line(cfg, oob_ip, console_port):
@@ -427,41 +428,28 @@ def clear_stuck_line(cfg, oob_ip, console_port):
     except Exception:
         return False
 
-# ---------------------------------------------------------------------------
-# Module Deep Verify (Background Thread Độc lập & Pivot qua OOB)
-# ---------------------------------------------------------------------------
-
 def extract_hostname(output: str) -> str:
     """Lọc hostname từ luồng ký tự trả về của Console."""
-    # Xóa mã màu ANSI
     output = re.sub(r'\x1b\[.*?m', '', output)
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     auth_seen = False
     
     for line in reversed(lines):
-        # BỎ QUA các dòng log phản hồi hệ thống (Echo lệnh) từ OOB
         if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line"]):
             continue
 
-        # BỎ QUA các dòng báo lỗi kết nối rõ ràng (pivot chưa tới được thiết bị đích) -
-        # nếu không sẽ dễ đọc nhầm dòng prompt NGAY SAU đó (vốn có thể vẫn là prompt
-        # của chính OOB) thành hostname của thiết bị đích.
         if re.search(r'refused|time(d)?[\s-]?out|unreachable|no route to host|unknown host|% ', line, re.IGNORECASE):
             continue
             
-        # 1. Bắt prompt chuẩn (VD: R1>, Switch#)
         m = re.search(r'([A-Za-z0-9_\-\.]+)[>#]', line)
         if m: return m.group(1)
             
-        # 2. Bắt prompt đăng nhập Juniper/Linux (Bỏ dấu neo ^ để linh hoạt hơn)
         m_login = re.search(r'([A-Za-z0-9_\-\.]+)\s+login:', line, re.IGNORECASE)
         if m_login: return m_login.group(1)
             
-        # 3. Bắt banner của FreeBSD (VD: FreeBSD/amd64 (CTO-BRAS-CTR-02-08) (ttyu0))
         m_bsd = re.search(r'\(([A-Za-z0-9_\-\.]+)\)\s*\(tty', line, re.IGNORECASE)
         if m_bsd: return m_bsd.group(1)
             
-        # Đánh dấu có thấy form đăng nhập
         if re.search(r'Username:|Password:|login:', line, re.IGNORECASE):
             auth_seen = True
             
@@ -472,8 +460,6 @@ def _truncate(text, width):
     text = "" if text is None else str(text)
     return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
-
-# Thu tu hien thi: nghiem trong nhat (CANH BAO) len dau, OK xuong cuoi.
 _VERIFY_STATUS_ORDER = {
     "CANH BAO": 0,
     "KHONG PIVOT": 1,
@@ -489,11 +475,7 @@ _VERIFY_STATUS_LABEL = {
     "OK": "OK",
 }
 
-
 def _build_verify_report(alias, oob_ip, own_hostname, results):
-    """Dung danh sach 'results' (moi phan tu la 1 dict: key/status/act_host/
-    desc/port/note) de dung thanh 1 bao cao dang bang, can le cot ro rang va
-    sap xep theo do nghiem trong - thay cho chuoi log_lines lien tuc truoc day."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     counts = {}
@@ -569,13 +551,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         
     print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
 
-    # Lay hostname CUA CHINH OOB nay truoc khi quet tung port.
-    # Ly do: neu lenh "telnet/ssh sang thiet bi dich" chay TU BEN TRONG OOB bi
-    # tu choi/timeout, session van con dang o console cua CHINH OOB. Truoc day
-    # extract_hostname() se doc nham prompt do la hostname cua "thiet bi noi vao",
-    # dan den bao "SAI LECH" gia (act_host thuc chat la hostname cua OOB, khong
-    # phai cua thiet bi o dau day). Co own_hostname de doi chieu va loai tru truong
-    # hop nay ngay ben duoi.
     own_hostname = None
     try:
         own_hostname = fetch_hostname_via_auto(
@@ -590,9 +565,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
 
-    results = []  # 1 dict/option: key, status, act_host, desc, port, note
+    results = [] 
 
-    # HÀM PHỤ: Tạo 1 phiên MỚI HOÀN TOÀN cho mỗi port để tránh kẹt Escape Sequence
     def check_port_via_oob(t_ip, t_port, proto):
         session = connect_auto(
             oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], 
@@ -603,17 +577,14 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         
         cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
         session.write(cmd)
-        time.sleep(1.5) # Cho telnet khởi tạo
-        session.write("\r\n\r\n") # Wake up prompt
+        time.sleep(1.5) 
+        session.write("\r\n\r\n") 
         
         out = session.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
-        
-        # ĐÓNG LUÔN SESSION OOB -> Tự động kill tiến trình telnet con chạy bên trong nó!
         session.close() 
         return out
 
     def clear_line_via_oob(t_port):
-        """Hàm phụ dọn dẹp line bị kẹt"""
         line_num = t_port - 2000
         if line_num <= 0: return False
         try:
@@ -630,7 +601,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         except Exception:
             return False
 
-    # BƯỚC 2: QUÉT TỪNG LINE ĐỘC LẬP
     for key, opt in options.items():
         desc = opt.get("description", "")
         if not desc: continue
@@ -643,14 +613,12 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         conn_error = ""
         note_parts = []
 
-        # LẦN 1: Pivot qua OOB
         try:
             output = check_port_via_oob(target_ip, port, proto)
             act_host = extract_hostname(output)
         except Exception as e:
             conn_error = str(e)
             
-        # NẾU LẦN 1 THẤT BẠI (Line kẹt hoặc Connection Refused)
         if not act_host:
             if port > 2000:
                 line_to_clear = port - 2000
@@ -658,8 +626,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 note_parts.append(f"Da phat hien ket line {line_to_clear}, da thu clear line")
 
                 if clear_line_via_oob(port):
-                    time.sleep(2) # Chờ switch reset line
-                    # LẦN 2: Thử lại sau khi clear
+                    time.sleep(2) 
                     try:
                         output = check_port_via_oob(target_ip, port, proto)
                         act_host = extract_hostname(output)
@@ -673,7 +640,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
 
         note = "; ".join(note_parts)
 
-        # ĐÁNH GIÁ KẾT QUẢ CUỐI CÙNG
         if not act_host:
             msg_ui = f"[dim][-][/] {alias} (Opt {key}): TIMEOUT hoac Loi mang"
             print_fn(msg_ui)
@@ -688,14 +654,9 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                              "desc": desc, "port": port, "note": note})
             continue
             
-        # CHUẨN HÓA DESCRIPTION: Xóa các mũi tên "----> " để so sánh công bằng
         desc_clean = re.sub(r'^[-=>\s]+', '', desc).strip().lower()
         act_host_clean = act_host.strip().lower()
 
-        # BẢO VỆ: hostname đọc được trùng với hostname CỦA CHÍNH OOB này -> lệnh
-        # pivot (telnet/ssh) chưa thực sự sang được thiết bị đích, session vẫn ở
-        # console của OOB. Đây là "không pivot được", KHÔNG PHẢI "SAI LỆCH", nên
-        # không được gộp chung vào cảnh báo sai lệch (tránh báo động giả).
         if own_hostname_clean and act_host_clean == own_hostname_clean:
             msg_ui = f"[dim][-][/] {alias} (Opt {key}): Khong pivot duoc toi thiet bi dich (van dang o console OOB)"
             print_fn(msg_ui)
@@ -704,9 +665,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                              "desc": desc, "port": port, "note": note})
             continue
 
-        # So sanh theo TU DOC LAP (word-boundary) thay vi so sanh chuoi con "in",
-        # tranh nham lan kieu hostname="CTO-SW-02-2" khop nham voi description
-        # chua "CTO-SW-02-20".
         if act_host_clean == desc_clean or hostname_matches_description(act_host, desc_clean):
             msg_ui = f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})"
             print_fn(msg_ui)
@@ -718,15 +676,103 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             results.append({"key": key, "status": "CANH BAO", "act_host": act_host,
                              "desc": desc, "port": port, "note": note})
 
-    # BƯỚC 3: KẾT THÚC & DỌN DẸP PHIÊN
     print_fn(f"[green]✓[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
 
     report_text = _build_verify_report(alias, oob_ip, own_hostname, results)
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write(report_text)
 
+    # TRẢ VỀ KẾT QUẢ CHO TIẾN TRÌNH TỰ ĐỘNG SỬA LỖI
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Module Self-Healing (Tự động phục hồi Description bị sai)
+# ---------------------------------------------------------------------------
+
+def check_ip_collision(cfg, target_ip, current_oob_ip):
+    """Kiểm tra xem target_ip đích có đang bị gán lặp chéo ở một thiết bị OOB nào khác không."""
+    conn = _init_db(cfg["baseline_db"], "baseline_menu")
+    cur = conn.execute("SELECT host FROM baseline_menu WHERE target_ip=?", (target_ip,))
+    hosts = {row[0] for row in cur.fetchall()}
+    conn.close()
+    return len(hosts - {current_oob_ip}) > 0
+
+def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, print_fn=None):
+    """Xử lý đẩy cấu hình tự động cho các Option báo CANH BAO."""
+    if print_fn is None: print_fn = log_verify
+    
+    warnings = [r for r in verify_results if r["status"] == "CANH BAO"]
+    if not warnings:
+        return
+
+    updates = {}
+    push_log_entries = []
+    
+    mn, dn, _ = get_options_by_host(cfg["baseline_db"], "baseline_menu", oob_ip)
+    if not mn:
+        return
+
+    for w in warnings:
+        key = w["key"]
+        act_host = w["act_host"]
+        target_ip = baseline[key].get("ip")
+        
+        if check_ip_collision(cfg, target_ip, oob_ip):
+            print_fn(f"[yellow][!][/] {alias} (Opt {key}): Nghi ngo trung IP {target_ip} tren nhieu OOB. Bo qua tu dong sua.")
+            continue
+            
+        new_desc = f"----> {act_host}"
+        updates[key] = new_desc
+        push_log_entries.append({
+            "key": key, "target_ip": target_ip,
+            "old": w["desc"], "new": new_desc
+        })
+
+    if not updates: return
+
+    print_fn(f"[*] Dang tu dong PUSH sua loi {len(updates)} option cho {alias}...")
+    success = push_menu_descriptions(
+        oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"],
+        cfg["username"], cfg["password"], cfg["enable_password"],
+        mn, updates, timeout=10
+    )
+
+    if not success:
+        print_fn(f"[red][LOI][/] {alias}: Push cau hinh that bai.")
+        return
+
+    os.makedirs("push-logs", exist_ok=True)
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join("push-logs", f"Push_{alias}_{ts_str}.log")
+    
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"=== PUSH LOG TỰ ĐỘNG: {alias} ({oob_ip}) ===\n")
+        f.write(f"Thoi gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        for entry in push_log_entries:
+            key = entry["key"]
+            baseline[key]["description"] = entry["new"] 
+            
+            f.write(f"- Option [{key}] (Target IP: {entry['target_ip']}):\n")
+            f.write(f"  + Cu : {entry['old']}\n")
+            f.write(f"  + Moi: {entry['new']}\n")
+            f.write(f"  + REVERT CMD (Hồi phục): menu {mn} text {key} {entry['old']}\n\n")
+
+    save_options(cfg["baseline_db"], "baseline_menu", oob_ip, mn, dn, baseline)
+    print_fn(f"[green]✓[/] Da cap nhat cau hinh & Baseline (Khong Auto-save write memory).")
+
+    print_fn(f"[*] Tu dong Re-Verify lai cac option vua sua tren {alias}...")
+    subset_options = {k: baseline[k] for k in updates.keys()}
+    run_deep_verify(cfg, alias, oob_ip, subset_options, print_fn=print_fn)
+
+
+# ---------------------------------------------------------------------------
+# Vòng lặp giám sát (Daemon Thread)
+# ---------------------------------------------------------------------------
+
 def run_verify_daemon(cfg):
-    """Tiến trình Daemon thứ 2 chuyên lặp lịch Deep Verify độc lập."""
+    """Tiến trình Daemon thứ 2 chuyên lặp lịch Deep Verify độc lập & Tự động phục hồi."""
     verify_interval = cfg.get("verify_interval", 3600)
     log_verify(f"[green][START][/] Khoi dong chu ky Verify vat ly moi {verify_interval}s.")
     
@@ -741,15 +787,11 @@ def run_verify_daemon(cfg):
         for ip, alias in hosts:
             _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
             if baseline:
-                run_deep_verify(cfg, alias, ip, baseline)
+                results = run_deep_verify(cfg, alias, ip, baseline)
+                process_push_and_reverify(cfg, alias, ip, baseline, results)
                 
         log_verify(f"[dim][zzz] Dang cho {verify_interval}s cho dot Verify tiep theo...[/]")
         time.sleep(verify_interval)
-
-
-# ---------------------------------------------------------------------------
-# Vòng lặp giám sát Cấu hình (Terminal Daemon)
-# ---------------------------------------------------------------------------
 
 def input_with_timeout(prompt_text: str, timeout: int = 5):
     _con.print(prompt_text, end="")
@@ -837,7 +879,13 @@ def run_daemon(cfg):
                         if ans == "y":
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
-                            threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                            
+                            # Tu dong Verify (Chay Thread de khong dung Daemon)
+                            def do_verify_and_push(c, al, i, sn):
+                                res = run_deep_verify(c, al, i, sn)
+                                process_push_and_reverify(c, al, i, sn, res)
+                            threading.Thread(target=do_verify_and_push, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                            
                         else:
                             _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
                             
@@ -863,7 +911,13 @@ def run_daemon(cfg):
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
-                        threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                        
+                        # Tu dong Verify sau khi doi Baseline (Thread ngam)
+                        def do_verify_and_push_2(c, al, i, sn):
+                            res = run_deep_verify(c, al, i, sn)
+                            process_push_and_reverify(c, al, i, sn, res)
+                        threading.Thread(target=do_verify_and_push_2, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                        
                     else:
                         _con.print(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
                     
@@ -1028,14 +1082,22 @@ def scan_specific_devices(cfg):
             if ans == "y":
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
-                threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                
+                def do_verify_and_push_manual_1(c, al, i, sn):
+                    res = run_deep_verify(c, al, i, sn)
+                    process_push_and_reverify(c, al, i, sn, res)
+                threading.Thread(target=do_verify_and_push_manual_1, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                
             else:
                 _con.print("  [dim][--] Bo qua.[/]")
             continue
 
         if options_equal(baseline, snapshot):
             _con.print(f"  [green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
-            threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
+            def do_verify_and_push_manual_2(c, al, i, sn):
+                res = run_deep_verify(c, al, i, sn)
+                process_push_and_reverify(c, al, i, sn, res)
+            threading.Thread(target=do_verify_and_push_manual_2, args=(cfg, alias, ip, snapshot), daemon=True).start()
             continue
 
         _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
@@ -1049,13 +1111,18 @@ def scan_specific_devices(cfg):
         if ans == "y":
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
             _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
-            threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
+            
+            def do_verify_and_push_manual_3(c, al, i, sn):
+                res = run_deep_verify(c, al, i, sn)
+                process_push_and_reverify(c, al, i, sn, res)
+            threading.Thread(target=do_verify_and_push_manual_3, args=(cfg, alias, ip, snapshot), daemon=True).start()
+            
         else:
             _con.print(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}.")
 
 
 def verify_specific_devices(cfg):
-    """Option 8: Quet Verify Vat ly tuc thi hien thi truc tiep tren Terminal 1"""
+    """Option 8: Quet Verify Vat ly tuc thi hien thi truc tiep tren Terminal 1 & Hoi Push"""
     targets_input = _con.input("  [cyan]Nhap IP/Alias can Verify vat ly (cach nhau dau phay, de trong de quet TAT CA)[/]: ").strip()
     all_hosts = load_ip_list(cfg["ip_list"])
     
@@ -1079,7 +1146,6 @@ def verify_specific_devices(cfg):
 
     _con.print(f"\n  [green][*] Bat dau Verify vat ly tuc thi {len(hosts_to_scan)} thiet bi...[/]")
     
-    # Hàm in tùy chỉnh để đẩy trực tiếp ra Terminal 1 với canh lề đẹp mắt
     def cli_print(msg):
         _con.print(f"    {msg}")
 
@@ -1088,11 +1154,20 @@ def verify_specific_devices(cfg):
         _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         
         if not baseline:
-            _con.print(f"  [yellow][!][/] OOB nay chua co Baseline (Chua duoc xac nhan chuan). Vui long quet cau hinh truoc (Option 7)!")
+            _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh truoc (Option 7)!")
             continue
             
-        # Chạy đồng bộ (không dùng Thread) để in trực tiếp ra Terminal hiện tại
-        run_deep_verify(cfg, alias, ip, baseline, print_fn=cli_print)
+        # Chạy đồng bộ Verify
+        results = run_deep_verify(cfg, alias, ip, baseline, print_fn=cli_print)
+        
+        # Kiểm tra Cảnh báo để gọi Self-healing ở chế độ thủ công
+        has_warning = any(r["status"] == "CANH BAO" for r in results)
+        if has_warning:
+            ans = _con.input("\n  [bold yellow]Phat hien sai lech thuc te (CANH BAO). Ban co muon tiep tuc tinh nang tu dong PUSH sua Description khong? (y/N)[/]: ").strip().lower()
+            if ans == 'y':
+                process_push_and_reverify(cfg, alias, ip, baseline, results, print_fn=cli_print)
+            else:
+                _con.print("  [dim]Da bo qua viec sua Description.[/]")
 
 
 def _show_menu(cfg):

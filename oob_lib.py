@@ -479,3 +479,37 @@ def fetch_hostname_via_auto(host, ssh_port, telnet_port,
         except OSError:
             pass
         tn.close()
+
+def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, menu_name, updates, timeout=10):
+    """
+    Kết nối, vào config mode, ghi đè toàn bộ description bị sai trong 1 phiên.
+    THOÁT RA và KHÔNG LƯU (no write memory).
+    updates: dict dạng {option_key: new_description_string}
+    """
+    if not updates: 
+        return True
+        
+    tn = connect_auto(host, ssh_port, telnet_port, username, password, enable_password, timeout=timeout)
+    try:
+        # Vào chế độ cấu hình toàn cục
+        tn.write("configure terminal")
+        tn.read_until("(config)#", timeout=5)
+        
+        # Ghi đè từng line bị sai
+        for key, new_desc in updates.items():
+            # Cú pháp chuẩn của IOS: menu <name> text <key> <text>
+            tn.write(f"menu {menu_name} text {key} {new_desc}")
+            tn.read_until("(config)#", timeout=5)
+            
+        # Thoát an toàn (Không write memory)
+        tn.write("end")
+        tn.read_until("#", timeout=5)
+        return True
+    except Exception as e:
+        return False
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
