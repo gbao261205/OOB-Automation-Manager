@@ -31,7 +31,10 @@ from rich.layout import Layout
 from rich.live import Live
 
 # Import the connect_auto, MiniTelnet, fetch_hostname
-from oob_lib import poll_host, MiniTelnet, connect_auto, fetch_hostname
+from oob_lib import (
+    poll_host, MiniTelnet, connect_auto, fetch_hostname,
+    fetch_hostname_via_auto, hostname_matches_description,
+)
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
 
@@ -439,6 +442,12 @@ def extract_hostname(output: str) -> str:
         # BỎ QUA các dòng log phản hồi hệ thống (Echo lệnh) từ OOB
         if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line"]):
             continue
+
+        # BỎ QUA các dòng báo lỗi kết nối rõ ràng (pivot chưa tới được thiết bị đích) -
+        # nếu không sẽ dễ đọc nhầm dòng prompt NGAY SAU đó (vốn có thể vẫn là prompt
+        # của chính OOB) thành hostname của thiết bị đích.
+        if re.search(r'refused|time(d)?[\s-]?out|unreachable|no route to host|unknown host|% ', line, re.IGNORECASE):
+            continue
             
         # 1. Bắt prompt chuẩn (VD: R1>, Switch#)
         m = re.search(r'([A-Za-z0-9_\-\.]+)[>#]', line)
@@ -465,7 +474,24 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         print_fn = log_verify
         
     print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
-    
+
+    # Lay hostname CUA CHINH OOB nay truoc khi quet tung port.
+    # Ly do: neu lenh "telnet/ssh sang thiet bi dich" chay TU BEN TRONG OOB bi
+    # tu choi/timeout, session van con dang o console cua CHINH OOB. Truoc day
+    # extract_hostname() se doc nham prompt do la hostname cua "thiet bi noi vao",
+    # dan den bao "SAI LECH" gia (act_host thuc chat la hostname cua OOB, khong
+    # phai cua thiet bi o dau day). Co own_hostname de doi chieu va loai tru truong
+    # hop nay ngay ben duoi.
+    own_hostname = None
+    try:
+        own_hostname = fetch_hostname_via_auto(
+            oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"],
+            cfg["username"], cfg["password"], cfg["enable_password"], timeout=6,
+        )
+    except Exception:
+        own_hostname = None
+    own_hostname_clean = (own_hostname or "").strip().lower()
+
     os.makedirs("verify-logs", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
@@ -572,7 +598,22 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         desc_clean = re.sub(r'^[-=>\s]+', '', desc).strip().lower()
         act_host_clean = act_host.strip().lower()
 
-        if act_host_clean == desc_clean or act_host_clean in desc_clean:
+        # BẢO VỆ: hostname đọc được trùng với hostname CỦA CHÍNH OOB này -> lệnh
+        # pivot (telnet/ssh) chưa thực sự sang được thiết bị đích, session vẫn ở
+        # console của OOB. Đây là "không pivot được", KHÔNG PHẢI "SAI LỆCH", nên
+        # không được gộp chung vào cảnh báo sai lệch (tránh báo động giả).
+        if own_hostname_clean and act_host_clean == own_hostname_clean:
+            msg_ui = f"[dim][-][/] {alias} (Opt {key}): Khong pivot duoc toi thiet bi dich (van dang o console OOB)"
+            msg_file = (f"[-] Option {key}: KHONG PIVOT DUOC - session van o console cua chinh OOB "
+                        f"({own_hostname}), chua thuc su ket noi toi thiet bi dich (Desc: {desc} | Port: {port})")
+            print_fn(msg_ui)
+            log_lines.append(msg_file)
+            continue
+
+        # So sanh theo TU DOC LAP (word-boundary) thay vi so sanh chuoi con "in",
+        # tranh nham lan kieu hostname="CTO-SW-02-2" khop nham voi description
+        # chua "CTO-SW-02-20".
+        if act_host_clean == desc_clean or hostname_matches_description(act_host, desc_clean):
             msg_ui = f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})"
             msg_file = f"[OK] Option {key}: Khop chuan (Hostname: {act_host} | Port: {port})"
             print_fn(msg_ui)

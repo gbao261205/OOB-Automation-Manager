@@ -364,6 +364,11 @@ def _hostname_matches_desc(hostname: str, description: str) -> bool:
     return hostname.upper() in tokens
 
 
+# Alias cong khai: oob_monitor.py va cac module khac nen dung ham nay (thay vi so
+# sanh chuoi con "in") de tranh nham lan kieu "CTO-SW-02-2" khop nham "CTO-SW-02-20".
+hostname_matches_description = _hostname_matches_desc
+
+
 # ---------------------------------------------------------------------------
 # Parse menu
 # ---------------------------------------------------------------------------
