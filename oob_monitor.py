@@ -372,37 +372,68 @@ def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_n
         if not menu_names:
             return hostname, None, {}
             
-        all_options = {}
+        # ==========================================
+        # THUẬT TOÁN 2 BƯỚC (TWO-PASS PARSER)
+        # ==========================================
+        all_texts = {}     # Rổ chứa nhãn hiển thị: (menu_name, key) -> description
+        all_commands = {}  # Rổ chứa lệnh IP: (menu_name, key) -> {ip, port, protocol}
+        
+        # BƯỚC 1: Quét và phân loại riêng biệt
         for raw_line in raw.splitlines():
             line = raw_line.strip()
             
             m = TEXT_RE.match(line)
             if m and m.group(1) in menu_names:
-                m_name, raw_k, desc = m.group(1), m.group(2), m.group(3).strip()
-                k = f"{m_name} [{clean_key(raw_k)}]" if len(menu_names) > 1 else clean_key(raw_k)
-                all_options.setdefault(k, {})["description"] = desc
+                m_name, raw_k, desc = m.group(1), m.group(2).strip(), m.group(3).strip()
+                all_texts[(m_name, raw_k)] = desc
                 continue
                 
             m = CMD_TELNET_RE.match(line)
             if m and m.group(1) in menu_names:
-                m_name, raw_k, target_ip = m.group(1), m.group(2), m.group(3)
-                port = int(m.group(4)) if m.group(4) else 23
-                k = f"{m_name} [{clean_key(raw_k)}]" if len(menu_names) > 1 else clean_key(raw_k)
-                entry = all_options.setdefault(k, {})
-                entry["ip"], entry["port"], entry["protocol"] = target_ip, port, "telnet"
+                m_name, raw_k = m.group(1), m.group(2).strip()
+                all_commands[(m_name, raw_k)] = {
+                    "ip": m.group(3),
+                    "port": int(m.group(4)) if m.group(4) else 23,
+                    "protocol": "telnet"
+                }
                 continue
                 
             m = CMD_SSH_RE.match(line)
             if m and m.group(1) in menu_names:
-                m_name, raw_k, target_ip = m.group(1), m.group(2), m.group(3)
-                port = int(m.group(4)) if m.group(4) else 22
-                k = f"{m_name} [{clean_key(raw_k)}]" if len(menu_names) > 1 else clean_key(raw_k)
-                entry = all_options.setdefault(k, {})
-                entry["ip"], entry["port"], entry["protocol"] = target_ip, port, "ssh"
+                m_name, raw_k = m.group(1), m.group(2).strip()
+                all_commands[(m_name, raw_k)] = {
+                    "ip": m.group(3),
+                    "port": int(m.group(4)) if m.group(4) else 22,
+                    "protocol": "ssh"
+                }
 
-        final_options = {k: v for k, v in all_options.items() if "ip" in v}
+        # BƯỚC 2: Móc nối Command với Text
+        final_options = {}
+        for (m_name, cmd_k), cmd_data in all_commands.items():
+            # ƯU TIÊN 1: Tìm nhãn có ngoặc vuông (VD: lệnh 4 -> ưu tiên móc với text [4])
+            if (m_name, f"[{cmd_k}]") in all_texts:
+                real_key = f"[{cmd_k}]"
+                desc = all_texts[(m_name, f"[{cmd_k}]")]
+            # ƯU TIÊN 2: Tìm nhãn số trần (VD: lệnh 4 -> móc với text 4)
+            elif (m_name, cmd_k) in all_texts:
+                real_key = cmd_k
+                desc = all_texts[(m_name, cmd_k)]
+            # Không có nhãn hiển thị nào
+            else:
+                real_key = cmd_k
+                desc = ""
+                
+            # Render ra key để hiển thị UI (có kèm tên Menu nếu có nhiều Menu)
+            ui_key = f"{m_name} [{real_key}]" if len(menu_names) > 1 else real_key
+            
+            final_options[ui_key] = {
+                "description": desc,
+                "ip": cmd_data["ip"],
+                "port": cmd_data["port"],
+                "protocol": cmd_data["protocol"]
+            }
+            
         combined_menu_name = " + ".join(sorted(menu_names))
-        
         return hostname, combined_menu_name, final_options
     finally:
         try:

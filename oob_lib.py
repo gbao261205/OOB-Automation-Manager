@@ -379,39 +379,76 @@ def parse_menu(output: str, menu_name: str) -> dict:
     Ho tro ca lenh telnet lan ssh trong menu."""
     options = {}
     
-    # Hàm con để làm sạch key (biến "[3]" thành "3")
+    # 1. Hàm làm sạch cơ bản (giữ nguyên để tránh lỗi khoảng trắng)
     def clean_key(raw_key: str) -> str:
         return raw_key.strip()
+
+    # 2. HÀM MỚI: Hàm Chuẩn hóa để GOM NHÓM (Bóc ngoặc vuông nếu có)
+    # Ví dụ: "[1]" -> "1", "1" -> "1", "[KTHT]" -> "KTHT"
+    def normalize_key(raw_key: str) -> str:
+        k = raw_key.strip()
+        if k.startswith("[") and k.endswith("]"):
+            return k[1:-1]
+        return k
         
     for raw_line in output.splitlines():
         line = raw_line.strip()
 
+        # Quét dòng TEXT (Hiển thị)
         m = TEXT_RE.match(line)
         if m and m.group(1) == menu_name:
-            key = clean_key(m.group(2))
-            options.setdefault(key, {})["description"] = m.group(3).strip()
+            original_key = clean_key(m.group(2))
+            norm_key = normalize_key(original_key)
+            
+            # Khởi tạo dict nếu chưa có, lưu lại CẢ original_key để dùng lúc Push
+            if norm_key not in options:
+                options[norm_key] = {"original_key": original_key}
+                
+            options[norm_key]["description"] = m.group(3).strip()
+            # Cập nhật original_key nếu dòng text có ngoặc vuông (ưu tiên lưu key hiển thị)
+            if original_key.startswith("["):
+                options[norm_key]["original_key"] = original_key
             continue
 
-        # Thu telnet truoc
+        # Quét dòng COMMAND TELNET
         m = CMD_TELNET_RE.match(line)
         if m and m.group(1) == menu_name:
-            key   = clean_key(m.group(2))
-            entry = options.setdefault(key, {})
+            norm_key = normalize_key(clean_key(m.group(2)))
+            
+            if norm_key not in options:
+                options[norm_key] = {"original_key": clean_key(m.group(2))}
+                
+            entry = options[norm_key]
             entry["ip"]       = m.group(3)
             entry["port"]     = int(m.group(4)) if m.group(4) else 23
             entry["protocol"] = "telnet"
             continue
 
-        # Thu ssh
+        # Quét dòng COMMAND SSH
         m = CMD_SSH_RE.match(line)
         if m and m.group(1) == menu_name:
-            key   = clean_key(m.group(2))
-            entry = options.setdefault(key, {})
+            norm_key = normalize_key(clean_key(m.group(2)))
+            
+            if norm_key not in options:
+                options[norm_key] = {"original_key": clean_key(m.group(2))}
+                
+            entry = options[norm_key]
             entry["ip"]       = m.group(3)
             entry["port"]     = int(m.group(4)) if m.group(4) else 22
             entry["protocol"] = "ssh"
 
-    return {k: v for k, v in options.items() if "ip" in v}
+    # Trả về dict, LỌC BỎ CÁC OPTION KHÔNG CÓ IP (như exit, resume)
+    # SỬ DỤNG original_key LÀM KEY CHÍNH CỦA DICTIONARY ĐỂ TOOL HIỂN THỊ ĐÚNG NGOẶC VUÔNG
+    final_options = {}
+    for norm_k, v in options.items():
+        if "ip" in v:
+            final_key = v.get("original_key", norm_k)
+            # Dọn dẹp original_key ra khỏi value dict trước khi trả về (cho sạch data)
+            if "original_key" in v:
+                del v["original_key"]
+            final_options[final_key] = v
+            
+    return final_options
 
 
 # ---------------------------------------------------------------------------
