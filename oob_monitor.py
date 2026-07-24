@@ -488,7 +488,18 @@ def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_n
         
         detected_names = list(set(MENU_NAME_RE.findall(raw)))
         if menu_name_override:
-            menu_names = [menu_name_override] if menu_name_override in detected_names else []
+            if menu_name_override not in detected_names:
+                # Day KHONG phai loi parse - thiet bi co menu hop le, chi la
+                # ten menu ep dung (cau hinh toan cuc trong Settings) khong
+                # khop voi thiet bi nay. Bao ro nguyen nhan thay vi de rot
+                # xuong thanh "Khong parse duoc menu hop le" chung chung.
+                found_str = ", ".join(detected_names) if detected_names else "(khong tim thay menu nao)"
+                raise ValueError(
+                    f"Ten menu ep dung 'menu_name_override={menu_name_override}' (cau hinh trong Settings) "
+                    f"khong ton tai tren thiet bi nay. Menu thuc te phat hien duoc: {found_str}. "
+                    f"Neu moi thiet bi dung ten menu khac nhau, hay de trong 'menu_name_override' de tu dong do."
+                )
+            menu_names = [menu_name_override]
         else:
             menu_names = detected_names
             
