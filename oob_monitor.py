@@ -51,6 +51,8 @@ DEFAULT_CONFIG = {
     "ip_list": "oob_ips.txt",
     "baseline_db": "baseline.db",
     "snapshot_db": "snapshot.db",
+    "auto_verify": True,        
+    "auto_push_desc": True,     
 }
 
 # ---------------------------------------------------------------------------
@@ -129,9 +131,11 @@ v. Chu ky Verify vat ly (s): {cfg.get('verify_interval', 3600)}
 8. File danh sach IP    : {cfg['ip_list']}
 9. File baseline DB     : {cfg['baseline_db']}
 a. File snapshot DB     : {cfg['snapshot_db']}
+b. Tu dong Verify ngam  : {'[BAT]' if cfg.get('auto_verify', True) else '[TAT]'}
+c. Tu dong Sua loi ngam : {'[BAT]' if cfg.get('auto_push_desc', True) else '[TAT]'}
 0. Quay lai menu chinh
 --------------------------------------------------""")
-        choice = input("Chon muc can sua: ").strip()
+        choice = input("Chon muc can sua: ").strip().lower()
 
         if choice == "1":
             cfg["username"] = input("  Username moi (Enter de bo trong): ").strip()
@@ -164,6 +168,10 @@ a. File snapshot DB     : {cfg['snapshot_db']}
         elif choice == "a":
             val = input(f"  File snapshot DB moi: ").strip()
             if val: cfg["snapshot_db"] = val
+        elif choice == "b":
+            cfg["auto_verify"] = not cfg.get("auto_verify", True)
+        elif choice == "c":
+            cfg["auto_push_desc"] = not cfg.get("auto_push_desc", True)
         elif choice == "0":
             save_config(config_path, cfg)
             print(f"[*] Da luu cau hinh vao {config_path}")
@@ -171,6 +179,7 @@ a. File snapshot DB     : {cfg['snapshot_db']}
         else:
             print("[!] Lua chon khong hop le.")
             continue
+            
         save_config(config_path, cfg)
 
 def load_ip_list(path):
