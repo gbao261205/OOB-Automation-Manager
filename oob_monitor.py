@@ -468,6 +468,100 @@ def extract_hostname(output: str) -> str:
     if auth_seen: return "AUTH_REQUIRED"
     return None
 
+def _truncate(text, width):
+    text = "" if text is None else str(text)
+    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+
+
+# Thu tu hien thi: nghiem trong nhat (CANH BAO) len dau, OK xuong cuoi.
+_VERIFY_STATUS_ORDER = {
+    "CANH BAO": 0,
+    "KHONG PIVOT": 1,
+    "TIMEOUT": 2,
+    "YEU CAU DANG NHAP": 3,
+    "OK": 4,
+}
+_VERIFY_STATUS_LABEL = {
+    "CANH BAO": "CANH BAO",
+    "KHONG PIVOT": "KO PIVOT",
+    "TIMEOUT": "TIMEOUT",
+    "YEU CAU DANG NHAP": "YC DANG NHAP",
+    "OK": "OK",
+}
+
+
+def _build_verify_report(alias, oob_ip, own_hostname, results):
+    """Dung danh sach 'results' (moi phan tu la 1 dict: key/status/act_host/
+    desc/port/note) de dung thanh 1 bao cao dang bang, can le cot ro rang va
+    sap xep theo do nghiem trong - thay cho chuoi log_lines lien tuc truoc day."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    summary = "   ".join(
+        f"{_VERIFY_STATUS_LABEL[s]}: {counts.get(s, 0)}"
+        for s in ("CANH BAO", "KHONG PIVOT", "TIMEOUT", "YEU CAU DANG NHAP", "OK")
+        if counts.get(s, 0)
+    ) or "Khong co option nao duoc quet"
+
+    headers = ["STT", "Option", "Trang thai", "Hostname thuc te", "Description", "Port", "Ghi chu"]
+    max_w   = [4,     22,       12,           22,                 32,             6,      36]
+
+    ordered = sorted(
+        enumerate(results),
+        key=lambda p: (_VERIFY_STATUS_ORDER.get(p[1]["status"], 9), p[0]),
+    )
+
+    rows = []
+    for i, (_, r) in enumerate(ordered, start=1):
+        rows.append([
+            str(i),
+            _truncate(r["key"], max_w[1]),
+            _VERIFY_STATUS_LABEL.get(r["status"], r["status"]),
+            _truncate(r.get("act_host") or "-", max_w[3]),
+            _truncate(r.get("desc") or "-", max_w[4]),
+            str(r.get("port", "") or ""),
+            _truncate(r.get("note") or "", max_w[6]),
+        ])
+
+    widths = []
+    for i, h in enumerate(headers):
+        col_max = max([len(h)] + [len(row[i]) for row in rows]) if rows else len(h)
+        widths.append(min(max(col_max, len(h)), max_w[i]))
+
+    def fmt_row(cols):
+        return "│ " + " │ ".join(cols[i].ljust(widths[i]) for i in range(len(cols))) + " │"
+
+    def fmt_sep(left, mid, right):
+        return left + mid.join("─" * (w + 2) for w in widths) + right
+
+    table_width = sum(widths) + 3 * len(widths) + 1
+    bar = "=" * max(table_width, 60)
+
+    lines = []
+    lines.append(bar)
+    lines.append(f" BAO CAO DEEP VERIFY - OOB: {alias} ({oob_ip})")
+    lines.append(f" Thoi gian      : {now_str}")
+    lines.append(f" Hostname OOB   : {own_hostname or '(khong xac dinh duoc)'}")
+    lines.append(f" Tong so option : {len(results)}")
+    lines.append(f" Tom tat        : {summary}")
+    lines.append(bar)
+    lines.append(fmt_sep("┌", "┬", "┐"))
+    lines.append(fmt_row(headers))
+    lines.append(fmt_sep("├", "┼", "┤"))
+    if rows:
+        for row in rows:
+            lines.append(fmt_row(row))
+    else:
+        lines.append("│ " + "(khong co option nao co description de kiem tra)".ljust(table_width - 4) + " │")
+    lines.append(fmt_sep("└", "┴", "┘"))
+    lines.append(bar)
+    lines.append(f" HOAN THANH luc {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(bar)
+    return "\n".join(lines)
+
+
 def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     """Thực thi verify vật lý (PIVOT Mới + Smart Clear) va xuat log."""
     if print_fn is None:
@@ -495,12 +589,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     os.makedirs("verify-logs", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
-    
-    log_lines = []
-    log_lines.append(f"========== KET QUA DEEP VERIFY ==========")
-    log_lines.append(f"OOB Alias : {alias} ({oob_ip})")
-    log_lines.append(f"Thoi gian : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log_lines.append(f"-----------------------------------------")
+
+    results = []  # 1 dict/option: key, status, act_host, desc, port, note
 
     # HÀM PHỤ: Tạo 1 phiên MỚI HOÀN TOÀN cho mỗi port để tránh kẹt Escape Sequence
     def check_port_via_oob(t_ip, t_port, proto):
@@ -551,6 +641,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         
         act_host = None
         conn_error = ""
+        note_parts = []
 
         # LẦN 1: Pivot qua OOB
         try:
@@ -564,8 +655,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             if port > 2000:
                 line_to_clear = port - 2000
                 print_fn(f"[yellow][!][/] {alias} (Opt {key}): Line {line_to_clear} dang ket. Dang clear line {line_to_clear}...")
-                log_lines.append(f"[*] Option {key}: Phat hien ket line {line_to_clear}. Dang clear line...")
-                
+                note_parts.append(f"Da phat hien ket line {line_to_clear}, da thu clear line")
+
                 if clear_line_via_oob(port):
                     time.sleep(2) # Chờ switch reset line
                     # LẦN 2: Thử lại sau khi clear
@@ -576,22 +667,25 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                         conn_error = str(e)
                 else:
                     print_fn(f"[dim][-][/] {alias}: Khong the clear line {line_to_clear} vao luc nay.")
+                    note_parts.append("Khong clear duoc line")
             else:
-                log_lines.append(f"[*] Option {key}: Port {port} la Direct Access, bo qua thao tac clear line.")
+                note_parts.append("Port la Direct Access, bo qua clear line")
+
+        note = "; ".join(note_parts)
 
         # ĐÁNH GIÁ KẾT QUẢ CUỐI CÙNG
         if not act_host:
             msg_ui = f"[dim][-][/] {alias} (Opt {key}): TIMEOUT hoac Loi mang"
-            msg_file = f"[-] Option {key}: TIMEOUT hoac khong the truy cap (Desc: {desc} | Port: {port})"
             print_fn(msg_ui)
-            log_lines.append(msg_file)
+            results.append({"key": key, "status": "TIMEOUT", "act_host": None,
+                             "desc": desc, "port": port, "note": note})
             continue
             
         if act_host == "AUTH_REQUIRED":
             msg_ui = f"[yellow][?][/] {alias} (Opt {key}): Thiet bi yeu cau dang nhap (Khong thay hostname)"
-            msg_file = f"[?] Option {key}: YEU CAU DANG NHAP, khong the xac minh (Desc: {desc} | Port: {port})"
             print_fn(msg_ui)
-            log_lines.append(msg_file)
+            results.append({"key": key, "status": "YEU CAU DANG NHAP", "act_host": None,
+                             "desc": desc, "port": port, "note": note})
             continue
             
         # CHUẨN HÓA DESCRIPTION: Xóa các mũi tên "----> " để so sánh công bằng
@@ -604,10 +698,10 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         # không được gộp chung vào cảnh báo sai lệch (tránh báo động giả).
         if own_hostname_clean and act_host_clean == own_hostname_clean:
             msg_ui = f"[dim][-][/] {alias} (Opt {key}): Khong pivot duoc toi thiet bi dich (van dang o console OOB)"
-            msg_file = (f"[-] Option {key}: KHONG PIVOT DUOC - session van o console cua chinh OOB "
-                        f"({own_hostname}), chua thuc su ket noi toi thiet bi dich (Desc: {desc} | Port: {port})")
             print_fn(msg_ui)
-            log_lines.append(msg_file)
+            note = "; ".join(note_parts + [f"Van o console cua chinh OOB ({own_hostname})"])
+            results.append({"key": key, "status": "KHONG PIVOT", "act_host": act_host,
+                             "desc": desc, "port": port, "note": note})
             continue
 
         # So sanh theo TU DOC LAP (word-boundary) thay vi so sanh chuoi con "in",
@@ -615,22 +709,21 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         # chua "CTO-SW-02-20".
         if act_host_clean == desc_clean or hostname_matches_description(act_host, desc_clean):
             msg_ui = f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})"
-            msg_file = f"[OK] Option {key}: Khop chuan (Hostname: {act_host} | Port: {port})"
             print_fn(msg_ui)
-            log_lines.append(msg_file)
+            results.append({"key": key, "status": "OK", "act_host": act_host,
+                             "desc": desc, "port": port, "note": note})
         else:
             msg_ui = f"[bold red]CANH BAO[/] Thiet bi noi line ([yellow]{act_host}[/]) khac description ([yellow]{desc_clean}[/]) tai Opt {key}!"
-            msg_file = f"[CANH BAO] Option {key}: SAI LECH! (Thuc te noi vao: {act_host} | Description: {desc} | Port: {port})"
             print_fn(msg_ui)
-            log_lines.append(msg_file)
-            
+            results.append({"key": key, "status": "CANH BAO", "act_host": act_host,
+                             "desc": desc, "port": port, "note": note})
+
     # BƯỚC 3: KẾT THÚC & DỌN DẸP PHIÊN
     print_fn(f"[green]✓[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
-    log_lines.append(f"-----------------------------------------")
-    log_lines.append(f"HOAN THANH KET XUAT LOG.\n")
-        
+
+    report_text = _build_verify_report(alias, oob_ip, own_hostname, results)
     with open(log_file_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(log_lines))
+        f.write(report_text)
 
 def run_verify_daemon(cfg):
     """Tiến trình Daemon thứ 2 chuyên lặp lịch Deep Verify độc lập."""
