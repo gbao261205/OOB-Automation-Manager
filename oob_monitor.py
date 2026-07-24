@@ -2,10 +2,10 @@
 """
 oob_monitor.py
 
-Cong cu giam sat (READ-ONLY) menu OOB.
+Cong cu giam sat (READ-ONLY) menu OOB va Verify vat ly.
 Kien truc Multi-Terminal:
-    - Terminal 1: Giam sat lien tuc (Daemon) - Phat hien va canh bao khac biet.
-    - Terminal 2: Menu Quan ly - Them/Xoa IP, Cau hinh, Xem danh sach.
+    - Terminal 1: Giam sat lien tuc (Daemon) + Deep Verify (Smart Clear).
+    - Terminal 2: Menu Quan ly - Them/Xoa IP, Cau hinh, Xem danh sach, Log.
 """
 
 import getpass
@@ -30,7 +30,8 @@ from rich.text import Text
 from rich.layout import Layout
 from rich.live import Live
 
-from oob_lib import poll_host, MiniTelnet
+# Import the connect_auto de dung cho chuc nang Clear Line
+from oob_lib import poll_host, MiniTelnet, connect_auto
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
 
@@ -42,7 +43,7 @@ DEFAULT_CONFIG = {
     "ssh_port": 22,
     "telnet_port": 23,
     "interval": 30,
-    "verify_interval": 3600,  # Mac dinh 1 tieng check vat ly 1 lan
+    "verify_interval": 3600,
     "ip_list": "oob_ips.txt",
     "baseline_db": "baseline.db",
     "snapshot_db": "snapshot.db",
@@ -76,13 +77,11 @@ def update_ui():
             _live_ui.update(layout)
 
 def log_oob(msg: str):
-    """Ghi log cho nửa trên màn hình (Daemon cấu hình)."""
     ts = datetime.now().strftime("%H:%M:%S")
     oob_logs.append(f"[dim]\\[{ts}][/] {msg}")
     update_ui()
 
 def log_verify(msg: str):
-    """Ghi log cho nửa dưới màn hình (Verify vật lý)."""
     ts = datetime.now().strftime("%H:%M:%S")
     verify_logs.append(f"[dim]\\[{ts}][/] {msg}")
     update_ui()
@@ -169,7 +168,6 @@ a. File snapshot DB     : {cfg['snapshot_db']}
             print("[!] Lua chon khong hop le.")
             continue
         save_config(config_path, cfg)
-
 
 def load_ip_list(path):
     hosts = []
@@ -330,8 +328,29 @@ def print_options(options: dict):
 
 
 # ---------------------------------------------------------------------------
-# Module Deep Verify (Background Thread Độc lập)
+# Module Deep Verify (Background Thread Độc lập & Smart Clear Line)
 # ---------------------------------------------------------------------------
+
+def clear_stuck_line(cfg, oob_ip, console_port):
+    """Đăng nhập vào OOB và clear line console đang bị kẹt."""
+    line_num = console_port - 2000 
+    
+    if line_num <= 0 or line_num > 200: 
+        return False
+        
+    try:
+        session = connect_auto(
+            oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], 
+            cfg["username"], cfg["password"], cfg["enable_password"], timeout=5
+        )
+        session.write(f"clear line {line_num}")
+        session.read_until("[confirm]", timeout=3)
+        session.write("\n")
+        session.read_until("#", timeout=3)
+        session.close()
+        return True
+    except Exception:
+        return False
 
 def extract_hostname(output: str) -> str:
     """Lọc hostname từ luồng ký tự trả về của Console."""
@@ -343,8 +362,8 @@ def extract_hostname(output: str) -> str:
             return m.group(1)
     return None
 
-def run_deep_verify(alias, options):
-    """Thực thi verify vật lý cho 1 thiết bị OOB và xuất log."""
+def run_deep_verify(cfg, alias, oob_ip, options):
+    """Thực thi verify vật lý (co kem Smart Clear) va xuat log."""
     log_verify(f"[*] Bat dau kiem tra vat ly thiet bi cho OOB: [bold]{alias}[/]")
     
     os.makedirs("verify-logs", exist_ok=True)
@@ -353,7 +372,7 @@ def run_deep_verify(alias, options):
     
     log_lines = []
     log_lines.append(f"========== KET QUA DEEP VERIFY ==========")
-    log_lines.append(f"OOB Alias : {alias}")
+    log_lines.append(f"OOB Alias : {alias} ({oob_ip})")
     log_lines.append(f"Thoi gian : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log_lines.append(f"-----------------------------------------")
     
@@ -362,38 +381,58 @@ def run_deep_verify(alias, options):
         if not desc:
             continue
             
-        ip = opt.get("ip")
+        target_ip = opt.get("ip")
         port = opt.get("port", 23)
         
+        act_host = None
+        conn_error = ""
+
+        # LAN 1: Thu ket noi binh thuong
         try:
-            session = MiniTelnet(ip, port, timeout=4)
+            session = MiniTelnet(target_ip, port, timeout=4)
             session.write("\r\n\r\n")
             output = session.read_until([">", "#", "login:", "Password:"], timeout=4)
             session.close()
-            
             act_host = extract_hostname(output)
-            
-            if not act_host:
-                msg_ui = f"[dim][-][/] {alias} (Opt {key}): Timeout hoac khong the doc prompt."
-                msg_file = f"[-] Option {key}: TIMEOUT hoac khong thay prompt (Desc: {desc} | Port: {port})"
-                log_verify(msg_ui)
-                log_lines.append(msg_file)
-                continue
-            
-            if act_host.lower() == desc.lower():
-                msg_ui = f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})"
-                msg_file = f"[OK] Option {key}: Khop chuan (Hostname: {act_host} | Port: {port})"
-                log_verify(msg_ui)
-                log_lines.append(msg_file)
-            else:
-                msg_ui = f"[bold red]CANH BAO[/] Phat hien thiet bi noi line console ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!"
-                msg_file = f"[CANH BAO] Option {key}: SAI LECH! (Thuc te noi vao: {act_host} | Description: {desc} | Port: {port})"
-                log_verify(msg_ui)
-                log_lines.append(msg_file)
-                
         except Exception as e:
-            msg_ui = f"[dim][LOI][/] {alias} (Opt {key}): Khong the ket noi den port {port} ({str(e)})"
-            msg_file = f"[LOI] Option {key}: Khong the ket noi port {port} ({str(e)})"
+            conn_error = str(e)
+            
+        # NEU LAN 1 THAT BAI (Timeout/Refused) -> Kich hoat Smart Clear
+        if not act_host:
+            log_verify(f"[yellow][!][/] {alias} (Opt {key}): Line dang bi ket hoac timeout. Dang goi lenh 'clear line'...")
+            log_lines.append(f"[*] Option {key}: Phat hien ket line {port - 2000}. Dang clear...")
+            
+            if clear_stuck_line(cfg, oob_ip, port):
+                time.sleep(1) # Cho line reset hoan toan
+                
+                # LAN 2: Thu lai sau khi clear
+                try:
+                    session = MiniTelnet(target_ip, port, timeout=4)
+                    session.write("\r\n\r\n")
+                    output = session.read_until([">", "#", "login:", "Password:"], timeout=4)
+                    session.close()
+                    act_host = extract_hostname(output)
+                except Exception as e:
+                    conn_error = str(e)
+            else:
+                log_verify(f"[dim][-][/] {alias}: Khong the clear line {port - 2000} vao luc nay.")
+        
+        # DANH GIA KET QUA CUOI CUNG
+        if not act_host:
+            msg_ui = f"[dim][-][/] {alias} (Opt {key}): Timeout hoac khong the doc prompt. Lỗi: {conn_error}"
+            msg_file = f"[-] Option {key}: TIMEOUT hoac khong the truy cap (Desc: {desc} | Port: {port})"
+            log_verify(msg_ui)
+            log_lines.append(msg_file)
+            continue
+            
+        if act_host.lower() == desc.lower():
+            msg_ui = f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})"
+            msg_file = f"[OK] Option {key}: Khop chuan (Hostname: {act_host} | Port: {port})"
+            log_verify(msg_ui)
+            log_lines.append(msg_file)
+        else:
+            msg_ui = f"[bold red]CANH BAO[/] Phat hien thiet bi noi line console ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!"
+            msg_file = f"[CANH BAO] Option {key}: SAI LECH! (Thuc te noi vao: {act_host} | Description: {desc} | Port: {port})"
             log_verify(msg_ui)
             log_lines.append(msg_file)
             
@@ -409,8 +448,7 @@ def run_verify_daemon(cfg):
     verify_interval = cfg.get("verify_interval", 3600)
     log_verify(f"[green][START][/] Khoi dong chu ky Verify vat ly moi {verify_interval}s.")
     
-    # Cho đợt chạy đầu tiên đợi 15s để luồng cấu hình kịp tạo Baseline mới nếu cần
-    time.sleep(15)
+    time.sleep(15) # Delay ban đầu cho đỡ đụng với luồng Config
     
     while True:
         hosts = load_ip_list(cfg["ip_list"])
@@ -419,10 +457,10 @@ def run_verify_daemon(cfg):
             continue
             
         for ip, alias in hosts:
-            # Lấy baseline hiện tại từ DB để lấy IP/Port đem đi quét vật lý
             _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
             if baseline:
-                run_deep_verify(alias, baseline)
+                # Truyền cfg và ip OOB vào để hàm run_deep_verify có thể clear line
+                run_deep_verify(cfg, alias, ip, baseline)
                 
         log_verify(f"[dim][zzz] Dang cho {verify_interval}s cho dot Verify tiep theo...[/]")
         time.sleep(verify_interval)
@@ -519,6 +557,8 @@ def run_daemon(cfg):
                         if ans == "y":
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
+                            # Trigger quét luôn cho OOB vừa xác nhận
+                            threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
                         else:
                             _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
                             
@@ -544,6 +584,7 @@ def run_daemon(cfg):
                     if ans == "y":
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
+                        threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
                     else:
                         _con.print(f"  [yellow][!][/] Het thoi gian hoac tu choi. Giu nguyen baseline cu cho {alias}.")
                     
@@ -707,12 +748,17 @@ def scan_specific_devices(cfg):
             if ans == "y":
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
+                
+                # Quét vật lý ngay
+                threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
             else:
                 _con.print("  [dim][--] Bo qua.[/]")
             continue
 
         if options_equal(baseline, snapshot):
             _con.print(f"  [green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
+            # Quét vật lý ngay
+            threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
             continue
 
         _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
@@ -726,6 +772,9 @@ def scan_specific_devices(cfg):
         if ans == "y":
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
             _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
+            
+            # Quét vật lý ngay trên baseline mới
+            threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
         else:
             _con.print(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}.")
 
