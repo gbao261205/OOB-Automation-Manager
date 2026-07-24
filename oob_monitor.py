@@ -30,8 +30,8 @@ from rich.text import Text
 from rich.layout import Layout
 from rich.live import Live
 
-# Import the connect_auto de dung cho chuc nang Clear Line
-from oob_lib import poll_host, MiniTelnet, connect_auto
+# Import the connect_auto, MiniTelnet, fetch_hostname
+from oob_lib import poll_host, MiniTelnet, connect_auto, fetch_hostname
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
 
@@ -221,16 +221,19 @@ def _init_db(path, table):
             PRIMARY KEY (host, menu_name, option_key)
         )
     """)
+    # Migrations de cap nhat database cu
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
     if "device_name" not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN device_name TEXT")
+    if "protocol" not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN protocol TEXT DEFAULT 'telnet'")
     conn.commit()
     return conn
 
 def get_options_by_host(db_path, table, host):
     conn = _init_db(db_path, table)
     cur = conn.execute(
-        f"SELECT menu_name, option_key, device_name, description, target_ip, target_port "
+        f"SELECT menu_name, option_key, device_name, description, target_ip, target_port, protocol "
         f"FROM {table} WHERE host=?", (host,)
     )
     rows = cur.fetchall()
@@ -240,8 +243,8 @@ def get_options_by_host(db_path, table, host):
     menu_name   = rows[0][0]
     device_name = rows[0][2]
     options = {
-        key: {"description": desc, "ip": ip, "port": port}
-        for _mn, key, _dn, desc, ip, port in rows
+        key: {"description": desc, "ip": ip, "port": port, "protocol": proto}
+        for _mn, key, _dn, desc, ip, port, proto in rows
     }
     return menu_name, device_name, options
 
@@ -259,9 +262,9 @@ def save_options(db_path, table, host, menu_name, device_name, options):
     for key, entry in options.items():
         conn.execute(
             f"INSERT INTO {table} (host, menu_name, option_key, device_name, description, "
-            f"target_ip, target_port, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            f"target_ip, target_port, protocol, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (host, menu_name, key, device_name, entry.get("description", ""), entry["ip"],
-             entry.get("port", 23), now),
+             entry.get("port", 23), entry.get("protocol", "telnet"), now),
         )
     conn.commit()
     conn.close()
@@ -309,7 +312,7 @@ def print_diff(baseline: dict, snapshot: dict):
         t.add_column("Hien tai", min_width=36)
         for key in d["changed"]:
             b, s = baseline[key], snapshot[key]
-            t.add_row(f"[{key}]", f"{b.get('description','')} [dim]{_fmt_entry(b)}[/]",
+            t.add_row(f"{key}", f"{b.get('description','')} [dim]{_fmt_entry(b)}[/]",
                       f"{s.get('description','')} [dim]{_fmt_entry(s)}[/]")
         _con.print(t)
 
@@ -323,9 +326,86 @@ def print_options(options: dict):
         proto = _norm_proto(e.get("protocol"))
         port  = e.get("port", 22 if proto == "ssh" else 23)
         col   = "green" if proto == "ssh" else "yellow"
-        t.add_row(f"[{key}]", e.get("description", ""), f"[{col}]{proto}[/]://{e['ip']}:{port}")
+        t.add_row(f"{key}", e.get("description", ""), f"[{col}]{proto}[/]://{e['ip']}:{port}")
     _con.print(t)
 
+
+# ---------------------------------------------------------------------------
+# Module Thu thập Menu (Đa Menu)
+# ---------------------------------------------------------------------------
+
+# Dinh nghia Regex phan tich menu
+MENU_NAME_RE = re.compile(r'^\s*menu\s+(\S+)\s+(?:text|command)\b', re.IGNORECASE | re.MULTILINE)
+TEXT_RE       = re.compile(r'^\s*menu\s+(\S+)\s+text\s+(\S+)\s+(.+)',                          re.IGNORECASE)
+CMD_TELNET_RE = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)(?:\s+(\d+))?',  re.IGNORECASE)
+CMD_SSH_RE    = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+ssh\s+(?:-l\s+\S+\s+|\S+@)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:\s+(\d+))?', re.IGNORECASE)
+
+def clean_key(raw_key: str) -> str:
+    """Lam sach key loai bo cac ki tu dac biet []()"""
+    return re.sub(r'\W+', '', raw_key)
+
+def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_name_override=None, ssh_port=22, timeout=10):
+    """Quet toan bo menu co tren OOB va tich hop thanh 1 object duy nhat."""
+    tn = connect_auto(ip, ssh_port, telnet_port, username, password, enable_password, timeout=timeout)
+    try:
+        hostname = fetch_hostname(tn)
+        tn.write("terminal length 0")
+        tn.read_until("#", timeout=5)
+        tn.write("show running-config | include menu")
+        raw = tn.read_until("#", timeout=15)
+        
+        # Phat hien toan bo ten Menu co trong cau hinh
+        detected_names = list(set(MENU_NAME_RE.findall(raw)))
+        if menu_name_override:
+            menu_names = [menu_name_override] if menu_name_override in detected_names else []
+        else:
+            menu_names = detected_names
+            
+        if not menu_names:
+            return hostname, None, {}
+            
+        all_options = {}
+        for raw_line in raw.splitlines():
+            line = raw_line.strip()
+            
+            # Text Description
+            m = TEXT_RE.match(line)
+            if m and m.group(1) in menu_names:
+                m_name, raw_k, desc = m.group(1), m.group(2), m.group(3).strip()
+                k = f"{m_name} [{clean_key(raw_k)}]" if len(menu_names) > 1 else clean_key(raw_k)
+                all_options.setdefault(k, {})["description"] = desc
+                continue
+                
+            # Telnet Command
+            m = CMD_TELNET_RE.match(line)
+            if m and m.group(1) in menu_names:
+                m_name, raw_k, target_ip = m.group(1), m.group(2), m.group(3)
+                port = int(m.group(4)) if m.group(4) else 23
+                k = f"{m_name} [{clean_key(raw_k)}]" if len(menu_names) > 1 else clean_key(raw_k)
+                entry = all_options.setdefault(k, {})
+                entry["ip"], entry["port"], entry["protocol"] = target_ip, port, "telnet"
+                continue
+                
+            # SSH Command
+            m = CMD_SSH_RE.match(line)
+            if m and m.group(1) in menu_names:
+                m_name, raw_k, target_ip = m.group(1), m.group(2), m.group(3)
+                port = int(m.group(4)) if m.group(4) else 22
+                k = f"{m_name} [{clean_key(raw_k)}]" if len(menu_names) > 1 else clean_key(raw_k)
+                entry = all_options.setdefault(k, {})
+                entry["ip"], entry["port"], entry["protocol"] = target_ip, port, "ssh"
+
+        # Loc chi lay cac option hoan chinh (co cau hinh IP dich)
+        final_options = {k: v for k, v in all_options.items() if "ip" in v}
+        combined_menu_name = " + ".join(sorted(menu_names))
+        
+        return hostname, combined_menu_name, final_options
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
 
 # ---------------------------------------------------------------------------
 # Module Deep Verify (Background Thread Độc lập & Smart Clear Line)
@@ -419,7 +499,7 @@ def run_deep_verify(cfg, alias, oob_ip, options):
         
         # DANH GIA KET QUA CUOI CUNG
         if not act_host:
-            msg_ui = f"[dim][-][/] {alias} (Opt {key}): Timeout hoac khong the doc prompt. Lỗi: {conn_error}"
+            msg_ui = f"[dim][-][/] {alias} (Opt {key}): Lỗi truy cap: {conn_error}"
             msg_file = f"[-] Option {key}: TIMEOUT hoac khong the truy cap (Desc: {desc} | Port: {port})"
             log_verify(msg_ui)
             log_lines.append(msg_file)
@@ -431,7 +511,7 @@ def run_deep_verify(cfg, alias, oob_ip, options):
             log_verify(msg_ui)
             log_lines.append(msg_file)
         else:
-            msg_ui = f"[bold red]CANH BAO[/] Phat hien thiet bi noi line console ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!"
+            msg_ui = f"[bold red]CANH BAO[/] Phat hien thiet bi noi line ([yellow]{act_host}[/]) khac voi description ([yellow]{desc}[/]) tai Opt {key}!"
             msg_file = f"[CANH BAO] Option {key}: SAI LECH! (Thuc te noi vao: {act_host} | Description: {desc} | Port: {port})"
             log_verify(msg_ui)
             log_lines.append(msg_file)
@@ -448,7 +528,7 @@ def run_verify_daemon(cfg):
     verify_interval = cfg.get("verify_interval", 3600)
     log_verify(f"[green][START][/] Khoi dong chu ky Verify vat ly moi {verify_interval}s.")
     
-    time.sleep(15) # Delay ban đầu cho đỡ đụng với luồng Config
+    time.sleep(15) 
     
     while True:
         hosts = load_ip_list(cfg["ip_list"])
@@ -459,7 +539,6 @@ def run_verify_daemon(cfg):
         for ip, alias in hosts:
             _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
             if baseline:
-                # Truyền cfg và ip OOB vào để hàm run_deep_verify có thể clear line
                 run_deep_verify(cfg, alias, ip, baseline)
                 
         log_verify(f"[dim][zzz] Dang cho {verify_interval}s cho dot Verify tiep theo...[/]")
@@ -506,7 +585,6 @@ def run_daemon(cfg):
 
     update_ui()
     
-    # Bắn luồng Verify Độc lập chạy ngầm phía dưới
     threading.Thread(target=run_verify_daemon, args=(cfg,), daemon=True).start()
     
     with Live(layout, refresh_per_second=4, screen=False) as live:
@@ -525,9 +603,10 @@ def run_daemon(cfg):
                 for ip, alias in hosts:
                     log_oob(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
                     try:
-                        hostname, menu_name, snapshot = poll_host(
+                        # DA THAY DOI SANG poll_host_multi
+                        hostname, menu_name, snapshot = poll_host_multi(
                             ip, cfg["telnet_port"], cfg["username"], cfg["password"],
-                            cfg["enable_password"], menu_name=cfg.get("menu_name_override") or None,
+                            cfg["enable_password"], menu_name_override=cfg.get("menu_name_override") or None,
                             ssh_port=cfg.get("ssh_port", 22),
                         )
                     except Exception as exc:
@@ -557,7 +636,6 @@ def run_daemon(cfg):
                         if ans == "y":
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
-                            # Trigger quét luôn cho OOB vừa xác nhận
                             threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
                         else:
                             _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
@@ -692,7 +770,7 @@ def search_device(cfg):
     for ip, alias, dn, key, entry in found:
         pr = _norm_proto(entry.get("protocol"))
         pt = entry.get("port", 22 if pr == "ssh" else 23)
-        _con.print(f"    [cyan]→[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [[bold cyan]{key}[/]] {entry.get('description', '')} [dim]→ {pr}://{entry['ip']}:{pt}[/]")
+        _con.print(f"    [cyan]→[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [bold cyan]{key}[/] {entry.get('description', '')} [dim]→ {pr}://{entry['ip']}:{pt}[/]")
 
 def scan_specific_devices(cfg):
     targets_input = _con.input("  [cyan]Nhap IP/Alias (cach nhau dau phay, de trong de quet TAT CA)[/]: ").strip()
@@ -721,9 +799,10 @@ def scan_specific_devices(cfg):
     for ip, alias in hosts_to_scan:
         _con.print(f"\n  [cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
         try:
-            hostname, menu_name, snapshot = poll_host(
+            # DA THAY DOI SANG poll_host_multi
+            hostname, menu_name, snapshot = poll_host_multi(
                 ip, cfg["telnet_port"], cfg["username"], cfg["password"],
-                cfg["enable_password"], menu_name=cfg.get("menu_name_override") or None,
+                cfg["enable_password"], menu_name_override=cfg.get("menu_name_override") or None,
                 ssh_port=cfg.get("ssh_port", 22),
             )
         except Exception as exc:
@@ -748,8 +827,6 @@ def scan_specific_devices(cfg):
             if ans == "y":
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
-                
-                # Quét vật lý ngay
                 threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
             else:
                 _con.print("  [dim][--] Bo qua.[/]")
@@ -757,7 +834,6 @@ def scan_specific_devices(cfg):
 
         if options_equal(baseline, snapshot):
             _con.print(f"  [green][OK][/] {alias}: Khop voi baseline ({menu_n} option).")
-            # Quét vật lý ngay
             threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
             continue
 
@@ -772,8 +848,6 @@ def scan_specific_devices(cfg):
         if ans == "y":
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
             _con.print(f"  [green][OK][/] Da cap nhat baseline moi cho {alias}.")
-            
-            # Quét vật lý ngay trên baseline mới
             threading.Thread(target=run_deep_verify, args=(cfg, alias, ip, snapshot), daemon=True).start()
         else:
             _con.print(f"  [yellow][!][/] Giu nguyen baseline cu cho {alias}.")
