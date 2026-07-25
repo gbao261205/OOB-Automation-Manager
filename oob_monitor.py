@@ -225,27 +225,51 @@ def _edit_verify_schedule(cfg):
 
 def settings_menu(cfg, config_path):
     while True:
-        print(f"""
---------------------------------------------------
-        ⚙️  CAU HINH HIEN TAI
---------------------------------------------------
-1. Username           : {cfg['username'] or '(khong dung)'}
-2. Password            : {mask(cfg['password'])}
-3. Enable password     : {mask(cfg['enable_password'])}
-4. Ten menu (rong=tu dong): {cfg['menu_name_override'] or '(tu dong do)'}
-5. SSH port (uu tien)   : {cfg.get('ssh_port', 22)}
-6. Telnet port (du phong): {cfg['telnet_port']}
-7. Chu ky thu thap (s)  : {cfg['interval']}
-v. Chu ky Verify vat ly (s): {cfg.get('verify_interval', 3600)}
-8. File danh sach IP    : {cfg['ip_list']}
-9. File baseline DB     : {cfg['baseline_db']}
-a. File snapshot DB     : {cfg['snapshot_db']}
-b. Tu dong Verify ngam  : {'[BAT]' if cfg.get('auto_verify', True) else '[TAT]'}
-c. Tu dong Sua loi ngam : {'[BAT]' if cfg.get('auto_push_desc', True) else '[TAT]'}
-d. Lich chay Verify     : {_describe_verify_schedule(cfg)}
-0. Quay lai menu chinh
---------------------------------------------------""")
-        choice = input("Chon muc can sua: ").strip().lower()
+        schedule_mode = cfg.get("verify_schedule_mode", "interval")
+        v_note = ("[dim red]<- Khong hieu luc (dang dung lich co dinh — doi o muc [d])[/]"
+                  if schedule_mode in ("daily", "weekly")
+                  else "[dim green]<- Dang co hieu luc[/]")
+        auto_v = "[green bold]BAT[/]" if cfg.get('auto_verify', True)     else "[red bold]TAT[/]"
+        auto_p = "[green bold]BAT[/]" if cfg.get('auto_push_desc', True)  else "[red bold]TAT[/]"
+
+        g = Table.grid(padding=(0, 1))
+        g.add_column(style="bold cyan", min_width=4, justify="right")
+        g.add_column()
+
+        g.add_row("", "[dim]── KET NOI ──────────────────────────────────────────────────────────[/]")
+        g.add_row("[1]",  f"Username              : {cfg['username'] or '[dim](khong dung)[/]'}")
+        g.add_row("[2]",  f"Password              : {mask(cfg['password'])}")
+        g.add_row("[3]",  f"Enable password       : {mask(cfg['enable_password'])}")
+        g.add_row("[5]",  f"SSH port (uu tien)    : {cfg.get('ssh_port', 22)}")
+        g.add_row("[6]",  f"Telnet port (du phong): {cfg.get('telnet_port', 23)}")
+        g.add_row("", "")
+        g.add_row("", "[dim]── FILE DU LIEU ────────────────────────────────────────────────────[/]")
+        g.add_row("[8]",  f"File danh sach IP     : {cfg['ip_list']}")
+        g.add_row("[9]",  f"File baseline DB      : {cfg['baseline_db']}")
+        g.add_row("\\[a]",  f"File snapshot DB      : {cfg['snapshot_db']}")
+        g.add_row("", "")
+        g.add_row("", "[dim]── LUONG 1: GIAM SAT CAU HINH (daemon chay lien tuc) ─────────────[/]")
+        g.add_row("", f"[dim]   Cu moi chu ky daemon ket noi OOB doc menu config,[/]")
+        g.add_row("", "[dim]   roi so sanh voi baseline → canh bao ngay neu co thay doi.[/]")
+        g.add_row("[4]",  f"Ten menu (rong=tu dong) : {cfg['menu_name_override'] or '[dim](tu dong do)[/]'}")
+        g.add_row("[7]",  f"Chu ky doc cau hinh (s) : [bold cyan]{cfg['interval']}[/]")
+        g.add_row("", "")
+        g.add_row("", "[dim]── LUONG 2: VERIFY VAT LY (Deep Verify — chay theo lich) ─────────[/]")
+        g.add_row("", "[dim]   Daemon pivot vao tung port console, lay hostname thuc[/]")
+        g.add_row("", "[dim]   de kiem tra description co dung khong. Chay theo lich.[/]")
+        g.add_row("\\[b]", f"Tu dong Verify ngam     : {auto_v}")
+        g.add_row("\\[c]",   f"Tu dong Sua loi ngam    : {auto_p}")
+        g.add_row("\\[d]",   f"Lich chay Verify        : [cyan]{_describe_verify_schedule(cfg)}[/]")
+        g.add_row("", "[dim]   • daily/weekly → chay vao dung gio/ngay co dinh[/]")
+        g.add_row("", "[dim]   • interval     → chay lap theo chu ky (muc \\[v] phia duoi)[/]")
+        g.add_row("\\[v]",   f"Chu ky interval (s)     : [bold cyan]{cfg.get('verify_interval', 3600)}[/]  {v_note}")
+        g.add_row("", "[dim]   Chi co hieu luc khi muc \\[d] dang o che do \"interval\".[/]")
+        g.add_row("", "")
+        g.add_row("[0]",   "[bold red]Quay lai menu chinh[/]")
+
+        _con.print()
+        _con.print(Panel(g, title="[bold cyan] ⚙️  CAI DAT HE THONG [/]", border_style="cyan", padding=(1, 2)))
+        choice = _con.input("[bold]Chon muc can sua[/]: ").strip().lower()
 
         if choice == "1":
             cfg["username"] = input("  Username moi (Enter de bo trong): ").strip()
@@ -1411,6 +1435,373 @@ def verify_specific_devices(cfg):
                 _con.print("  [dim]Da bo qua viec sua Description.[/]")
 
 
+# ---------------------------------------------------------------------------
+# Import / Export Excel
+# ---------------------------------------------------------------------------
+
+def _parse_verify_logs_for_status() -> dict:
+    """Doc log verify gan nhat cho tung OOB alias, tra ve dict:
+    {(alias, opt_key): {"status": ..., "act_host": ...}}
+    De su dung lam nguon du lieu cho cot Desc Status trong Export Excel."""
+    log_dir = "verify-logs"
+    if not os.path.exists(log_dir):
+        return {}
+
+    # Nhom file theo alias. Ten file: Verify_ALIAS_YYYYMMDD_HHMMSS.log
+    # Timestamp = 15 ky tu (YYYYMMDD_HHMMSS) + 1 dau _ phan cach = 16 ky tu cuoi.
+    alias_files: dict = {}
+    for fname in os.listdir(log_dir):
+        if not fname.endswith('.log') or not fname.startswith('Verify_'):
+            continue
+        body = fname[len('Verify_'):-len('.log')]  # ALIAS_YYYYMMDD_HHMMSS
+        if len(body) < 17:
+            continue
+        alias = body[:-16]          # cat 16 ky tu cuoi = _YYYYMMDD_HHMMSS
+        fpath = os.path.join(log_dir, fname)
+        mtime = os.path.getmtime(fpath)
+        if alias not in alias_files or mtime > alias_files[alias][1]:
+            alias_files[alias] = (fpath, mtime)
+
+    STATUS_MAP = {
+        "OK":           "OK",
+        "CANH BAO":     "CANH BAO",
+        "KO PIVOT":     "KHONG PIVOT",
+        "TIMEOUT":      "TIMEOUT",
+        "YC DANG NHAP": "YEU CAU DANG NHAP",
+    }
+    result: dict = {}
+    for alias, (fpath, _) in alias_files.items():
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            # Cac dong du lieu la dong co nhieu ky tu │
+            if not line.startswith('│') or line.count('│') < 5:
+                continue
+            cols = [c.strip() for c in line.split('│')]
+            # Do ghi: '' | STT | Option | Trang_thai | Hostname | Desc | Port | Ghi_chu | ''
+            if len(cols) < 5:
+                continue
+            opt_key    = cols[2]
+            status_raw = cols[3]
+            act_host   = cols[4] if len(cols) > 4 else ""
+            # Bo qua dong header
+            if not opt_key or opt_key.lower() in ('option', 'stt'):
+                continue
+            if not status_raw or status_raw.lower() == 'trang thai':
+                continue
+            result[(alias, opt_key)] = {
+                "status":   STATUS_MAP.get(status_raw, status_raw),
+                "act_host": act_host if act_host not in ('-', '') else None,
+            }
+    return result
+
+
+def _export_excel_template():
+    """Tao file Excel mau (oob_import_template.xlsx) de nguoi dung tham khao dinh dang import."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        _con.print("  [red][!][/] Thieu openpyxl. Chay: pip install openpyxl")
+        return
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OOB_Import"
+    for col, header in enumerate(["IP", "Alias (ten goi)"], 1):
+        c = ws.cell(1, col, header)
+        c.font = Font(bold=True, color="FFFFFF", size=11)
+        c.fill = PatternFill(fill_type="solid", fgColor="1F4E79")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    for r, (ip, alias) in enumerate([("192.168.1.1", "OOB-HCM-01"),
+                                      ("192.168.1.2", "OOB-HCM-02"),
+                                      ("10.0.0.1",    "OOB-HAN-01")], 2):
+        ws.cell(r, 1, ip)
+        ws.cell(r, 2, alias)
+    ws.column_dimensions['A'].width = 18
+    ws.column_dimensions['B'].width = 24
+    ws.row_dimensions[1].height = 22
+    tpl = "oob_import_template.xlsx"
+    wb.save(tpl)
+    _con.print(f"  [green]✓[/] Da tao file mau: [bold]{tpl}[/]")
+    _con.print("      Dien IP vao cot A, ten alias vao cot B (tu dong 2 tro xuong).")
+    _con.print("      Sau do chon lai option \\[i] → nhap duong dan file de import.")
+
+
+def import_from_excel(cfg):
+    """Import danh sach thiet bi OOB tu file Excel (.xlsx) vao ip_list.
+    Moi dong trong Excel: cot A = IP, cot B = Alias (ten goi).
+    Tu dong bo qua IP da co trong danh sach va IP khong hop le.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        _con.print("  [red][!][/] Thieu thu vien openpyxl. Cai dat bang lenh:")
+        _con.print("      [bold]pip install openpyxl[/]")
+        return
+
+    want_tpl = _con.input(
+        "  [cyan]Xuat file mau Excel de tham khao dinh dang? (y/N)[/]: "
+    ).strip().lower()
+    if want_tpl == 'y':
+        _export_excel_template()
+        return
+
+    file_path = _con.input("  [cyan]Duong dan file Excel (.xlsx)[/]: ").strip()
+    if not file_path:
+        _con.print("  [yellow][!][/] Khong nhap duong dan. Huy.")
+        return
+    if not os.path.exists(file_path):
+        _con.print(f"  [red][!][/] Khong tim thay file: {file_path}")
+        return
+
+    try:
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        _con.print(f"  [red][!][/] Khong doc duoc file Excel: {e}")
+        return
+
+    existing     = load_ip_list(cfg["ip_list"])
+    existing_ips = {h[0] for h in existing}
+    ip_re        = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
+    added = skipped_dup = skipped_invalid = 0
+
+    try:
+        with open(cfg["ip_list"], "a", encoding="utf-8") as f:
+            for row_idx, row in enumerate(
+                ws.iter_rows(min_row=2, values_only=True), 2
+            ):
+                if not row or row[0] is None:
+                    continue
+                ip_raw    = str(row[0]).strip()
+                alias_raw = (str(row[1]).strip()
+                             if len(row) > 1 and row[1] is not None else "")
+                if not ip_re.match(ip_raw):
+                    _con.print(
+                        f"  [yellow][!][/] Dong {row_idx}: '{ip_raw}' "
+                        "khong phai IP hop le, bo qua."
+                    )
+                    skipped_invalid += 1
+                    continue
+                if ip_raw in existing_ips:
+                    skipped_dup += 1
+                    continue
+                alias = alias_raw or ip_raw
+                f.write(f"{ip_raw} {alias}\n")
+                existing_ips.add(ip_raw)
+                added += 1
+    except Exception as e:
+        _con.print(f"  [red][!][/] Loi khi ghi file: {e}")
+        return
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    _con.print()
+    _con.print(
+        f"  [green]✓[/] Import tu [bold]{os.path.basename(file_path)}[/] hoan tat:"
+    )
+    _con.print(f"      Da them                  : [green bold]{added}[/] thiet bi")
+    _con.print(f"      Bo qua (IP trung)         : [yellow]{skipped_dup}[/]")
+    _con.print(f"      Bo qua (IP khong hop le)  : [yellow]{skipped_invalid}[/]")
+
+
+def export_menu_report(cfg):
+    """Xuat bao cao menu OOB ra file Excel 2 sheet:
+    - Sheet 'Chi tiet': moi dong = 1 option, co cot Desc Status kiem tra description.
+    - Sheet 'Tom tat' : moi dong = 1 OOB, tong hop so luong OK/SAI/Chua verify.
+    Khong can ket noi thiet bi — doc tu baseline DB va file log verify da co.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        _con.print("  [red][!][/] Thieu thu vien openpyxl. Cai dat:")
+        _con.print("      [bold]pip install openpyxl[/]")
+        return
+
+    hosts = load_ip_list(cfg["ip_list"])
+    if not hosts:
+        _con.print("  [yellow][!][/] Danh sach IP dang trong. Chua co thiet bi nao.")
+        return
+
+    _con.print("  [cyan][*][/] Dang doc du lieu tu baseline DB va log verify...")
+    verify_st = _parse_verify_logs_for_status()
+
+    # Mau sac cot Desc Status
+    C_MATCH, C_WRONG  = "C6EFCE", "FFC7CE"   # xanh la / do nhat
+    C_UNVER, C_NO_CON = "FFEB9C", "FFCC99"   # vang / cam nhat
+    C_NO_DS           = "D9D9D9"              # xam nhat (khong co desc)
+    C_HDR, C_HDR2     = "1F4E79", "2E75B6"   # header sheet 1 / sheet 2
+
+    def mk_fill(c): return PatternFill(fill_type="solid", fgColor=c)
+    def mk_bdr():
+        s = Side(style='thin', color='BFBFBF')
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    wb = openpyxl.Workbook()
+
+    # ── Sheet 1: Chi tiet ────────────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Chi tiet"
+    h1 = ["OOB IP", "OOB Alias", "OOB Hostname", "Menu Name",
+          "Option Key", "Description", "Target IP", "Target Port",
+          "Protocol", "Desc Status", "Ghi chu"]
+    for ci, h in enumerate(h1, 1):
+        c = ws1.cell(1, ci, h)
+        c.font      = Font(bold=True, color="FFFFFF", size=11)
+        c.fill      = mk_fill(C_HDR)
+        c.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+        c.border = mk_bdr()
+    ws1.row_dimensions[1].height = 28
+    ws1.freeze_panes              = "A2"
+    ws1.auto_filter.ref           = f"A1:{get_column_letter(len(h1))}1"
+
+    ri      = 2
+    summary = []
+
+    for ip, alias in hosts:
+        mn, device_name, baseline = get_options_by_host(
+            cfg["baseline_db"], "baseline_menu", ip
+        )
+        if baseline is None:
+            # OOB chua co baseline — ghi 1 dong thong bao
+            for ci, val in enumerate(
+                [ip, alias, "(chua co baseline)",
+                 "", "", "", "", "", "", "", ""], 1
+            ):
+                c = ws1.cell(ri, ci, val)
+                c.fill      = mk_fill("F2F2F2")
+                c.border    = mk_bdr()
+                c.alignment = Alignment(vertical="center")
+            ri += 1
+            summary.append({"alias": alias, "ip": ip,
+                            "hn": "(chua co baseline)", "mn": "",
+                            "total": 0, "match": 0, "wrong": 0,
+                            "unverif": 0, "no_conn": 0, "no_desc": 0})
+            continue
+
+        hn  = device_name or ""
+        cnt = dict(match=0, wrong=0, unverif=0, no_conn=0, no_desc=0)
+
+        for opt_key in sorted(baseline):
+            opt    = baseline[opt_key]
+            desc   = opt.get("description", "") or ""
+            t_ip   = opt.get("ip", "")
+            t_port = opt.get("port", "")
+            proto  = opt.get("protocol", "telnet")
+
+            # ── Xac dinh Desc Status ─────────────────────────────────
+            if not desc:
+                slabel, scolor = "Khong co desc", C_NO_DS
+                note = "O description trong"
+                cnt["no_desc"] += 1
+            else:
+                vr = verify_st.get((alias, opt_key))
+                if vr is None:
+                    slabel, scolor = "Chua Verify", C_UNVER
+                    note = "Chua co du lieu verify (chua chay Deep Verify)"
+                    cnt["unverif"] += 1
+                elif vr["status"] == "OK":
+                    slabel, scolor = "OK - Khop", C_MATCH
+                    note = f"Hostname thuc te: {vr.get('act_host', '')}"
+                    cnt["match"] += 1
+                elif vr["status"] == "CANH BAO":
+                    slabel, scolor = "SAI - Sai desc", C_WRONG
+                    note = (
+                        f"Hostname thuc: {vr.get('act_host', '')} "
+                        "!= Description"
+                    )
+                    cnt["wrong"] += 1
+                elif vr["status"] in ("TIMEOUT", "KHONG PIVOT"):
+                    slabel, scolor = "Khong ket noi duoc", C_NO_CON
+                    note = f"Trang thai: {vr['status']}"
+                    cnt["no_conn"] += 1
+                else:
+                    slabel, scolor = f"? {vr['status']}", C_UNVER
+                    note = vr.get("status", "")
+                    cnt["unverif"] += 1
+
+            for ci, val in enumerate(
+                [ip, alias, hn, mn or "", opt_key,
+                 desc, t_ip, t_port, proto, slabel, note], 1
+            ):
+                c = ws1.cell(ri, ci, val)
+                c.border    = mk_bdr()
+                c.alignment = Alignment(vertical="center")
+                if ci == 10:   # cot Desc Status
+                    c.fill      = mk_fill(scolor)
+                    c.font      = Font(bold=True)
+                    c.alignment = Alignment(
+                        horizontal="center", vertical="center"
+                    )
+            ri += 1
+
+        summary.append({"alias": alias, "ip": ip, "hn": hn,
+                        "mn": mn or "", "total": len(baseline), **cnt})
+
+    for i, w in enumerate([16, 16, 18, 20, 12, 38, 16, 12, 10, 22, 44], 1):
+        ws1.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Sheet 2: Tom tat ─────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Tom tat")
+    h2 = ["OOB Alias", "OOB IP", "Hostname OOB", "Menu",
+          "Tong Option", "OK Khop", "SAI",
+          "Chua Verify", "Khong KN", "Khong Desc"]
+    for ci, h in enumerate(h2, 1):
+        c = ws2.cell(1, ci, h)
+        c.font      = Font(bold=True, color="FFFFFF", size=11)
+        c.fill      = mk_fill(C_HDR2)
+        c.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+        c.border = mk_bdr()
+    ws2.row_dimensions[1].height = 32
+    ws2.freeze_panes              = "A2"
+    ws2.auto_filter.ref           = f"A1:{get_column_letter(len(h2))}1"
+
+    for ri2, sd in enumerate(summary, 2):
+        vals = [sd["alias"], sd["ip"], sd["hn"], sd["mn"],
+                sd["total"], sd["match"], sd["wrong"],
+                sd["unverif"], sd["no_conn"], sd["no_desc"]]
+        for ci, val in enumerate(vals, 1):
+            c = ws2.cell(ri2, ci, val)
+            c.border    = mk_bdr()
+            c.alignment = Alignment(
+                vertical="center",
+                horizontal="center" if ci > 4 else "left"
+            )
+        if sd.get("wrong", 0) > 0:
+            ws2.cell(ri2, 7).fill = mk_fill(C_WRONG)
+            ws2.cell(ri2, 7).font = Font(bold=True)
+        if sd.get("match", 0) > 0:
+            ws2.cell(ri2, 6).fill = mk_fill(C_MATCH)
+
+    for i, w in enumerate([18, 16, 20, 20, 14, 10, 10, 14, 12, 13], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+
+    # Luu file
+    os.makedirs("reports", exist_ok=True)
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = os.path.join("reports", f"OOB_Menu_Report_{ts}.xlsx")
+    wb.save(out)
+    _con.print(f"\n  [green]✓[/] Da xuat: [bold]{out}[/]")
+    _con.print(f"      Sheet 'Chi tiet': {ri - 2} dong option")
+    _con.print(f"      Sheet 'Tom tat' : {len(summary)} OOB")
+    _con.print(
+        "      [dim]Mo bang Excel hoac LibreOffice de xem day du mau sac va auto-filter.[/]"
+    )
+
+
 def _show_menu(cfg):
     hosts_n = len(load_ip_list(cfg["ip_list"]))
     user = f"[bold]{cfg['username']}[/]" if cfg["username"] else "[dim yellow](chua dat)[/]"
@@ -1424,14 +1815,16 @@ def _show_menu(cfg):
     
     grid.add_row("[1]", "Them thiet bi OOB")
     grid.add_row("[2]", "Xoa thiet bi OOB")
+    grid.add_row("\\[i]", "[cyan]Import danh sach OOB tu file Excel (.xlsx)[/]")
     grid.add_row("", "")
     grid.add_row("[3]", "Cau hinh (username/password/port...)")
     grid.add_row("[4]", "Xem danh sach thiet bi")
     grid.add_row("[5]", "Xem baseline (Chuan)")
     grid.add_row("[6]", "Tim kiem thiet bi")
-    grid.add_row("[7]", "[bold green]Quet kiem tra Cấu hình tức thì (Chỉ định hoac Tat ca)[/]")
-    grid.add_row("[8]", "[bold magenta]Deep Verify Vật lý tức thì (Chỉ định hoac Tat ca)[/]")
+    grid.add_row("[7]", "[bold green]Quet kiem tra Cau hinh tuc thi (Chi dinh hoac Tat ca)[/]")
+    grid.add_row("[8]", "[bold magenta]Deep Verify Vat ly tuc thi (Chi dinh hoac Tat ca)[/]")
     grid.add_row("[9]", "[dim magenta]Xem ket qua Verify vat ly gan nhat[/]")
+    grid.add_row("\\[e]", "[yellow]Xuat bao cao menu OOB ra Excel (tat ca thiet bi)[/]")
     grid.add_row("", "")
     grid.add_row("[0]", "[bold red]Thoat[/]")
 
@@ -1474,6 +1867,10 @@ def main_menu(cfg, config_path):
             verify_specific_devices(cfg)
         elif choice == "9":
             view_latest_verify_log()
+        elif choice == "i":
+            import_from_excel(cfg)
+        elif choice == "e":
+            export_menu_report(cfg)
         elif choice == "0":
             _con.print("\n[dim]Tam biet.[/]")
             sys.exit(0)
