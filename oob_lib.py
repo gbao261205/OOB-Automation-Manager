@@ -37,6 +37,15 @@ WILL = 251
 SB   = 250
 SE   = 240
 
+# Dung de doc CAC OUTPUT DAI (vd "show running-config | include menu") mot
+# cach an toan: thay vi dung read_until("#") - se ket thuc SAI ngay khi gap
+# BAT KY ky tu "#" nao xuat hien trong noi dung cau hinh (vd 1 description
+# dat la "##"), pattern nay CHI khop khi "#"/">" la ky tu CUOI CUNG cua buffer
+# hien tai VA duoc dung ngay sau 1 chuoi giong ten thiet bi (khong phai dung
+# sau 1 ky tu "#" khac hay "----> ") - tuc la dung PROMPT THAT cua thiet bi,
+# khong phai 1 doan text nam giua noi dung dang doc.
+PROMPT_TAIL_RE = re.compile(r'(?:^|[\r\n])[\w\-\.\(\)]{1,64}[>#]\s*$')
+
 TEXT_RE       = re.compile(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)',                          re.IGNORECASE)
 CMD_TELNET_RE = re.compile(r'menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)(?:\s+(\d+))?',  re.IGNORECASE)
 # SSH: bao gom 'ssh -l user IP', 'ssh user@IP', 'ssh IP'
@@ -120,6 +129,31 @@ class MiniTelnet:
         data, self.buffer = self.buffer, b""
         return data.decode(errors="ignore")
 
+    def read_until_prompt(self, timeout=10):
+        """Doc cho toi khi gap PROMPT THAT cua thiet bi (xem PROMPT_TAIL_RE) -
+        an toan cho cac lenh output dai ("show running-config | include menu")
+        co the chua ky tu '#' ngay trong noi dung (vd description "##"), khac
+        voi read_until("#") se ket thuc SAI ngay khi gap '#' dau tien bat ke
+        no nam o dau."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.sock.settimeout(max(0.3, deadline - time.time()))
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buffer += self._strip_iac(chunk)
+            text = self.buffer.decode(errors="ignore")
+            if PROMPT_TAIL_RE.search(text):
+                self.buffer = b""
+                return text
+        data, self.buffer = self.buffer, b""
+        return data.decode(errors="ignore")
+
     def write(self, text: str):
         self.sock.sendall((text + "\r\n").encode())
 
@@ -195,6 +229,32 @@ class MiniSSH:
                     matched     = self.buffer[: idx + len(p)]
                     self.buffer = self.buffer[idx + len(p):]
                     return matched.decode(errors="ignore")
+        data, self.buffer = self.buffer, b""
+        return data.decode(errors="ignore")
+
+    def read_until_prompt(self, timeout=10):
+        """Doc cho toi khi gap PROMPT THAT cua thiet bi (xem PROMPT_TAIL_RE) -
+        an toan cho cac lenh output dai ("show running-config | include menu")
+        co the chua ky tu '#' ngay trong noi dung (vd description "##"), khac
+        voi read_until("#") se ket thuc SAI ngay khi gap '#' dau tien bat ke
+        no nam o dau. Tuong duong ban Telnet, dung cho ca duong SSH (uu tien)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.3, deadline - time.time())
+            self._shell.settimeout(remaining)
+            try:
+                chunk = self._shell.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buffer += self._strip_ansi(chunk)
+            text = self.buffer.decode(errors="ignore")
+            if PROMPT_TAIL_RE.search(text):
+                self.buffer = b""
+                return text
         data, self.buffer = self.buffer, b""
         return data.decode(errors="ignore")
 

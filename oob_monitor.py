@@ -484,7 +484,14 @@ def poll_host_multi(ip, telnet_port, username, password, enable_password, menu_n
         tn.write("terminal length 0")
         tn.read_until("#", timeout=5)
         tn.write("show running-config | include menu")
-        raw = tn.read_until("#", timeout=15)
+        # QUAN TRONG: dung read_until_prompt() (dua vao PROMPT_TAIL_RE), KHONG
+        # dung read_until("#") - vi output nay co the dai nhieu dong va chua
+        # ky tu '#' NGAY TRONG NOI DUNG (vd description "##" nhu tren thiet bi
+        # HCM-OOB-FNX02L03H1-02), khien read_until("#") cat buffer NGANG GIUA
+        # CHUNG output ngay khi gap ky tu '#' dau tien - con lai toan bo cac
+        # dong "menu ... command ..." phia sau se bi mat, dan den
+        # final_options rong va bao nham "Khong parse duoc menu hop le".
+        raw = tn.read_until_prompt(timeout=15)
         
         detected_names = list(set(MENU_NAME_RE.findall(raw)))
         if menu_name_override:
