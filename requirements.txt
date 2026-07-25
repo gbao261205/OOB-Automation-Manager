@@ -14,3 +14,11 @@ paramiko==3.5.1
 # trong oob_monitor.py (rich.console, rich.panel, rich.rule, rich.table,
 # rich.text, rich.layout, rich.live, rich.box).
 rich>=13.7.0,<15.0.0
+
+# --- Tuy chon (nhung KHONG the thieu neu muon dung tinh nang Import/Export Excel):
+# openpyxl duoc dung boi cac ham:
+#   import_from_excel()      - doc file .xlsx de import danh sach IP thiet bi
+#   export_menu_report()     - xuat bao cao menu OOB ra file .xlsx 2 sheet
+#   _export_excel_template() - tao file mau huong dan dinh dang import
+# Neu chua cai, 3 ham tren van chay duoc nhung se hien thong bao loi va thoat.
+openpyxl>=3.1.0
