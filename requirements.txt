@@ -1,0 +1,16 @@
+# requirements.txt cho oob_lib.py / oob_monitor.py
+#
+# Cac thu vien duoi day la nhung goi THUC SU duoc import trong 2 file, ngoai
+# thu vien chuan cua Python (sqlite3, threading, socket, re, json, os, sys,
+# time, getpass, platform, subprocess, datetime, collections) von di kem san
+# voi moi ban cai dat Python, khong can khai bao o day.
+
+# --- Bat buoc: dung de SSH (paramiko.SSHClient / invoke_shell) trong oob_lib.py,
+# fallback sang MiniTelnet (tu viet, khong can thu vien ngoai) neu SSH loi.
+# Chot dung phien ban 3.5.1 theo yeu cau.
+paramiko==3.5.1
+
+# --- Bat buoc: dung cho toan bo giao dien Console/Live/Layout/Table/Panel
+# trong oob_monitor.py (rich.console, rich.panel, rich.rule, rich.table,
+# rich.text, rich.layout, rich.live, rich.box).
+rich>=13.7.0,<15.0.0

@@ -37,6 +37,15 @@ WILL = 251
 SB   = 250
 SE   = 240
 
+# Dung de doc CAC OUTPUT DAI (vd "show running-config | include menu") mot
+# cach an toan: thay vi dung read_until("#") - se ket thuc SAI ngay khi gap
+# BAT KY ky tu "#" nao xuat hien trong noi dung cau hinh (vd 1 description
+# dat la "##"), pattern nay CHI khop khi "#"/">" la ky tu CUOI CUNG cua buffer
+# hien tai VA duoc dung ngay sau 1 chuoi giong ten thiet bi (khong phai dung
+# sau 1 ky tu "#" khac hay "----> ") - tuc la dung PROMPT THAT cua thiet bi,
+# khong phai 1 doan text nam giua noi dung dang doc.
+PROMPT_TAIL_RE = re.compile(r'(?:^|[\r\n])[\w\-\.\(\)]{1,64}[>#]\s*$')
+
 TEXT_RE       = re.compile(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)',                          re.IGNORECASE)
 CMD_TELNET_RE = re.compile(r'menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)(?:\s+(\d+))?',  re.IGNORECASE)
 # SSH: bao gom 'ssh -l user IP', 'ssh user@IP', 'ssh IP'
@@ -120,6 +129,31 @@ class MiniTelnet:
         data, self.buffer = self.buffer, b""
         return data.decode(errors="ignore")
 
+    def read_until_prompt(self, timeout=10):
+        """Doc cho toi khi gap PROMPT THAT cua thiet bi (xem PROMPT_TAIL_RE) -
+        an toan cho cac lenh output dai ("show running-config | include menu")
+        co the chua ky tu '#' ngay trong noi dung (vd description "##"), khac
+        voi read_until("#") se ket thuc SAI ngay khi gap '#' dau tien bat ke
+        no nam o dau."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.sock.settimeout(max(0.3, deadline - time.time()))
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buffer += self._strip_iac(chunk)
+            text = self.buffer.decode(errors="ignore")
+            if PROMPT_TAIL_RE.search(text):
+                self.buffer = b""
+                return text
+        data, self.buffer = self.buffer, b""
+        return data.decode(errors="ignore")
+
     def write(self, text: str):
         self.sock.sendall((text + "\r\n").encode())
 
@@ -195,6 +229,32 @@ class MiniSSH:
                     matched     = self.buffer[: idx + len(p)]
                     self.buffer = self.buffer[idx + len(p):]
                     return matched.decode(errors="ignore")
+        data, self.buffer = self.buffer, b""
+        return data.decode(errors="ignore")
+
+    def read_until_prompt(self, timeout=10):
+        """Doc cho toi khi gap PROMPT THAT cua thiet bi (xem PROMPT_TAIL_RE) -
+        an toan cho cac lenh output dai ("show running-config | include menu")
+        co the chua ky tu '#' ngay trong noi dung (vd description "##"), khac
+        voi read_until("#") se ket thuc SAI ngay khi gap '#' dau tien bat ke
+        no nam o dau. Tuong duong ban Telnet, dung cho ca duong SSH (uu tien)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.3, deadline - time.time())
+            self._shell.settimeout(remaining)
+            try:
+                chunk = self._shell.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buffer += self._strip_ansi(chunk)
+            text = self.buffer.decode(errors="ignore")
+            if PROMPT_TAIL_RE.search(text):
+                self.buffer = b""
+                return text
         data, self.buffer = self.buffer, b""
         return data.decode(errors="ignore")
 
@@ -364,6 +424,11 @@ def _hostname_matches_desc(hostname: str, description: str) -> bool:
     return hostname.upper() in tokens
 
 
+# Alias cong khai: oob_monitor.py va cac module khac nen dung ham nay (thay vi so
+# sanh chuoi con "in") de tranh nham lan kieu "CTO-SW-02-2" khop nham "CTO-SW-02-20".
+hostname_matches_description = _hostname_matches_desc
+
+
 # ---------------------------------------------------------------------------
 # Parse menu
 # ---------------------------------------------------------------------------
@@ -374,39 +439,76 @@ def parse_menu(output: str, menu_name: str) -> dict:
     Ho tro ca lenh telnet lan ssh trong menu."""
     options = {}
     
-    # Hàm con để làm sạch key (biến "[3]" thành "3")
+    # 1. Hàm làm sạch cơ bản (giữ nguyên để tránh lỗi khoảng trắng)
     def clean_key(raw_key: str) -> str:
-        return re.sub(r'\W+', '', raw_key)
+        return raw_key.strip()
+
+    # 2. HÀM MỚI: Hàm Chuẩn hóa để GOM NHÓM (Bóc ngoặc vuông nếu có)
+    # Ví dụ: "[1]" -> "1", "1" -> "1", "[KTHT]" -> "KTHT"
+    def normalize_key(raw_key: str) -> str:
+        k = raw_key.strip()
+        if k.startswith("[") and k.endswith("]"):
+            return k[1:-1]
+        return k
         
     for raw_line in output.splitlines():
         line = raw_line.strip()
 
+        # Quét dòng TEXT (Hiển thị)
         m = TEXT_RE.match(line)
         if m and m.group(1) == menu_name:
-            key = clean_key(m.group(2))
-            options.setdefault(key, {})["description"] = m.group(3).strip()
+            original_key = clean_key(m.group(2))
+            norm_key = normalize_key(original_key)
+            
+            # Khởi tạo dict nếu chưa có, lưu lại CẢ original_key để dùng lúc Push
+            if norm_key not in options:
+                options[norm_key] = {"original_key": original_key}
+                
+            options[norm_key]["description"] = m.group(3).strip()
+            # Cập nhật original_key nếu dòng text có ngoặc vuông (ưu tiên lưu key hiển thị)
+            if original_key.startswith("["):
+                options[norm_key]["original_key"] = original_key
             continue
 
-        # Thu telnet truoc
+        # Quét dòng COMMAND TELNET
         m = CMD_TELNET_RE.match(line)
         if m and m.group(1) == menu_name:
-            key   = clean_key(m.group(2))
-            entry = options.setdefault(key, {})
+            norm_key = normalize_key(clean_key(m.group(2)))
+            
+            if norm_key not in options:
+                options[norm_key] = {"original_key": clean_key(m.group(2))}
+                
+            entry = options[norm_key]
             entry["ip"]       = m.group(3)
             entry["port"]     = int(m.group(4)) if m.group(4) else 23
             entry["protocol"] = "telnet"
             continue
 
-        # Thu ssh
+        # Quét dòng COMMAND SSH
         m = CMD_SSH_RE.match(line)
         if m and m.group(1) == menu_name:
-            key   = clean_key(m.group(2))
-            entry = options.setdefault(key, {})
+            norm_key = normalize_key(clean_key(m.group(2)))
+            
+            if norm_key not in options:
+                options[norm_key] = {"original_key": clean_key(m.group(2))}
+                
+            entry = options[norm_key]
             entry["ip"]       = m.group(3)
             entry["port"]     = int(m.group(4)) if m.group(4) else 22
             entry["protocol"] = "ssh"
 
-    return {k: v for k, v in options.items() if "ip" in v}
+    # Trả về dict, LỌC BỎ CÁC OPTION KHÔNG CÓ IP (như exit, resume)
+    # SỬ DỤNG original_key LÀM KEY CHÍNH CỦA DICTIONARY ĐỂ TOOL HIỂN THỊ ĐÚNG NGOẶC VUÔNG
+    final_options = {}
+    for norm_k, v in options.items():
+        if "ip" in v:
+            final_key = v.get("original_key", norm_k)
+            # Dọn dẹp original_key ra khỏi value dict trước khi trả về (cho sạch data)
+            if "original_key" in v:
+                del v["original_key"]
+            final_options[final_key] = v
+            
+    return final_options
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +570,39 @@ def fetch_hostname_via_auto(host, ssh_port, telnet_port,
                       username, password, enable_password, timeout=timeout)
     try:
         return fetch_hostname(tn)
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
+
+def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, updates_list, timeout=10):
+    """
+    Kết nối, ghi đè cấu hình và BẮT LỖI TỪ CISCO IOS.
+    updates_list: danh sách các tuple (real_menu_name, real_key, new_desc)
+    """
+    if not updates_list: 
+        return True
+        
+    tn = connect_auto(host, ssh_port, telnet_port, username, password, enable_password, timeout=timeout)
+    try:
+        tn.write("configure terminal")
+        tn.read_until("(config)#", timeout=5)
+        
+        all_success = True
+        for m_name, k, new_desc in updates_list:
+            tn.write(f"menu {m_name} text {k} {new_desc}")
+            out = tn.read_until("(config)#", timeout=5)
+            # Kiểm tra xem thiết bị Cisco có từ chối lệnh không
+            if "%" in out:
+                all_success = False
+                
+        tn.write("end")
+        tn.read_until("#", timeout=5)
+        return all_success
+    except Exception:
+        return False
     finally:
         try:
             tn.write("exit")
