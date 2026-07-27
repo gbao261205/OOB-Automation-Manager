@@ -1408,10 +1408,14 @@ def verify_specific_devices(cfg):
 
         for future in concurrent.futures.as_completed(future_to_alias):
             alias, ip, baseline = future_to_alias[future]
-            try: results_map[(alias, ip, baseline)] = future.result()
-            except Exception as exc: _con.print(f"  [red][LOI][/] {alias}: {exc}")
+            try: 
+                # ?? S?A T?I ??Y: ??y baseline v?o ph?n Value thay v? Key
+                results_map[(alias, ip)] = (baseline, future.result())
+            except Exception as exc: 
+                _con.print(f"  [red][LOI][/] {alias}: {exc}")
 
-    for (alias, ip, baseline), results in results_map.items():
+    # ?? S?A T?I ??Y: Unpack ??ng c?u tr?c d? li?u m?i c?a results_map
+    for (alias, ip), (baseline, results) in results_map.items():
         if any(r["status"] == "CANH BAO" for r in results):
             ans = _con.input(f"\n  [bold yellow]Phat hien sai lech tren {alias}. Tu dong PUSH sua Description? (y/N)[/]: ").strip().lower()
             if ans == 'y': process_push_and_reverify(cfg, alias, ip, baseline, results, print_fn=cli_print)
