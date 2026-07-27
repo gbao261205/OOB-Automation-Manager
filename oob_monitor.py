@@ -61,6 +61,13 @@ DEFAULT_CONFIG = {
     "verify_schedule_mode": "interval",   # "interval" | "daily" | "weekly"
     "verify_schedule_time": "01:00",      # "HH:MM", dung cho "daily"/"weekly"
     "verify_schedule_weekday": "mon",     # mon/tue/wed/thu/fri/sat/sun, dung cho "weekly"
+    # Lich chay Thu thap cau hinh tu dong (run_daemon, Luong 1). Cung 3 che do
+    # nhu verify_schedule_mode o tren: "interval" = giu hanh vi cu (lap lai
+    # moi "interval" giay). "daily"/"weekly" = chi chay 1 lan vao dung
+    # gio/thu co dinh moi ngay/tuan.
+    "scan_schedule_mode": "interval",     # "interval" | "daily" | "weekly"
+    "scan_schedule_time": "01:00",        # "HH:MM", dung cho "daily"/"weekly"
+    "scan_schedule_weekday": "mon",       # mon/tue/wed/thu/fri/sat/sun, dung cho "weekly"
     # Thoi gian cho sau khi telnet/ssh den port console (giay). Giam xuong 0.5s
     # neu mang nhanh, tang len 2-3s neu thiet bi phan hoi cham (#9).
     "verify_wait_after_connect": 1.5,
@@ -246,6 +253,57 @@ def _edit_verify_schedule(cfg):
     _con.print("  [yellow][!][/] Lua chon khong hop le, giu nguyen lich cu.")
 
 
+def _describe_scan_schedule(cfg):
+    mode = cfg.get("scan_schedule_mode", "interval")
+    if mode == "daily":
+        return f"Hang ngay luc {cfg.get('scan_schedule_time', '01:00')}"
+    if mode == "weekly":
+        wd = (cfg.get("scan_schedule_weekday", "mon") or "mon").strip().lower()[:3]
+        wd_label = _WEEKDAY_LABELS.get(wd, wd)
+        return f"Hang tuan vao {wd_label} luc {cfg.get('scan_schedule_time', '01:00')}"
+    return f"Lap lai moi {cfg.get('interval', 30)}s (che do interval)"
+
+
+def _edit_scan_schedule(cfg):
+    _con.print(f"""
+  --- Lich chay Thu thap cau hinh (Luong 1) tu dong ---
+  Hien tai: {_describe_scan_schedule(cfg)}
+  1. Lap lai theo chu ky (giay) - hanh vi mac dinh cu
+  2. Hang ngay, vao 1 gio co dinh (VD 01:00 = 1 gio sang)
+  3. Hang tuan, vao 1 thu + gio co dinh (VD Thu 2 luc 01:00)
+""")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+
+    if mode_choice == "1":
+        cfg["scan_schedule_mode"] = "interval"
+        _con.print("  [green][*][/] Da chuyen ve che do lap lai theo chu ky (muc '7' o menu Cau hinh).")
+        return
+
+    if mode_choice == "2":
+        cfg["scan_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay, dinh dang HH:MM (hien tai: {cfg.get('scan_schedule_time', '01:00')})[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green][*][/] Da dat lich: Hang ngay luc {cfg.get('scan_schedule_time', '01:00')}.")
+        return
+
+    if mode_choice == "3":
+        cfg["scan_schedule_mode"] = "weekly"
+        _con.print("  Chon thu trong tuan: mon=Thu2 tue=Thu3 wed=Thu4 thu=Thu5 fri=Thu6 sat=Thu7 sun=CN")
+        wd_val = _con.input(f"  [cyan]Thu (hien tai: {cfg.get('scan_schedule_weekday', 'mon')})[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP:
+            cfg["scan_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay, dinh dang HH:MM (hien tai: {cfg.get('scan_schedule_time', '01:00')})[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green][*][/] Da dat lich: {_describe_scan_schedule(cfg)}.")
+        return
+
+    _con.print("  [yellow][!][/] Lua chon khong hop le, giu nguyen lich cu.")
+
+
 def _test_connection(cfg):
     """Thu ket noi nhanh toi 1 IP bat ky de kiem tra credential (#13)."""
     test_ip = _con.input("  [cyan]Nhap IP OOB can thu ket noi[/]: ").strip()
@@ -279,6 +337,10 @@ def settings_menu(cfg, config_path):
         v_note = ("[dim red]<- Khong hieu luc (dang dung lich co dinh — doi o muc [d])[/]"
                   if schedule_mode in ("daily", "weekly")
                   else "[dim green]<- Dang co hieu luc[/]")
+        scan_schedule_mode = cfg.get("scan_schedule_mode", "interval")
+        s_note = ("[dim red]<- Khong hieu luc (dang dung lich co dinh — doi o muc [s])[/]"
+                  if scan_schedule_mode in ("daily", "weekly")
+                  else "[dim green]<- Dang co hieu luc[/]")
         auto_v = "[green bold]BAT[/]" if cfg.get('auto_verify', True)     else "[red bold]TAT[/]"
         auto_p = "[green bold]BAT[/]" if cfg.get('auto_push_desc', True)  else "[red bold]TAT[/]"
         wait_s = cfg.get('verify_wait_after_connect', 1.5)
@@ -304,7 +366,10 @@ def settings_menu(cfg, config_path):
         g.add_row("", f"[dim]   Cu moi chu ky daemon ket noi OOB doc menu config,[/]")
         g.add_row("", "[dim]   roi so sanh voi baseline → canh bao ngay neu co thay doi.[/]")
         g.add_row("[4]",  f"Ten menu (rong=tu dong) : {cfg['menu_name_override'] or '[dim](tu dong do)[/]'}")
-        g.add_row("[7]",  f"Chu ky doc cau hinh (s) : [bold cyan]{cfg['interval']}[/]")
+        g.add_row("\\[s]", f"Lich chay Thu thap      : [cyan]{_describe_scan_schedule(cfg)}[/]")
+        g.add_row("", "[dim]   • daily/weekly → chay vao dung gio/ngay co dinh[/]")
+        g.add_row("", "[dim]   • interval     → chay lap theo chu ky (muc [7] phia duoi)[/]")
+        g.add_row("[7]",  f"Chu ky interval (s)     : [bold cyan]{cfg['interval']}[/]  {s_note}")
         g.add_row("", "")
         g.add_row("", "[dim]── LUONG 2: VERIFY VAT LY (Deep Verify — chay theo lich) ─────────[/]")
         g.add_row("", "[dim]   Daemon pivot vao tung port console, lay hostname thuc[/]")
@@ -385,6 +450,8 @@ def settings_menu(cfg, config_path):
             cfg["auto_push_desc"] = not cfg.get("auto_push_desc", True)
         elif choice == "d":
             _edit_verify_schedule(cfg)
+        elif choice == "s":
+            _edit_scan_schedule(cfg)
         elif choice == "0":
             save_config(config_path, cfg)
             _con.print(f"[green][*][/] Da luu cau hinh vao {config_path}")
@@ -1240,6 +1307,31 @@ def input_with_timeout(prompt_text: str, timeout: int = 5):
             print()
             return None 
 
+def _scan_wait(cfg):
+    """Tinh & cho toi lan Thu thap cau hinh (Luong 1) tiep theo, dua tren
+    cfg['scan_schedule_mode']:
+      - "interval" (mac dinh, giu hanh vi cu): cho dung cfg['interval'] giay.
+      - "daily"/"weekly": cho toi dung gio/thu co dinh da cau hinh, dung
+        cung logic voi Deep Verify (compute_next_scheduled_run).
+    Doc lai cfg moi lan goi de nhan thay doi lich neu duoc sua trong menu
+    Cau hinh (option 3) trong cung tien trinh.
+    """
+    mode = cfg.get("scan_schedule_mode", "interval")
+    if mode in ("daily", "weekly"):
+        next_run = compute_next_scheduled_run(
+            mode,
+            cfg.get("scan_schedule_time", "01:00"),
+            cfg.get("scan_schedule_weekday", "mon"),
+        )
+        sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()))
+        log_oob(f"[dim][zzz] Lan Thu thap tiep theo: {next_run.strftime('%Y-%m-%d %H:%M')} "
+                f"(con {sleep_seconds}s)...[/]")
+    else:
+        sleep_seconds = cfg["interval"]
+        log_oob(f"[dim][zzz] Dang cho {sleep_seconds}s de quet lai...[/]")
+    time.sleep(sleep_seconds)
+
+
 def run_daemon(cfg):
     """Vòng lặp giám sát hiển thị đa luồng chia đôi màn hình."""
     global _live_ui
@@ -1256,7 +1348,7 @@ def run_daemon(cfg):
     
     with Live(layout, refresh_per_second=4, screen=False) as live:
         _live_ui = live
-        log_oob(f"[green][START][/] Khoi dong chu ky Config moi {cfg['interval']}s.")
+        log_oob(f"[green][START][/] Khoi dong Thu thap cau hinh - lich: {_describe_scan_schedule(cfg)}.")
         
         try:
             while True:
@@ -1264,7 +1356,7 @@ def run_daemon(cfg):
                 
                 if not hosts:
                     log_oob("[yellow][!][/] Danh sach IP trong. Doi them thiet bi...")
-                    time.sleep(cfg["interval"])
+                    _scan_wait(cfg)
                     continue
 
                 for ip, alias in hosts:
@@ -1340,8 +1432,7 @@ def run_daemon(cfg):
                     
                     live.start() 
 
-                log_oob(f"[dim][zzz] Dang cho {cfg['interval']}s de quet lai...[/]")
-                time.sleep(cfg["interval"])
+                _scan_wait(cfg)
 
         except KeyboardInterrupt:
             pass
