@@ -592,7 +592,7 @@ def poll_host_multi(ip, cfg, timeout=10):
                 except OSError: pass
                 tn.close()
         except Exception as e: last_exc = e
-    raise last_exc
+    raise last_exc or RuntimeError("Khong co credential nao hop le hoac danh sach credential trong.")
 
 # ---------------------------------------------------------------------------
 # Deep Verify & Alarm
