@@ -28,7 +28,6 @@ def query_db(query, args=(), fetchall=True):
 
 # --- CÁC TIẾN TRÌNH CHẠY NGẦM (Tránh treo Web) ---
 def _web_print(msg): 
-    # Bỏ qua in ra console để tránh rác log của Flask
     pass
 
 def bg_task_scan(target_ip=None):
@@ -106,7 +105,7 @@ def api_device():
 @app.route("/api/action", methods=["POST"])
 def api_action():
     action = request.json.get("action")
-    target_ip = request.json.get("ip") # Có thể là IP cụ thể hoặc null (All)
+    target_ip = request.json.get("ip") 
     
     if action == "scan":
         threading.Thread(target=bg_task_scan, args=(target_ip,)).start()
@@ -117,100 +116,57 @@ def api_action():
         
     return jsonify({"status": "success", "msg": f"Đã đưa lệnh {action.upper()} vào chạy ngầm!"})
 
+@app.route("/api/search")
+def api_search():
+    query = request.args.get("q", "").strip().lower()
+    if not query: return jsonify([])
 
-# --- GIAO DIỆN HTML/JS TÍCH HỢP ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="vi" data-bs-theme="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OOB Manager Web Panel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
-    <style>
-        body { background-color: #121212; color: #e0e0e0; }
-        .card { background-color: #1e1e1e; border: 1px solid #333; }
-        .table-dark { background-color: #1e1e1e; }
-        .stat-card { border-left: 4px solid #0d6efd; }
-    </style>
-</head>
-<body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
-        <div class="container-fluid">
-            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Web Panel</a>
-            <div>
-                <button class="btn btn-outline-info btn-sm me-2" onclick="openSettings()"><i class="bi bi-gear"></i> Cài đặt</button>
-                <button class="btn btn-outline-success btn-sm me-2" onclick="openAddDevice()"><i class="bi bi-plus-lg"></i> Thêm Thiết bị</button>
-                <span class="text-muted small"><i class="bi bi-clock"></i> {{ time_now }}</span>
-            </div>
-        </div>
-    </nav>
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    verify_st = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0 * 30)
 
-    <div class="container-fluid px-4">
-        <!-- Nút Hành động Tổng -->
-        <div class="card shadow-sm mb-4">
-            <div class="card-body bg-dark d-flex gap-2">
-                <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập)</button>
-                <button class="btn btn-warning" onclick="triggerAction('verify', null)"><i class="bi bi-lightning"></i> Verify All (Kiểm tra)</button>
-                <button class="btn btn-danger" onclick="triggerAction('push', null)"><i class="bi bi-upload"></i> Push Config All (Sửa lỗi)</button>
-            </div>
-        </div>
+    found = []
+    for ip, alias in hosts:
+        _mn, dn, source = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        if source is None: _mn, dn, source = oob_monitor.get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
+        if not source: continue
+        dn = dn or alias
+        
+        for key, entry in source.items():
+            act_host = verify_st.get((alias, key), {}).get("act_host", "") or ""
+            score = 0
+            
+            # Thuật toán tính điểm giống CLI
+            if query == act_host.lower(): score = 100
+            elif query in act_host.lower(): score = 90
+            elif query == alias.lower() or query == ip: score = 85
+            elif query == dn.lower(): score = 80
+            elif query in alias.lower() or query in dn.lower(): score = 75
+            elif query in entry.get("description", "").lower(): score = 60
+            elif query in entry.get("ip", "").lower(): score = 50
+            elif query == key.lower(): score = 40
+            
+            if score > 0:
+                found.append({
+                    "score": score,
+                    "oob_ip": ip,
+                    "oob_alias": alias,
+                    "oob_host": dn,
+                    "opt_key": key,
+                    "desc": entry.get("description", ""),
+                    "target_ip": entry.get("ip", ""),
+                    "target_port": entry.get("port", 23),
+                    "protocol": entry.get("protocol", "telnet"),
+                    "act_host": act_host
+                })
+    
+    # Sắp xếp kết quả ưu tiên cao nhất lên đầu
+    found.sort(key=lambda x: x["score"], reverse=True)
+    return jsonify(found)
 
-        <!-- Bảng danh sách thiết bị -->
-        <div class="card shadow mb-4">
-            <div class="card-header py-3 bg-dark">
-                <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices ({{ stats.total }} thiết bị)</h6>
-            </div>
-            <div class="card-body bg-dark">
-                <div class="table-responsive">
-                    <table class="table table-dark table-hover table-striped align-middle">
-                        <thead>
-                            <tr>
-                                <th>Alias</th>
-                                <th>IP Address</th>
-                                <th>Ping</th>
-                                <th>Trạng thái Menu</th>
-                                <th>Options</th>
-                                <th>Cập nhật lần cuối</th>
-                                <th>Hành động (Chạy ngầm)</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for dev in devices %}
-                            <tr>
-                                <td class="fw-bold">{{ dev.alias }}</td>
-                                <td><code>{{ dev.ip }}</code></td>
-                                <td>
-                                    {% if dev.ping == True %}<span class="badge bg-success">Online</span>
-                                    {% elif dev.ping == False %}<span class="badge bg-danger">Offline</span>
-                                    {% else %}<span class="badge bg-secondary">-</span>{% endif %}
-                                </td>
-                                <td>
-                                    {% if dev.menu_state == 'ok' %}<span class="badge bg-success">OK</span>
-                                    {% elif dev.menu_state == 'conn_failed' %}<span class="badge bg-danger">Lỗi KN</span>
-                                    {% else %}<span class="badge bg-secondary">{{ dev.menu_state or '-' }}</span>{% endif %}
-                                </td>
-                                <td><span class="text-info fw-bold">{{ dev.opt_count }}</span></td>
-                                <td class="text-muted small">{{ dev.checked_at }}</td>
-                                <td>
-                                    <div class="btn-group btn-group-sm">
-                                        <a href="/device/{{ dev.ip }}" class="btn btn-outline-light" title="Xem chi tiết"><i class="bi bi-eye"></i></a>
-                                        <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ dev.ip }}')" title="Scan"><i class="bi bi-search"></i></button>
-                                        <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ dev.ip }}')" title="Verify"><i class="bi bi-lightning"></i></button>
-                                        <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ dev.ip }}')" title="Push"><i class="bi bi-upload"></i></button>
-                                        <button class="btn btn-outline-secondary" onclick="deleteDevice('{{ dev.ip }}')" title="Xóa"><i class="bi bi-trash"></i></button>
-                                    </div>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
 
+# --- COMMON HTML BLOCKS (Dùng chung cho cả 2 trang) ---
+COMMON_MODALS_JS = """
     <!-- Modal Settings -->
     <div class="modal fade" id="settingsModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog">
@@ -257,6 +213,37 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Modal Search Results -->
+    <div class="modal fade" id="searchModal" tabindex="-1" data-bs-theme="dark">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content bg-dark text-light border-secondary">
+                <div class="modal-header border-secondary bg-primary text-white">
+                    <h5 class="modal-title"><i class="bi bi-search"></i> Kết quả tìm kiếm cho: <span id="searchKeyword" class="fw-bold"></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-dark table-hover table-striped align-middle m-0">
+                            <thead>
+                                <tr>
+                                    <th class="ps-3">Thuộc OOB</th>
+                                    <th>Menu/Port</th>
+                                    <th>Description</th>
+                                    <th>Hostname Thực tế</th>
+                                    <th>Kết nối Đích</th>
+                                    <th class="pe-3">Hành động</th>
+                                </tr>
+                            </thead>
+                            <tbody id="searchResultsBody">
+                                <!-- Du lieu render tu JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Notification -->
     <div class="toast-container position-fixed bottom-0 end-0 p-3">
         <div id="liveToast" class="toast align-items-center text-bg-primary border-0" role="alert" aria-live="assertive" aria-atomic="true">
@@ -278,7 +265,6 @@ HTML_TEMPLATE = """
             toast.show();
         }
 
-        // --- CÁC HÀM GỌI API ---
         async function triggerAction(action, ip) {
             let confirmMsg = ip ? `Xác nhận chạy ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
             if(!confirm(confirmMsg)) return;
@@ -333,11 +319,145 @@ HTML_TEMPLATE = """
             await fetch('/api/device', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip: ip}) });
             location.reload();
         }
+
+        // TÍNH NĂNG TÌM KIẾM
+        async function executeSearch() {
+            let q = document.getElementById('searchInput').value.trim();
+            if(!q) return;
+            document.getElementById('searchKeyword').innerText = q;
+            
+            let res = await fetch('/api/search?q=' + encodeURIComponent(q));
+            let data = await res.json();
+            
+            let tbody = document.getElementById('searchResultsBody');
+            tbody.innerHTML = '';
+            
+            if(data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-warning py-4">Không tìm thấy thiết bị nào khớp!</td></tr>';
+            } else {
+                data.forEach(item => {
+                    let actHostHtml = item.act_host ? `<span class="text-success fw-bold">${item.act_host}</span>` : '<span class="text-muted">-</span>';
+                    tbody.innerHTML += `
+                        <tr>
+                            <td class="ps-3"><strong class="text-info">${item.oob_alias}</strong><br><small class="text-muted">${item.oob_ip}</small></td>
+                            <td><kbd>${item.opt_key}</kbd></td>
+                            <td>${item.desc}</td>
+                            <td>${actHostHtml}</td>
+                            <td><code>${item.protocol}://${item.target_ip}:${item.target_port}</code></td>
+                            <td class="pe-3"><a href="/device/${item.oob_ip}" class="btn btn-sm btn-outline-primary" title="Tới thiết bị OOB"><i class="bi bi-box-arrow-right"></i> Đi tới</a></td>
+                        </tr>
+                    `;
+                });
+            }
+            
+            let myModal = new bootstrap.Modal(document.getElementById('searchModal'));
+            myModal.show();
+        }
     </script>
-</body>
-</html>
 """
 
+# --- GIAO DIỆN CHÍNH (Dashboard) ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="vi" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OOB Manager Web Panel</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; }
+        .table-dark { background-color: #1e1e1e; }
+        .stat-card { border-left: 4px solid #0d6efd; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Web Panel</a>
+            
+            <!-- THANH TÌM KIẾM -->
+            <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
+                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên thiết bị, OOB..." aria-label="Search" style="width: 300px;">
+                <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
+            </form>
+
+            <div>
+                <button class="btn btn-outline-info btn-sm me-2" onclick="openSettings()"><i class="bi bi-gear"></i> Cài đặt</button>
+                <button class="btn btn-outline-success btn-sm me-2" onclick="openAddDevice()"><i class="bi bi-plus-lg"></i> Thêm OOB</button>
+                <span class="text-muted small"><i class="bi bi-clock"></i> {{ time_now }}</span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid px-4">
+        <!-- Nút Hành động Tổng -->
+        <div class="card shadow-sm mb-4">
+            <div class="card-body bg-dark d-flex gap-2">
+                <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập)</button>
+                <button class="btn btn-warning" onclick="triggerAction('verify', null)"><i class="bi bi-lightning"></i> Verify All (Kiểm tra)</button>
+                <button class="btn btn-danger" onclick="triggerAction('push', null)"><i class="bi bi-upload"></i> Push Config All (Sửa lỗi)</button>
+            </div>
+        </div>
+
+        <!-- Bảng danh sách thiết bị -->
+        <div class="card shadow mb-4">
+            <div class="card-header py-3 bg-dark">
+                <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices ({{ stats.total }} thiết bị)</h6>
+            </div>
+            <div class="card-body bg-dark p-0">
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover table-striped align-middle m-0">
+                        <thead>
+                            <tr>
+                                <th class="ps-4">Alias</th>
+                                <th>IP Address</th>
+                                <th>Ping</th>
+                                <th>Trạng thái Menu</th>
+                                <th>Options</th>
+                                <th>Cập nhật lần cuối</th>
+                                <th class="pe-4">Hành động (Chạy ngầm)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for dev in devices %}
+                            <tr>
+                                <td class="fw-bold ps-4">{{ dev.alias }}</td>
+                                <td><code>{{ dev.ip }}</code></td>
+                                <td>
+                                    {% if dev.ping == True %}<span class="badge bg-success">Online</span>
+                                    {% elif dev.ping == False %}<span class="badge bg-danger">Offline</span>
+                                    {% else %}<span class="badge bg-secondary">-</span>{% endif %}
+                                </td>
+                                <td>
+                                    {% if dev.menu_state == 'ok' %}<span class="badge bg-success">OK</span>
+                                    {% elif dev.menu_state == 'conn_failed' %}<span class="badge bg-danger">Lỗi KN</span>
+                                    {% else %}<span class="badge bg-secondary">{{ dev.menu_state or '-' }}</span>{% endif %}
+                                </td>
+                                <td><span class="text-info fw-bold">{{ dev.opt_count }}</span></td>
+                                <td class="text-muted small">{{ dev.checked_at }}</td>
+                                <td class="pe-4">
+                                    <div class="btn-group btn-group-sm">
+                                        <a href="/device/{{ dev.ip }}" class="btn btn-outline-light" title="Xem chi tiết"><i class="bi bi-eye"></i></a>
+                                        <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ dev.ip }}')" title="Scan"><i class="bi bi-search"></i></button>
+                                        <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ dev.ip }}')" title="Verify"><i class="bi bi-lightning"></i></button>
+                                        <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ dev.ip }}')" title="Push"><i class="bi bi-upload"></i></button>
+                                        <button class="btn btn-outline-secondary" onclick="deleteDevice('{{ dev.ip }}')" title="Xóa"><i class="bi bi-trash"></i></button>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+""" + COMMON_MODALS_JS
+
+# --- GIAO DIỆN CHI TIẾT OOB ---
 DETAIL_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi" data-bs-theme="dark">
@@ -353,55 +473,64 @@ DETAIL_TEMPLATE = """
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
         <div class="container-fluid">
             <a class="navbar-brand fw-bold" href="/"><i class="bi bi-arrow-left"></i> Trở về Dashboard</a>
+            
+            <!-- THANH TÌM KIẾM -->
+            <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
+                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên thiết bị, OOB..." aria-label="Search" style="width: 300px;">
+                <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
+            </form>
         </div>
     </nav>
 
     <div class="container">
         <div class="card shadow mb-4">
-            <div class="card-header py-3 bg-dark">
+            <div class="card-header py-3 bg-dark d-flex justify-content-between align-items-center">
                 <h4 class="m-0 fw-bold text-primary">Cấu hình Menu: {{ ip }}</h4>
+                <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ ip }}')" title="Scan"><i class="bi bi-search"></i> Quét lại</button>
+                    <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ ip }}')" title="Verify"><i class="bi bi-lightning"></i> Verify</button>
+                    <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ ip }}')" title="Push"><i class="bi bi-upload"></i> Push Config</button>
+                </div>
             </div>
-            <div class="card-body bg-dark">
+            <div class="card-body bg-dark p-0">
                 {% if options %}
-                <div class="row mb-3">
-                    <div class="col-md-6"><p><strong>Tên thiết bị (Hostname):</strong> {{ options[0]['device_name'] }}</p></div>
-                    <div class="col-md-6"><p><strong>Hãng sản xuất:</strong> <span class="badge bg-secondary text-uppercase">{{ options[0]['vendor'] }}</span></p></div>
+                <div class="row p-3 m-0 border-bottom border-secondary">
+                    <div class="col-md-6"><p class="mb-0"><strong>Tên thiết bị (Hostname):</strong> {{ options[0]['device_name'] }}</p></div>
+                    <div class="col-md-6 text-end"><p class="mb-0"><strong>Hãng sản xuất:</strong> <span class="badge bg-secondary text-uppercase">{{ options[0]['vendor'] }}</span></p></div>
                 </div>
                 <div class="table-responsive">
-                    <table class="table table-dark table-striped table-hover">
+                    <table class="table table-dark table-striped table-hover m-0">
                         <thead>
                             <tr>
-                                <th>Phím Menu</th>
+                                <th class="ps-4">Phím Menu</th>
                                 <th>Description</th>
                                 <th>Target IP</th>
                                 <th>Target Port</th>
-                                <th>Protocol</th>
+                                <th class="pe-4">Protocol</th>
                             </tr>
                         </thead>
                         <tbody>
                             {% for opt in options %}
                             <tr>
-                                <td><kbd>{{ opt['option_key'] }}</kbd></td>
+                                <td class="ps-4"><kbd>{{ opt['option_key'] }}</kbd></td>
                                 <td>{{ opt['description'] }}</td>
                                 <td><code>{{ opt['target_ip'] }}</code></td>
                                 <td>{{ opt['target_port'] }}</td>
-                                <td><span class="badge {% if opt['protocol'] == 'ssh' %}bg-success{% elif opt['protocol'] == 'serial' %}bg-info text-dark{% else %}bg-warning text-dark{% endif %}">{{ opt['protocol'] | upper }}</span></td>
+                                <td class="pe-4"><span class="badge {% if opt['protocol'] == 'ssh' %}bg-success{% elif opt['protocol'] == 'serial' %}bg-info text-dark{% else %}bg-warning text-dark{% endif %}">{{ opt['protocol'] | upper }}</span></td>
                             </tr>
                             {% endfor %}
                         </tbody>
                     </table>
                 </div>
                 {% else %}
-                <div class="alert alert-warning">
+                <div class="alert alert-warning m-4">
                     <i class="bi bi-exclamation-circle"></i> Chưa có dữ liệu Baseline cho thiết bị này, hoặc thiết bị chưa được quét.
                 </div>
                 {% endif %}
             </div>
         </div>
     </div>
-</body>
-</html>
-"""
+""" + COMMON_MODALS_JS
 
 # --- ROUTING GIAO DIỆN ---
 @app.route("/")
@@ -412,7 +541,7 @@ def index():
     stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "err_menu": 0}
 
     for item in ips:
-        ip, alias = item[0], item[1]
+        ip, alias = item["ip"], item["alias"]
         status = dev_status.get(ip, {})
         
         if status.get("ping") is True: stats["online"] += 1
@@ -439,7 +568,7 @@ def device_detail(ip):
 
 if __name__ == "__main__":
     print("=========================================================")
-    print("🚀 GIAO DIỆN WEB OOB (FULL ACTIONS) ĐÃ KHỞI ĐỘNG")
+    print("🚀 GIAO DIỆN WEB OOB (FULL ACTIONS + SEARCH) ĐÃ KHỞI ĐỘNG")
     print("👉 Mở trình duyệt và truy cập: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False)
