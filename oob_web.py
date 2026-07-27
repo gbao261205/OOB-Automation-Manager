@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
-# Import thẳng các hàm lõi từ tool CLI của bạn
+# Import thẳng các hàm lõi từ tool CLI (Đã cập nhật chuẩn Vertiv)
 import oob_monitor
 
 app = Flask(__name__)
@@ -28,7 +28,7 @@ def query_db(query, args=(), fetchall=True):
 
 # --- CÁC TIẾN TRÌNH CHẠY NGẦM (Tránh treo Web) ---
 def _web_print(msg): 
-    pass
+    pass # Ẩn log CLI để Web không bị rác
 
 def bg_task_scan(target_ip=None):
     cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
@@ -72,7 +72,7 @@ def bg_task_push(target_ip=None):
         if not baseline: continue
         
         vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
-        if vendor == "vertiv": continue # Vertiv chưa hỗ trợ Push
+        if vendor == "vertiv": continue # Vertiv chưa hỗ trợ Push Config
         
         results = oob_monitor.run_deep_verify(cfg, alias, ip, baseline, print_fn=_web_print)
         if any(r["status"] == "CANH BAO" for r in results):
@@ -118,6 +118,7 @@ def api_action():
 
 @app.route("/api/search")
 def api_search():
+    """API Tìm kiếm siêu tốc trên Web"""
     query = request.args.get("q", "").strip().lower()
     if not query: return jsonify([])
 
@@ -136,7 +137,7 @@ def api_search():
             act_host = verify_st.get((alias, key), {}).get("act_host", "") or ""
             score = 0
             
-            # Thuật toán tính điểm giống CLI
+            # Chấm điểm mức độ khớp ưu tiên
             if query == act_host.lower(): score = 100
             elif query in act_host.lower(): score = 90
             elif query == alias.lower() or query == ip: score = 85
@@ -148,26 +149,19 @@ def api_search():
             
             if score > 0:
                 found.append({
-                    "score": score,
-                    "oob_ip": ip,
-                    "oob_alias": alias,
-                    "oob_host": dn,
-                    "opt_key": key,
-                    "desc": entry.get("description", ""),
-                    "target_ip": entry.get("ip", ""),
-                    "target_port": entry.get("port", 23),
-                    "protocol": entry.get("protocol", "telnet"),
-                    "act_host": act_host
+                    "score": score, "oob_ip": ip, "oob_alias": alias, "oob_host": dn,
+                    "opt_key": key, "desc": entry.get("description", ""),
+                    "target_ip": entry.get("ip", ""), "target_port": entry.get("port", 23),
+                    "protocol": entry.get("protocol", "telnet"), "act_host": act_host
                 })
     
-    # Sắp xếp kết quả ưu tiên cao nhất lên đầu
     found.sort(key=lambda x: x["score"], reverse=True)
     return jsonify(found)
 
 
 # --- COMMON HTML BLOCKS (Dùng chung cho cả 2 trang) ---
 COMMON_MODALS_JS = """
-    <!-- Modal Settings -->
+    <!-- Modal Cài đặt Hệ thống -->
     <div class="modal fade" id="settingsModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog">
             <div class="modal-content bg-dark text-light border-secondary">
@@ -194,7 +188,7 @@ COMMON_MODALS_JS = """
         </div>
     </div>
 
-    <!-- Modal Add Device -->
+    <!-- Modal Thêm Thiết bị -->
     <div class="modal fade" id="addDeviceModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog">
             <div class="modal-content bg-dark text-light border-secondary">
@@ -213,12 +207,12 @@ COMMON_MODALS_JS = """
         </div>
     </div>
 
-    <!-- Modal Search Results -->
+    <!-- Modal Popup HIỂN THỊ KẾT QUẢ TÌM KIẾM -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog modal-xl">
             <div class="modal-content bg-dark text-light border-secondary">
                 <div class="modal-header border-secondary bg-primary text-white">
-                    <h5 class="modal-title"><i class="bi bi-search"></i> Kết quả tìm kiếm cho: <span id="searchKeyword" class="fw-bold"></span></h5>
+                    <h5 class="modal-title"><i class="bi bi-search"></i> Kết quả tìm kiếm cho: "<span id="searchKeyword" class="fw-bold"></span>"</h5>
                     <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body p-0">
@@ -235,7 +229,7 @@ COMMON_MODALS_JS = """
                                 </tr>
                             </thead>
                             <tbody id="searchResultsBody">
-                                <!-- Du lieu render tu JS -->
+                                <!-- Dữ liệu API đổ vào đây -->
                             </tbody>
                         </table>
                     </div>
@@ -244,7 +238,7 @@ COMMON_MODALS_JS = """
         </div>
     </div>
 
-    <!-- Toast Notification -->
+    <!-- Toast Notification (Thông báo góc dưới) -->
     <div class="toast-container position-fixed bottom-0 end-0 p-3">
         <div id="liveToast" class="toast align-items-center text-bg-primary border-0" role="alert" aria-live="assertive" aria-atomic="true">
             <div class="d-flex">
@@ -266,7 +260,7 @@ COMMON_MODALS_JS = """
         }
 
         async function triggerAction(action, ip) {
-            let confirmMsg = ip ? `Xác nhận chạy ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
+            let confirmMsg = ip ? `Xác nhận chạy lệnh ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy lệnh ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
             if(!confirm(confirmMsg)) return;
 
             let res = await fetch('/api/action', {
@@ -320,7 +314,7 @@ COMMON_MODALS_JS = """
             location.reload();
         }
 
-        // TÍNH NĂNG TÌM KIẾM
+        // --- JS TÌM KIẾM ---
         async function executeSearch() {
             let q = document.getElementById('searchInput').value.trim();
             if(!q) return;
@@ -344,7 +338,7 @@ COMMON_MODALS_JS = """
                             <td>${item.desc}</td>
                             <td>${actHostHtml}</td>
                             <td><code>${item.protocol}://${item.target_ip}:${item.target_port}</code></td>
-                            <td class="pe-3"><a href="/device/${item.oob_ip}" class="btn btn-sm btn-outline-primary" title="Tới thiết bị OOB"><i class="bi bi-box-arrow-right"></i> Đi tới</a></td>
+                            <td class="pe-3"><a href="/device/${item.oob_ip}" class="btn btn-sm btn-outline-primary" title="Tới thiết bị OOB"><i class="bi bi-box-arrow-in-right"></i> Đi tới</a></td>
                         </tr>
                     `;
                 });
@@ -354,6 +348,8 @@ COMMON_MODALS_JS = """
             myModal.show();
         }
     </script>
+</body>
+</html>
 """
 
 # --- GIAO DIỆN CHÍNH (Dashboard) ---
@@ -378,9 +374,9 @@ HTML_TEMPLATE = """
         <div class="container-fluid">
             <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Web Panel</a>
             
-            <!-- THANH TÌM KIẾM -->
+            <!-- THANH TÌM KIẾM TRÊN NAVBAR -->
             <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
-                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên thiết bị, OOB..." aria-label="Search" style="width: 300px;">
+                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
                 <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
             </form>
 
@@ -394,17 +390,17 @@ HTML_TEMPLATE = """
 
     <div class="container-fluid px-4">
         <!-- Nút Hành động Tổng -->
-        <div class="card shadow-sm mb-4">
+        <div class="card shadow-sm mb-4 border-secondary">
             <div class="card-body bg-dark d-flex gap-2">
-                <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập)</button>
-                <button class="btn btn-warning" onclick="triggerAction('verify', null)"><i class="bi bi-lightning"></i> Verify All (Kiểm tra)</button>
-                <button class="btn btn-danger" onclick="triggerAction('push', null)"><i class="bi bi-upload"></i> Push Config All (Sửa lỗi)</button>
+                <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập Data)</button>
+                <button class="btn btn-warning" onclick="triggerAction('verify', null)"><i class="bi bi-lightning"></i> Verify All (Kiểm tra cáp)</button>
+                <button class="btn btn-danger" onclick="triggerAction('push', null)"><i class="bi bi-upload"></i> Push Config All (Sửa lỗi Desc)</button>
             </div>
         </div>
 
         <!-- Bảng danh sách thiết bị -->
-        <div class="card shadow mb-4">
-            <div class="card-header py-3 bg-dark">
+        <div class="card shadow mb-4 border-secondary">
+            <div class="card-header py-3 bg-dark border-secondary">
                 <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices ({{ stats.total }} thiết bị)</h6>
             </div>
             <div class="card-body bg-dark p-0">
@@ -416,9 +412,9 @@ HTML_TEMPLATE = """
                                 <th>IP Address</th>
                                 <th>Ping</th>
                                 <th>Trạng thái Menu</th>
-                                <th>Options</th>
+                                <th>Tổng Line</th>
                                 <th>Cập nhật lần cuối</th>
-                                <th class="pe-4">Hành động (Chạy ngầm)</th>
+                                <th class="pe-4">Hành động OOB</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -433,18 +429,18 @@ HTML_TEMPLATE = """
                                 </td>
                                 <td>
                                     {% if dev.menu_state == 'ok' %}<span class="badge bg-success">OK</span>
-                                    {% elif dev.menu_state == 'conn_failed' %}<span class="badge bg-danger">Lỗi KN</span>
+                                    {% elif dev.menu_state == 'conn_failed' %}<span class="badge bg-danger">Lỗi Connect</span>
                                     {% else %}<span class="badge bg-secondary">{{ dev.menu_state or '-' }}</span>{% endif %}
                                 </td>
                                 <td><span class="text-info fw-bold">{{ dev.opt_count }}</span></td>
                                 <td class="text-muted small">{{ dev.checked_at }}</td>
                                 <td class="pe-4">
                                     <div class="btn-group btn-group-sm">
-                                        <a href="/device/{{ dev.ip }}" class="btn btn-outline-light" title="Xem chi tiết"><i class="bi bi-eye"></i></a>
-                                        <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ dev.ip }}')" title="Scan"><i class="bi bi-search"></i></button>
-                                        <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ dev.ip }}')" title="Verify"><i class="bi bi-lightning"></i></button>
-                                        <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ dev.ip }}')" title="Push"><i class="bi bi-upload"></i></button>
-                                        <button class="btn btn-outline-secondary" onclick="deleteDevice('{{ dev.ip }}')" title="Xóa"><i class="bi bi-trash"></i></button>
+                                        <a href="/device/{{ dev.ip }}" class="btn btn-outline-light" title="Xem chi tiết line"><i class="bi bi-eye"></i></a>
+                                        <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ dev.ip }}')" title="Scan OOB"><i class="bi bi-search"></i></button>
+                                        <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ dev.ip }}')" title="Verify OOB"><i class="bi bi-lightning"></i></button>
+                                        <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ dev.ip }}')" title="Push OOB"><i class="bi bi-upload"></i></button>
+                                        <button class="btn btn-outline-secondary" onclick="deleteDevice('{{ dev.ip }}')" title="Xóa OOB"><i class="bi bi-trash"></i></button>
                                     </div>
                                 </td>
                             </tr>
@@ -474,39 +470,39 @@ DETAIL_TEMPLATE = """
         <div class="container-fluid">
             <a class="navbar-brand fw-bold" href="/"><i class="bi bi-arrow-left"></i> Trở về Dashboard</a>
             
-            <!-- THANH TÌM KIẾM -->
+            <!-- THANH TÌM KIẾM TRÊN NAVBAR -->
             <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
-                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên thiết bị, OOB..." aria-label="Search" style="width: 300px;">
+                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
                 <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
             </form>
         </div>
     </nav>
 
     <div class="container">
-        <div class="card shadow mb-4">
-            <div class="card-header py-3 bg-dark d-flex justify-content-between align-items-center">
-                <h4 class="m-0 fw-bold text-primary">Cấu hình Menu: {{ ip }}</h4>
+        <div class="card shadow mb-4 border-secondary">
+            <div class="card-header py-3 bg-dark d-flex justify-content-between align-items-center border-secondary">
+                <h4 class="m-0 fw-bold text-primary">Cấu hình Menu OOB: {{ ip }}</h4>
                 <div class="btn-group btn-group-sm">
-                    <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ ip }}')" title="Scan"><i class="bi bi-search"></i> Quét lại</button>
-                    <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ ip }}')" title="Verify"><i class="bi bi-lightning"></i> Verify</button>
-                    <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ ip }}')" title="Push"><i class="bi bi-upload"></i> Push Config</button>
+                    <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ ip }}')" title="Scan"><i class="bi bi-search"></i> Quét Lại Data</button>
+                    <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ ip }}')" title="Verify"><i class="bi bi-lightning"></i> K.Tra Dây Cắm</button>
+                    <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ ip }}')" title="Push"><i class="bi bi-upload"></i> Sửa Lỗi Desc</button>
                 </div>
             </div>
             <div class="card-body bg-dark p-0">
                 {% if options %}
                 <div class="row p-3 m-0 border-bottom border-secondary">
-                    <div class="col-md-6"><p class="mb-0"><strong>Tên thiết bị (Hostname):</strong> {{ options[0]['device_name'] }}</p></div>
+                    <div class="col-md-6"><p class="mb-0"><strong>Tên thiết bị (Hostname OOB):</strong> {{ options[0]['device_name'] }}</p></div>
                     <div class="col-md-6 text-end"><p class="mb-0"><strong>Hãng sản xuất:</strong> <span class="badge bg-secondary text-uppercase">{{ options[0]['vendor'] }}</span></p></div>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-dark table-striped table-hover m-0">
                         <thead>
                             <tr>
-                                <th class="ps-4">Phím Menu</th>
-                                <th>Description</th>
+                                <th class="ps-4">Phím Menu / Cổng</th>
+                                <th>Mô tả (Description)</th>
                                 <th>Target IP</th>
                                 <th>Target Port</th>
-                                <th class="pe-4">Protocol</th>
+                                <th class="pe-4">Giao thức</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -524,7 +520,7 @@ DETAIL_TEMPLATE = """
                 </div>
                 {% else %}
                 <div class="alert alert-warning m-4">
-                    <i class="bi bi-exclamation-circle"></i> Chưa có dữ liệu Baseline cho thiết bị này, hoặc thiết bị chưa được quét.
+                    <i class="bi bi-exclamation-circle"></i> Chưa có dữ liệu Baseline cho thiết bị này, hoặc thiết bị chưa được Scan.
                 </div>
                 {% endif %}
             </div>
@@ -563,12 +559,12 @@ def index():
 
 @app.route("/device/<ip>")
 def device_detail(ip):
-    options = query_db("SELECT * FROM baseline_menu WHERE host=? ORDER BY option_key", (ip,))
+    options = query_db("SELECT * FROM baseline_menu WHERE host=? ORDER BY CAST(option_key AS INTEGER)", (ip,))
     return render_template_string(DETAIL_TEMPLATE, ip=ip, options=[dict(row) for row in options])
 
 if __name__ == "__main__":
     print("=========================================================")
-    print("🚀 GIAO DIỆN WEB OOB (FULL ACTIONS + SEARCH) ĐÃ KHỞI ĐỘNG")
+    print("🚀 GIAO DIỆN WEB OOB (CÓ THANH SEARCH) ĐÃ KHỞI ĐỘNG")
     print("👉 Mở trình duyệt và truy cập: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False)
