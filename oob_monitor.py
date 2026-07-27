@@ -65,15 +65,15 @@ DEFAULT_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
-# Locks ?? ??ng b? lu?ng (Multi-threading)
+# Locks de dong bo luong
 # ---------------------------------------------------------------------------
-db_lock = threading.Lock()            # Ch?ng l?i Database is locked khi ?a lu?ng
-action_lock = threading.Lock()        # B?t Verify ph?i ch? Scan ch?y xong m?i ???c ch?y
-file_lock = threading.Lock()          # Kh?a ghi file log
-ui_print_lock = threading.Lock()      # Kh?a in console tr?nh b? ?an xen text
+db_lock = threading.Lock()            
+action_lock = threading.Lock()        
+file_lock = threading.Lock()          
+ui_print_lock = threading.Lock()      
 
 # ---------------------------------------------------------------------------
-# Module-level compiled regex constants
+# Regex
 # ---------------------------------------------------------------------------
 _DESC_PREFIX_RE    = re.compile(r'^[-=>\s]+')
 _HOSTNAME_PROMPT_RE = re.compile(r'([A-Za-z0-9_\-\.]+)[>#]')
@@ -84,7 +84,7 @@ _CONN_ERR_RE        = re.compile(r'refused|time(d)?[\s-]?out|unreachable|no rout
 _IP_RE              = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 
 # ---------------------------------------------------------------------------
-# H? th?ng UI ?a lu?ng
+# He thong UI da luong
 # ---------------------------------------------------------------------------
 _con = Console(highlight=False)
 
@@ -103,8 +103,8 @@ _live_ui = None
 
 def update_ui():
     with ui_lock:
-        layout["upper"].update(Panel(Text.from_markup("\n".join(oob_logs)), title="[bold cyan]? OOB MONITORING (C?u h?nh)[/]", border_style="cyan"))
-        layout["lower"].update(Panel(Text.from_markup("\n".join(verify_logs)), title="[bold magenta]? DEEP VERIFY (Thi?t b? cu?i)[/]", border_style="magenta"))
+        layout["upper"].update(Panel(Text.from_markup("\n".join(oob_logs)), title="[bold cyan] [ OOB MONITORING (Cau hinh) ] [/]", border_style="cyan"))
+        layout["lower"].update(Panel(Text.from_markup("\n".join(verify_logs)), title="[bold magenta] [ DEEP VERIFY (Thiet bi cuoi) ] [/]", border_style="magenta"))
         if _live_ui and _live_ui.is_started:
             _live_ui.update(layout)
 
@@ -129,7 +129,7 @@ def log_baseline_change(alias, ip, action):
     except Exception: pass
 
 # ---------------------------------------------------------------------------
-# Trang thai thiet bi (ping + tinh trang menu)
+# Trang thai thiet bi
 # ---------------------------------------------------------------------------
 DEVICE_STATUS_FILE = "device_status.json"
 _device_status_lock = threading.Lock()
@@ -159,7 +159,7 @@ MENU_STATE_LABELS = {
 }
 
 # ---------------------------------------------------------------------------
-# C?c h?m ti?n ?ch, c?u h?nh v? Database
+# Cac ham tien ich, cau hinh va DB
 # ---------------------------------------------------------------------------
 def load_config(path):
     cfg = DEFAULT_CONFIG.copy()
@@ -228,7 +228,7 @@ def settings_menu(cfg, config_path):
 
         g = Table.grid(padding=(0, 1))
         g.add_column(style="bold cyan", min_width=4, justify="right"); g.add_column()
-        g.add_row("", "[dim]?? KET NOI ??????????????????????????????????????????????????????????[/]")
+        g.add_row("", "[dim]-- KET NOI ----------------------------------------------------------[/]")
         g.add_row("[1]",  f"Username (chinh)      : {cfg['username'] or '[dim](khong dung)[/]'}")
         g.add_row("[2]",  f"Password (chinh)      : {mask(cfg['password'])}")
         g.add_row("[3]",  f"Enable pass (chinh)   : {mask(cfg['enable_password'])}")
@@ -236,17 +236,17 @@ def settings_menu(cfg, config_path):
         g.add_row("[5]",  f"SSH port (uu tien)    : {cfg.get('ssh_port', 22)}")
         g.add_row("[6]",  f"Telnet port (du phong): {cfg.get('telnet_port', 23)}")
         g.add_row("", "")
-        g.add_row("", "[dim]?? FILE DU LIEU ????????????????????????????????????????????????????[/]")
+        g.add_row("", "[dim]-- FILE DU LIEU ----------------------------------------------------[/]")
         g.add_row("[8]",  f"File danh sach IP     : {cfg['ip_list']}")
         g.add_row("[9]",  f"File baseline DB      : {cfg['baseline_db']}")
         g.add_row("\\[a]",  f"File snapshot DB      : {cfg['snapshot_db']}")
         g.add_row("", "")
-        g.add_row("", "[dim]?? LUONG 1: GIAM SAT CAU HINH ????????????????????????????????????[/]")
+        g.add_row("", "[dim]-- LUONG 1: GIAM SAT CAU HINH ------------------------------------[/]")
         g.add_row("[4]",  f"Ten menu ep dung      : {cfg['menu_name_override'] or '[dim](tu dong do)[/]'}")
         g.add_row("\\[s]", f"Lich chay Thu thap    : [cyan]{_describe_scan_schedule(cfg)}[/]")
         g.add_row("[7]",  f"Chu ky interval (s)   : [bold cyan]{cfg['interval']}[/]  {s_note}")
         g.add_row("", "")
-        g.add_row("", "[dim]?? LUONG 2: VERIFY VAT LY ????????????????????????????????????????[/]")
+        g.add_row("", "[dim]-- LUONG 2: VERIFY VAT LY ----------------------------------------[/]")
         g.add_row("\\[b]", f"Tu dong Verify ngam   : {auto_v}")
         g.add_row("\\[d]", f"Lich chay Verify      : [cyan]{_describe_verify_schedule(cfg)}[/]")
         g.add_row("\\[v]", f"Chu ky interval (s)   : [bold cyan]{cfg.get('verify_interval', 3600)}[/]  {v_note}")
@@ -256,7 +256,7 @@ def settings_menu(cfg, config_path):
         g.add_row("[0]",   "[bold red]Quay lai menu chinh[/]")
 
         _con.print()
-        _con.print(Panel(g, title="[bold cyan] ?  CAI DAT HE THONG [/]", border_style="cyan", padding=(1, 2)))
+        _con.print(Panel(g, title="[bold cyan] [ CAI DAT HE THONG ] [/]", border_style="cyan", padding=(1, 2)))
         choice = _con.input("[bold]Chon muc can sua[/]: ").strip().lower()
 
         if choice == "1": cfg["username"] = input("  Username moi (Enter de bo trong): ").strip()
@@ -304,7 +304,7 @@ def add_ip(path, ip, alias=None):
     hosts = load_ip_list(path)
     if any(h[0] == ip for h in hosts): return _con.print(f"  [yellow][!][/] IP {ip} da co.")
     with open(path, "a", encoding="utf-8") as f: f.write(f"{ip} {alias or ip}\n")
-    _con.print(f"  [green]?[/] Da them {ip}")
+    _con.print(f"  [green](OK)[/] Da them {ip}")
 
 def remove_ip(path, ip):
     hosts = load_ip_list(path)
@@ -312,7 +312,7 @@ def remove_ip(path, ip):
     if len(remaining) == len(hosts): return _con.print(f"  [yellow][!][/] Khong tim thay IP.")
     with open(path, "w", encoding="utf-8") as f:
         for h_ip, alias in remaining: f.write(f"{h_ip} {alias}\n")
-    _con.print(f"  [green]?[/] Da xoa {ip}")
+    _con.print(f"  [green](OK)[/] Da xoa {ip}")
 
 _DB_INIT_CACHE = set()
 def _init_db(path, table):
@@ -382,13 +382,13 @@ def print_diff(baseline: dict, snapshot: dict):
     if d["missing"]: _con.print(f"    [red]- Option bi mat: {', '.join(d['missing'])}[/]")
     if d["changed"]:
         _con.print(f"    [yellow]~ Option bi doi noi dung: {', '.join(d['changed'])}[/]")
-        t = Table(box=rbox.SIMPLE_HEAD, header_style="bold dim", show_header=True)
+        t = Table(box=rbox.ASCII, header_style="bold dim", show_header=True)
         t.add_column("Option",  style="bold cyan"); t.add_column("Baseline (chuan)"); t.add_column("Hien tai")
         for key in d["changed"]: t.add_row(f"{key}", f"{baseline[key].get('description','')} [dim]{_fmt_entry(baseline[key])}[/]", f"{snapshot[key].get('description','')} [dim]{_fmt_entry(snapshot[key])}[/]")
         _con.print(t)
 
 def print_options(options: dict):
-    t = Table(box=rbox.SIMPLE, show_header=False, padding=(0, 1))
+    t = Table(box=rbox.ASCII, show_header=False, padding=(0, 1))
     t.add_column(style="bold cyan", justify="right"); t.add_column(); t.add_column(style="dim")
     for key in sorted(options):
         e, proto = options[key], _norm_proto(options[key].get("protocol"))
@@ -396,7 +396,7 @@ def print_options(options: dict):
     _con.print(t)
 
 # ---------------------------------------------------------------------------
-# Thu th?p Menu
+# Thu thap Menu
 # ---------------------------------------------------------------------------
 MENU_NAME_RE = re.compile(r'^\s*menu\s+(\S+)\s+(?:text|command)\b', re.IGNORECASE | re.MULTILINE)
 TEXT_RE       = re.compile(r'^\s*menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', re.IGNORECASE)
@@ -458,9 +458,26 @@ def _build_verify_report(alias, oob_ip, own_hostname, results):
     counts = {}
     for r in results: counts[r["status"]] = counts.get(r["status"], 0) + 1
     summary = "   ".join(f"{s}: {counts.get(s, 0)}" for s in ("CANH BAO", "KHONG PIVOT", "TIMEOUT", "YEU CAU DANG NHAP", "OK") if counts.get(s, 0)) or "Khong co opt"
-    bar = "=" * 80
-    lines = [bar, f" BAO CAO DEEP VERIFY - OOB: {alias} ({oob_ip})", f" Hostname OOB   : {own_hostname or '?'}", f" Tom tat        : {summary}", bar]
-    for r in results: lines.append(f" - [{r['status']}] {r['key']}: {r.get('act_host')} | Note: {r.get('note')}")
+    
+    # Su dung ky tu ASCII cho bang bao cao de khong bi loi text
+    def fmt_row(cols, widths): return "| " + " | ".join(cols[i].ljust(widths[i]) for i in range(len(cols))) + " |"
+    def fmt_sep(widths): return "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    
+    headers = ["STT", "Option", "Trang thai", "Hostname thuc te", "Description", "Port", "Ghi chu"]
+    max_w   = [4, 22, 12, 22, 32, 6, 36]
+    ordered = sorted(enumerate(results), key=lambda p: ({"CANH BAO": 0, "KHONG PIVOT": 1, "TIMEOUT": 2, "YEU CAU DANG NHAP": 3, "OK": 4}.get(p[1]["status"], 9), p[0]))
+    rows = []
+    for i, (_, r) in enumerate(ordered, start=1):
+        rows.append([str(i), (r["key"][:max_w[1]-1]+"~") if len(r["key"])>max_w[1] else r["key"], r["status"], (r.get("act_host") or "-")[:max_w[3]], (r.get("desc") or "-")[:max_w[4]], str(r.get("port", "")), (r.get("note") or "")[:max_w[6]]])
+    widths = [min(max([len(h)] + ([len(row[i]) for row in rows] if rows else [])), max_w[i]) for i, h in enumerate(headers)]
+    
+    bar = "=" * max(sum(widths) + 3*len(widths) + 1, 60)
+    lines = [bar, f" BAO CAO DEEP VERIFY - OOB: {alias} ({oob_ip})", f" Thoi gian      : {now_str}", f" Hostname OOB   : {own_hostname or '?'}", f" Tong so option : {len(results)}", f" Tom tat        : {summary}", bar]
+    lines.extend([fmt_sep(widths), fmt_row(headers, widths), fmt_sep(widths)])
+    if rows:
+        for row in rows: lines.append(fmt_row(row, widths))
+    else: lines.append("| (khong co option nao)".ljust(len(bar)-1) + "|")
+    lines.extend([fmt_sep(widths), bar])
     return "\n".join(lines)
 
 def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
@@ -561,12 +578,11 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 print_fn(f"[dim][-][/] {alias} (Opt {key}): Khong pivot duoc (van o console OOB)")
                 results.append({"key": key, "status": "KHONG PIVOT", "act_host": act_host, "desc": desc, "port": port, "note": note})
             elif act_host_clean == desc_clean or hostname_matches_description(act_host, desc_clean):
-                print_fn(f"[green][OK][/] {alias} (Opt {key}): Khop ({act_host})")
+                print_fn(f"[green](OK)[/] {alias} (Opt {key}): Khop ({act_host})")
                 results.append({"key": key, "status": "OK", "act_host": act_host, "desc": desc, "port": port, "note": note})
             else:
-                # K?CH HO?T ALARM (Ti?ng Beep + Log file + Highlight giao di?n)
                 msg_alarm = f"ALARM! Thiet bi noi line ([yellow]{act_host}[/]) khac description ([yellow]{desc_clean}[/]) tai Opt {key} tren {alias}!"
-                print_fn(f"\a[bold red blink]? {msg_alarm}[/bold red blink]")
+                print_fn(f"\a[bold red blink][ALARM] {msg_alarm}[/bold red blink]")
                 sys.stdout.write('\a'); sys.stdout.flush()
                 
                 os.makedirs("alarms", exist_ok=True)
@@ -578,7 +594,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 
                 results.append({"key": key, "status": "CANH BAO", "act_host": act_host, "desc": desc, "port": port, "note": note})
 
-    print_fn(f"[green]?[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
+    print_fn(f"[green](OK)[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
     if session: session.close()
     
     os.makedirs("verify-logs", exist_ok=True)
@@ -592,11 +608,10 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     return results
 
 def _thread_verify_only(cfg, alias, ip, snapshot):
-    """Chi thuc hien verify (d?ng chung cho daemon khi nh?n di?n kh?c baseline)"""
     run_deep_verify(cfg, alias, ip, snapshot)
 
 # ---------------------------------------------------------------------------
-# Manual Push (T?ch bi?t t?nh n?ng s?a l?i ra th?nh t?y ch?n ??c l?p)
+# Manual Push
 # ---------------------------------------------------------------------------
 def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, print_fn=None):
     if print_fn is None: print_fn = log_verify
@@ -643,13 +658,13 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     with file_lock:
         with open(os.path.join("push-logs", f"Push_{alias}_{ts_str}.log"), "w", encoding="utf-8") as f:
-            f.write(f"=== PUSH LOG TH? C?NG: {alias} ({oob_ip}) ===\nThoi gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"=== PUSH LOG THU CONG: {alias} ({oob_ip}) ===\nThoi gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             for entry in push_log_entries:
                 baseline[entry["key"]]["description"] = entry["new"] 
                 f.write(f"- Option [{entry['key']}] (Target IP: {entry['target_ip']}):\n  + Cu : {entry['old']}\n  + Moi: {entry['new']}\n")
 
     save_options(cfg["baseline_db"], "baseline_menu", oob_ip, mn, dn, baseline)
-    print_fn(f"[green]?[/] Da cap nhat cau hinh vao Switch & cap nhat l?i Baseline DB.")
+    print_fn(f"[green](OK)[/] Da cap nhat cau hinh vao Switch & cap nhat lai Baseline DB.")
     print_fn(f"[*] Tu dong Re-Verify lai cac option vua sua tren {alias}...")
     run_deep_verify(cfg, alias, oob_ip, {entry["key"]: baseline[entry["key"]] for entry in push_log_entries}, print_fn=print_fn)
 
@@ -682,10 +697,10 @@ def manual_push_devices(cfg):
             if ans == 'y': process_push_and_reverify(cfg, alias, ip, baseline, results, print_fn=cli_print)
             else: _con.print(f"  [dim]Da huy PUSH cho {alias}.[/]")
         else:
-            _con.print(f"  [green][OK][/] Khong co sai lech nao can sua cho {alias}.")
+            _con.print(f"  [green](OK)[/] Khong co sai lech nao can sua cho {alias}.")
 
 # ---------------------------------------------------------------------------
-# V?ng l?p gi?m s?t (Daemon Thread)
+# Daemon Thread
 # ---------------------------------------------------------------------------
 def run_verify_daemon(cfg):
     log_verify(f"[green][START][/] Khoi dong Verify vat ly - lich: {_describe_verify_schedule(cfg)}.")
@@ -694,13 +709,11 @@ def run_verify_daemon(cfg):
         if cfg.get("auto_verify", True):
             hosts = load_ip_list(cfg["ip_list"])
             if hosts:
-                # ??NG B?: S? d?ng action_lock ?? bu?c verify ph?i CH? collect-data ch?y xong
                 with action_lock: 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                         for ip, alias in hosts:
                             _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-                            if baseline:
-                                executor.submit(_thread_verify_only, cfg, alias, ip, baseline)
+                            if baseline: executor.submit(_thread_verify_only, cfg, alias, ip, baseline)
         else:
             log_verify("[dim][zzz] Tinh nang Verify ngam dang bi TAT trong cau hinh. Dang cho...[/]")
 
@@ -785,13 +798,13 @@ def run_daemon(cfg, config_path=None):
                             print_options(snapshot)
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             log_baseline_change(alias, ip, "TAO MOI BASELINE")
-                            _con.print(f"  [green][OK][/] Da TU DONG luu baseline cho {alias}.")
+                            _con.print(f"  [green](OK)[/] Da TU DONG luu baseline cho {alias}.")
                             live.start()
                         pending_verifies.append((alias, ip, snapshot))
                         return
 
                     if options_equal(baseline, snapshot):
-                        log_oob(f"[green][OK][/] {alias}: Khop voi baseline ({len(snapshot)} option).")
+                        log_oob(f"[green](OK)[/] {alias}: Khop voi baseline ({len(snapshot)} option).")
                         return
 
                     with ui_lock:
@@ -800,17 +813,15 @@ def run_daemon(cfg, config_path=None):
                         print_diff(baseline, snapshot)
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         log_baseline_change(alias, ip, "CAP NHAT BASELINE")
-                        _con.print(f"  [green][OK][/] Da TU DONG cap nhat baseline moi cho {alias}.")
+                        _con.print(f"  [green](OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
                         live.start()
                     pending_verifies.append((alias, ip, snapshot))
 
-                # Ch?y ?a lu?ng v? GI? KH?A action_lock ?? Verify ph?i ch?
                 with action_lock: 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                         futures = [executor.submit(_scan_single_daemon, ip, alias) for ip, alias in hosts]
                         concurrent.futures.wait(futures)
 
-                    # Sau khi ho?n t?t 100% collect-data, m?i g?i lu?ng Verify ch?y cho c?c node v?a update
                     if cfg.get("auto_verify", True) and pending_verifies:
                         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                             for alias, ip, snap in pending_verifies:
@@ -867,12 +878,12 @@ def scan_specific_devices(cfg):
                 _con.print(f"  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 log_baseline_change(alias, ip, "TAO MOI BASELINE")
-                _con.print(f"  [green][OK][/] Da TU DONG luu baseline cho {alias}.")
+                _con.print(f"  [green](OK)[/] Da TU DONG luu baseline cho {alias}.")
             pending_verifies.append((alias, ip, snapshot))
             return
 
         if options_equal(baseline, snapshot):
-            with ui_print_lock: _con.print(f"  [green][OK][/] {alias}: Khop voi baseline ({len(snapshot)} option).")
+            with ui_print_lock: _con.print(f"  [green](OK)[/] {alias}: Khop voi baseline ({len(snapshot)} option).")
             return
 
         with ui_print_lock:
@@ -880,15 +891,13 @@ def scan_specific_devices(cfg):
             print_diff(baseline, snapshot)
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
             log_baseline_change(alias, ip, "CAP NHAT BASELINE")
-            _con.print(f"  [green][OK][/] Da TU DONG cap nhat baseline moi cho {alias}.")
+            _con.print(f"  [green](OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
         pending_verifies.append((alias, ip, snapshot))
 
-    # Ch?y ?a lu?ng
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(_scan_single_cli, ip, alias) for ip, alias in hosts_to_scan]
         concurrent.futures.wait(futures)
 
-    # Ch?y l?nh Verify sau khi m? Scan ?a lu?ng ?? ho?n t?t
     if cfg.get("auto_verify", True) and pending_verifies:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             for alias, ip, snap in pending_verifies:
@@ -921,10 +930,9 @@ def verify_specific_devices(cfg):
             executor.submit(run_deep_verify, cfg, alias, ip, baseline, cli_print)
 
 # ---------------------------------------------------------------------------
-# Import / Export Excel / T?M KI?M
+# Import / Export / TIM KIEM
 # ---------------------------------------------------------------------------
 def _parse_verify_logs_for_status(max_age_hours: float = 24.0) -> dict:
-    """??c l?ch s? Verify g?n nh?t ?? l?y Hostname th?c t? (act_host)."""
     log_dir = "verify-logs"
     if not os.path.exists(log_dir): return {}
     cutoff = time.time() - max_age_hours * 3600
@@ -958,7 +966,6 @@ def search_device(cfg):
     hosts = load_ip_list(cfg["ip_list"])
     found = []
     
-    # L?y l?ch s? 30 ng?y ?? ?u ti?n t?m ra Hostname th?t d? ch?a Push
     verify_st = _parse_verify_logs_for_status(max_age_hours=24.0 * 30)
     
     for ip, alias in hosts:
@@ -969,8 +976,6 @@ def search_device(cfg):
         
         for key, entry in source.items():
             act_host = verify_st.get((alias, key), {}).get("act_host", "") or ""
-            
-            # CH?M ?I?M ?U TI?N K?T QU? T?M KI?M
             score = 0
             if query == act_host.lower(): score = 100
             elif query in act_host.lower(): score = 90
@@ -984,16 +989,14 @@ def search_device(cfg):
                 found.append((score, ip, alias, dn, key, entry, act_host))
                 
     if not found: return _con.print(f"\n  [yellow]Khong tim thay thiet bi nao![/]")
-    
-    # S?p x?p l?i theo m?c ?? ?u ti?n
     found.sort(key=lambda x: x[0], reverse=True)
     
-    _con.print(f"\n  [green][*] Tim thay {len(found)} ket qua (?u ti?n: Hostname th?c t? > Hostname OOB > Description):[/]")
+    _con.print(f"\n  [green][*] Tim thay {len(found)} ket qua (Uu tien: Hostname thuc > Hostname OOB > Description):[/]")
     for score, ip, alias, dn, key, entry, act_host in found:
         pr = _norm_proto(entry.get("protocol"))
         pt = entry.get("port", 22 if pr == "ssh" else 23)
-        act_str = f" [bold green](Th?c t?: {act_host})[/]" if act_host else ""
-        _con.print(f"    [cyan]?[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [bold cyan]{key}[/] {entry.get('description', '')}{act_str} [dim]? {pr}://{entry['ip']}:{pt}[/]")
+        act_str = f" [bold green](Thuc te: {act_host})[/]" if act_host else ""
+        _con.print(f"    [cyan]->[/] OOB: [bold]{alias}[/] ({ip} - host: {dn}) | Opt [bold cyan]{key}[/] {entry.get('description', '')}{act_str} [dim]-> {pr}://{entry['ip']}:{pt}[/]")
 
 def view_latest_verify_log():
     log_dir = "verify-logs"
@@ -1003,13 +1006,13 @@ def view_latest_verify_log():
     latest_file = max(files, key=os.path.getmtime)
     try:
         with open(latest_file, "r", encoding="utf-8") as f: content = f.read()
-        _con.print(Panel(content, title=f"[bold magenta]? LOG VERIFY GAN NHAT: {os.path.basename(latest_file)}[/]", border_style="magenta", padding=(1, 2)))
+        _con.print(Panel(content, title=f"[bold magenta] [ LOG VERIFY GAN NHAT: {os.path.basename(latest_file)} ] [/]", border_style="magenta", padding=(1, 2)))
     except Exception as e: _con.print(f"  [red][LOI][/] {e}")
 
 def list_devices(cfg):
     hosts = load_ip_list(cfg["ip_list"])
     if not hosts: return _con.print(f"\n  [yellow][!][/] Danh sach trong.")
-    table = Table(title="[bold]DANH SACH THIET BI OOB[/]", box=rbox.ROUNDED, border_style="cyan", header_style="bold cyan")
+    table = Table(title="[bold]DANH SACH THIET BI OOB[/]", box=rbox.ASCII, border_style="cyan", header_style="bold cyan")
     table.add_column("Alias", style="bold cyan", min_width=12)
     table.add_column("IP", min_width=16)
     table.add_column("Hostname", min_width=14)
@@ -1020,8 +1023,8 @@ def list_devices(cfg):
         _mn, device_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         updated_at = get_updated_at_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if device_name is None: _mn, device_name, _ = get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
-        if baseline: bl = "[green]? Co[/]"; checked_count += 1
-        else: bl = "[yellow]? Chua[/]"; unchecked_count += 1
+        if baseline: bl = "[green](OK) Co[/]"; checked_count += 1
+        else: bl = "[yellow](X) Chua[/]"; unchecked_count += 1
         table.add_row(alias, ip, device_name or "[dim](chua ro)[/]", bl, updated_at or "[dim]-[/]")
     _con.print(f"  [cyan]TONG KET: Co [bold]{len(hosts)}[/] thiet bi | ?? check: [green bold]{checked_count}[/] | Ch?a check: [yellow bold]{unchecked_count}[/][/]")
     _con.print(table)
@@ -1064,10 +1067,10 @@ def import_from_excel(cfg):
     finally:
         try: wb.close()
         except: pass
-    _con.print(f"\n  [green]?[/] Da them {added}, bo qua {skipped_dup} trung, bo qua {skipped_invalid} khong hop le.")
+    _con.print(f"\n  [green](OK)[/] Da them {added}, bo qua {skipped_dup} trung, bo qua {skipped_invalid} khong hop le.")
 
 def export_menu_report(cfg):
-    _con.print("  [yellow][*][/] T?nh n?ng export hi?n ?ang t?t trong b?n debug.")
+    _con.print("  [yellow][*][/] Tinh nang export hien dang tat trong ban debug.")
     pass
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +1111,7 @@ def _show_menu(cfg):
     grid.add_row("", ""); grid.add_row("[0]", "[bold red]Thoat[/]")
 
     _con.print()
-    _con.print(Panel(Group(info, Rule(style="dim cyan"), grid), title="[bold cyan] ?  OOB NETWORK MANAGER [/]", border_style="cyan", padding=(1, 2)))
+    _con.print(Panel(Group(info, Rule(style="dim cyan"), grid), title="[bold cyan] [ OOB NETWORK MANAGER ] [/]", border_style="cyan", padding=(1, 2)))
 
 def main_menu(cfg, config_path):
     while True:
@@ -1147,7 +1150,7 @@ def main():
     if "--daemon" in sys.argv: return run_daemon(cfg, config_path)
     elif "--menu" in sys.argv: return main_menu(cfg, config_path)
 
-    _con.print(Panel("[bold cyan]1.[/] Mo Menu Quan Ly (Them/Sua IP, Xem danh sach)\n[bold cyan]2.[/] Mo Trinh Giam Sat (Chay log Daemon o terminal nay)\n[bold cyan]3.[/] Mo CA HAI (Tu dong mo 2 cua so - Yeu cau Windows)", title="[bold yellow]? OOB LAUNCHER MULTI-TERM[/]", border_style="yellow", padding=(1,2)))
+    _con.print(Panel("[bold cyan]1.[/] Mo Menu Quan Ly (Them/Sua IP, Xem danh sach)\n[bold cyan]2.[/] Mo Trinh Giam Sat (Chay log Daemon o terminal nay)\n[bold cyan]3.[/] Mo CA HAI (Tu dong mo 2 cua so - Yeu cau Windows)", title="[bold yellow] [ OOB LAUNCHER MULTI-TERM ] [/]", border_style="yellow", padding=(1,2)))
     choice = input("Chon che do: ").strip()
     
     if choice == "1": main_menu(cfg, config_path)
