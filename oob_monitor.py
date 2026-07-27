@@ -220,6 +220,89 @@ def _describe_scan_schedule(cfg):
     if mode == "weekly": return f"Hang tuan vao {_WEEKDAY_LABELS.get((cfg.get('scan_schedule_weekday', 'mon') or 'mon').strip().lower()[:3], 'mon')} luc {cfg.get('scan_schedule_time', '01:00')}"
     return f"Lap lai moi {cfg.get('interval', 30)}s"
 
+def _edit_verify_schedule(cfg):
+    _con.print(f"\n  --- Lich chay Deep Verify tu dong ---")
+    _con.print(f"  Hien tai: {_describe_verify_schedule(cfg)}")
+    _con.print("  1. Lap lai theo chu ky (interval)")
+    _con.print("  2. Hang ngay, vao 1 gio co dinh")
+    _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    if mode_choice == "1":
+        cfg["verify_schedule_mode"] = "interval"
+        _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
+    elif mode_choice == "2":
+        cfg["verify_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: Hang ngay luc {cfg.get('verify_schedule_time', '01:00')}.")
+    elif mode_choice == "3":
+        cfg["verify_schedule_mode"] = "weekly"
+        wd_val = _con.input(f"  [cyan]Thu (mon/tue/wed/thu/fri/sat/sun)[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP: cfg["verify_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_verify_schedule(cfg)}.")
+    else:
+        _con.print("  [yellow][!][/] Lua chon khong hop le.")
+
+def _edit_scan_schedule(cfg):
+    _con.print(f"\n  --- Lich chay Thu thap cau hinh ---")
+    _con.print(f"  Hien tai: {_describe_scan_schedule(cfg)}")
+    _con.print("  1. Lap lai theo chu ky (interval)")
+    _con.print("  2. Hang ngay, vao 1 gio co dinh")
+    _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    if mode_choice == "1":
+        cfg["scan_schedule_mode"] = "interval"
+        _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
+    elif mode_choice == "2":
+        cfg["scan_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: Hang ngay luc {cfg.get('scan_schedule_time', '01:00')}.")
+    elif mode_choice == "3":
+        cfg["scan_schedule_mode"] = "weekly"
+        wd_val = _con.input(f"  [cyan]Thu (mon/tue/wed/thu/fri/sat/sun)[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP: cfg["scan_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_scan_schedule(cfg)}.")
+    else:
+        _con.print("  [yellow][!][/] Lua chon khong hop le.")
+
+def _test_connection(cfg):
+    test_ip = _con.input("  [cyan]Nhap IP OOB can thu ket noi[/]: ").strip()
+    if not test_ip:
+        _con.print("  [yellow][!][/] Khong nhap IP. Huy.")
+        return
+    creds = get_all_credentials(cfg)
+    if not any(c.get("password") for c in creds):
+        _con.print("  [yellow][!][/] Chua cau hinh bat ky password nao. Vui long cau hinh truoc.")
+        return
+    _con.print(f"  [cyan][*][/] Dang thu ket noi toi [bold]{test_ip}[/] (Multi-Account)...")
+    last_exc = None
+    for idx, c in enumerate(creds):
+        try:
+            session = connect_auto(
+                test_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23),
+                c["username"], c["password"], c["enable_password"], timeout=8,
+            )
+            hn = fetch_hostname(session)
+            session.close()
+            _con.print(f"  [green](OK)[/] Ket noi thanh cong bang tai khoan: ({c['username']})! Hostname: [bold cyan]{hn or '?'}[/]")
+            return
+        except Exception as e:
+            last_exc = e
+    _con.print(f"  [red][!][/] Ket noi that bai (thu {len(creds)} tai khoan): {last_exc}")
+
 def settings_menu(cfg, config_path):
     while True:
         v_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("verify_schedule_mode", "interval") in ("daily", "weekly") else "[dim green]<- Dang co hieu luc[/]"
@@ -253,6 +336,7 @@ def settings_menu(cfg, config_path):
         g.add_row("\\[w]", f"Cho sau connect (s)   : [bold cyan]{cfg.get('verify_wait_after_connect', 1.5)}[/]")
         g.add_row("\\[m]", f"Timeout Verify (s)    : [bold cyan]{cfg.get('max_verify_duration', 300)}[/]")
         g.add_row("", "")
+        g.add_row("\\[t]",  "[bold yellow]Thu ket noi nhanh (test credential)[/]")
         g.add_row("[0]",   "[bold red]Quay lai menu chinh[/]")
 
         _con.print()
@@ -273,11 +357,40 @@ def settings_menu(cfg, config_path):
         elif choice == "9": val = input("  File baseline DB moi: ").strip(); cfg["baseline_db"] = val if val else cfg["baseline_db"]
         elif choice == "a": val = input("  File snapshot DB moi: ").strip(); cfg["snapshot_db"] = val if val else cfg["snapshot_db"]
         elif choice == "b": cfg["auto_verify"] = not cfg.get("auto_verify", True)
-        elif choice == "k": pass 
+        elif choice == "d": _edit_verify_schedule(cfg)
+        elif choice == "s": _edit_scan_schedule(cfg)
+        elif choice == "t": _test_connection(cfg)
+        elif choice == "k": 
+            _con.print("\n  [bold]Danh sach Tai khoan phu (Multi-Account)[/]")
+            creds = cfg.setdefault("credentials", [])
+            if not creds: _con.print("  [dim](Chua co tai khoan phu nao)[/]")
+            for i, c in enumerate(creds):
+                _con.print(f"  {i+1}. User: [cyan]{c.get('username')}[/] | Pass: ***")
+            _con.print("\n  [a] Them tai khoan moi  |  [d] Xoa 1 tai khoan (theo so)  |  [c] Xoa tat ca  |  [0] Quay lai")
+            sub = input("  Chon: ").strip().lower()
+            if sub == "a":
+                u = input("  Username: ").strip()
+                p = getpass.getpass("  Password: ").strip()
+                e = getpass.getpass("  Enable Password: ").strip()
+                creds.append({"username": u, "password": p, "enable_password": e})
+                _con.print("  [green](OK)[/] Da them.")
+            elif sub == "d":
+                if not creds: _con.print("  [yellow][!][/] Danh sach tai khoan phu dang trong.")
+                else:
+                    idx_raw = input(f"  Nhap so thu tu can xoa (1-{len(creds)}): ").strip()
+                    if idx_raw.isdigit() and 1 <= int(idx_raw) <= len(creds):
+                        removed = creds.pop(int(idx_raw) - 1)
+                        _con.print(f"  [green](OK)[/] Da xoa tai khoan: {removed.get('username')}")
+            elif sub == "c":
+                cfg["credentials"] = []
+                _con.print("  [green](OK)[/] Da xoa toan bo tai khoan phu.")
         elif choice == "0":
             save_config(config_path, cfg)
             _con.print(f"[green][*][/] Da luu cau hinh vao {config_path}")
             return
+        else:
+            _con.print("[yellow][!][/] Lua chon khong hop le.")
+            continue
         save_config(config_path, cfg)
 
 def load_ip_list(path):
@@ -416,58 +529,39 @@ def poll_host_multi(ip, cfg, timeout=10):
         try:
             tn = connect_auto(ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), c["username"], c["password"], c["enable_password"], timeout=timeout)
             try:
-                # Kiem tra Vertiv/Cisco bang cach gui enter lay prompt
                 tn.write("\r\n")
                 initial_prompt = tn.read_until(["#", ">", "cli->"], timeout=5)
 
                 if "cli->" in initial_prompt:
-                    # ==========================================
-                    # VERTIV ACS LOGIC
-                    # ==========================================
                     tn.write("cd access/")
                     tn.read_until("cli->", timeout=5)
                     tn.write("show")
                     raw = tn.read_until("cli->", timeout=15)
 
-                    if tn.last_read_timed_out and not raw.strip():
-                        return None, None, {}, "fetch_failed"
+                    if tn.last_read_timed_out and not raw.strip(): return None, None, {}, "fetch_failed"
 
                     final_options = {}
                     hostname = None
-
                     lines = raw.splitlines()
                     for i, line in enumerate(lines):
                         line = line.strip()
-                        # Tim Hostname Vertiv (Dong duoi dau gach ==========)
                         if line.startswith("===") and i + 1 < len(lines):
                             potential_host = lines[i+1].strip()
-                            if potential_host and " " not in potential_host:
-                                hostname = potential_host
+                            if potential_host and " " not in potential_host: hostname = potential_host
 
-                        # Parse Port (name port serial idle)
                         m = re.match(r'^(\S+)\s+(\d+)\s+serial\s+', line, re.IGNORECASE)
                         if m:
                             desc, port_str = m.group(1), m.group(2)
                             key = str(port_str)
                             final_options[key] = {
-                                "description": desc,
-                                "ip": ip,
-                                "port": int(port_str),
-                                "protocol": "serial",
-                                "_raw_key": key,
-                                "_menu_name": "access",
-                                "vendor": "vertiv"
+                                "description": desc, "ip": ip, "port": int(port_str),
+                                "protocol": "serial", "_raw_key": key, "_menu_name": "access", "vendor": "vertiv"
                             }
 
-                    if not final_options:
-                        return hostname, None, {}, "no_menu"
-
+                    if not final_options: return hostname, None, {}, "no_menu"
                     return hostname, "Vertiv ACS", final_options, "ok"
 
                 else:
-                    # ==========================================
-                    # CISCO LOGIC
-                    # ==========================================
                     hostname = fetch_hostname(tn)
                     tn.write("terminal length 0"); tn.read_until("#", timeout=5)
                     tn.write("show running-config | include menu")
@@ -540,14 +634,12 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     if print_fn is None: print_fn = log_verify
     max_duration = float(cfg.get("max_verify_duration", 300))
     _verify_deadline = time.time() + max_duration
-    print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
 
     creds = get_all_credentials(cfg)
     own_hostname, working_cred = None, creds[0]
     for c in creds:
         try:
             tn = connect_auto(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], timeout=6)
-            # Thue de lay hostname Vertiv/Cisco o verify
             tn.write("\r\n")
             prmpt = tn.read_until(["#", ">", "cli->"], timeout=3)
             if "cli->" in prmpt:
@@ -585,7 +677,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         out = s.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
         try:
             if vendor == "vertiv":
-                # Ep ngat ket noi Serial Vertiv that sach
                 s.write_raw(b"\x1a\r\n~.\r\n")
                 reset_session()
             else:
@@ -598,7 +689,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         return out
 
     def clear_line_via_oob(t_port, vendor):
-        if vendor == "vertiv": return False # Chua ho tro clear tren Vertiv
+        if vendor == "vertiv": return False
         line_num = t_port - 2000
         if line_num <= 0: return False
         try:
@@ -668,7 +759,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 
                 results.append({"key": key, "status": "CANH BAO", "act_host": act_host, "desc": desc, "port": port, "note": note})
 
-    print_fn(f"[green](OK)[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
     if session: session.close()
     
     os.makedirs("verify-logs", exist_ok=True)
@@ -681,8 +771,11 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         except Exception: pass
     return results
 
-def _thread_verify_only(cfg, alias, ip, snapshot):
-    run_deep_verify(cfg, alias, ip, snapshot)
+def _thread_verify_only(cfg, alias, ip, snapshot, pfx=""):
+    log_verify(f"{pfx} [*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
+    def _print_fn(msg): log_verify(f"{pfx} {msg}")
+    run_deep_verify(cfg, alias, ip, snapshot, print_fn=_print_fn)
+    log_verify(f"{pfx} [green](OK)[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
 
 # ---------------------------------------------------------------------------
 # Manual Push
@@ -758,18 +851,19 @@ def manual_push_devices(cfg):
     _con.print(f"\n  [green][*] Bat dau Verify & Push thu cong cho {len(hosts_to_scan)} thiet bi...[/]")
     def cli_print(msg): _con.print(f"    {msg}")
     
-    for ip, alias in hosts_to_scan:
-        _con.print(f"\n  [cyan][MANUAL PUSH][/] [bold]{alias}[/] ({ip}) ...")
+    for idx, (ip, alias) in enumerate(hosts_to_scan, 1):
+        pct = (idx / len(hosts_to_scan)) * 100
+        pfx = f"[{idx}/{len(hosts_to_scan)} {pct:.0f}%]"
+
+        _con.print(f"\n  [cyan]{pfx} [MANUAL PUSH][/] [bold]{alias}[/] ({ip}) ...")
         _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if not baseline:
             _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh (Option 7) truoc!")
             continue
             
-        # Kiem tra neu la Vertiv thi hoan toan cam PUSH
         vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
         if vendor == "vertiv":
             _con.print(f"  [yellow][!][/] Thiet bi {alias} la Vertiv. Tinh nang Push Config chua duoc ho tro cho hang nay!")
-            # Van Verify de hien thi loi cho user biet, nhung khong thuc hien Push
             run_deep_verify(cfg, alias, ip, baseline, cli_print)
             continue
             
@@ -791,11 +885,21 @@ def run_verify_daemon(cfg):
         if cfg.get("auto_verify", True):
             hosts = load_ip_list(cfg["ip_list"])
             if hosts:
+                total_hosts = len(hosts)
+                started_hosts = 0
+                prog_lock = threading.Lock()
+
                 with action_lock: 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                         for ip, alias in hosts:
                             _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-                            if baseline: executor.submit(_thread_verify_only, cfg, alias, ip, baseline)
+                            if baseline:
+                                with prog_lock:
+                                    started_hosts += 1
+                                    idx = started_hosts
+                                    pct = (idx / total_hosts) * 100
+                                pfx = f"[{idx}/{total_hosts} {pct:.0f}%]"
+                                executor.submit(_thread_verify_only, cfg, alias, ip, baseline, pfx)
         else:
             log_verify("[dim][zzz] Tinh nang Verify ngam dang bi TAT trong cau hinh. Dang cho...[/]")
 
@@ -845,29 +949,39 @@ def run_daemon(cfg, config_path=None):
                     _scan_wait(cfg)
                     continue
 
+                total_hosts = len(hosts)
+                started_hosts = 0
+                scan_prog_lock = threading.Lock()
                 pending_verifies = []
 
                 def _scan_single_daemon(ip, alias):
-                    log_oob(f"[cyan][PING][/] [bold]{alias}[/] ({ip}) ...")
+                    nonlocal started_hosts
+                    with scan_prog_lock:
+                        started_hosts += 1
+                        idx = started_hosts
+                        pct = (idx / total_hosts) * 100
+                    pfx = f"[{idx}/{total_hosts} {pct:.0f}%]"
+
+                    log_oob(f"[cyan]{pfx} [PING][/] [bold]{alias}[/] ({ip}) ...")
                     alive = ping_host(ip)
                     save_device_status(ip, alias=alias, ping=alive)
                     if not alive:
-                        log_oob(f"[red][!][/] {alias} ({ip}): Khong ping duoc. Bo qua vong nay.")
+                        log_oob(f"[red]{pfx} [!][/] {alias} ({ip}): Khong ping duoc. Bo qua vong nay.")
                         return
 
-                    log_oob(f"[cyan][SCAN][/] [bold]{alias}[/] ({ip}) ...")
+                    log_oob(f"[cyan]{pfx} [SCAN][/] [bold]{alias}[/] ({ip}) ...")
                     try: hostname, menu_name, snapshot, menu_state = poll_host_multi(ip, cfg, timeout=cfg.get("interval", 30))
                     except Exception as exc:
                         save_device_status(ip, alias=alias, menu_state="conn_failed")
-                        log_oob(f"[red][LOI][/] {alias} ({ip}): {exc}")
+                        log_oob(f"[red]{pfx} [LOI][/] {alias} ({ip}): {exc}")
                         return
 
                     save_device_status(ip, alias=alias, menu_state=menu_state)
                     if menu_state == "fetch_failed":
-                        log_oob(f"[yellow][!][/] {alias}: Da ket noi nhung KHONG lay duoc thong tin menu. Se thu lai vong sau.")
+                        log_oob(f"[yellow]{pfx} [!][/] {alias}: Da ket noi nhung KHONG lay duoc thong tin menu.")
                         return
                     if menu_state == "no_menu" or not menu_name or not snapshot:
-                        log_oob(f"[yellow][!][/] {alias}: Thiet bi khong co cau hinh menu.")
+                        log_oob(f"[yellow]{pfx} [!][/] {alias}: Thiet bi khong co cau hinh menu.")
                         return
 
                     save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
@@ -876,17 +990,17 @@ def run_daemon(cfg, config_path=None):
                     if baseline is None:
                         with ui_lock:
                             live.stop()
-                            _con.print(f"\n  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
+                            _con.print(f"\n  [yellow]{pfx} [?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
                             print_options(snapshot)
                             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                             log_baseline_change(alias, ip, "TAO MOI BASELINE")
-                            _con.print(f"  [green](OK)[/] Da TU DONG luu baseline cho {alias}.")
+                            _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG luu baseline cho {alias}.")
                             live.start()
-                        pending_verifies.append((alias, ip, snapshot))
+                        pending_verifies.append((alias, ip, snapshot, pfx))
                         return
 
                     if options_equal(baseline, snapshot):
-                        log_oob(f"[green](OK)[/] {alias}: Khop voi baseline ({len(snapshot)} option).")
+                        log_oob(f"[green]{pfx} (OK)[/] {alias}: Khop voi baseline ({len(snapshot)} option).")
                         return
 
                     with ui_lock:
@@ -895,9 +1009,9 @@ def run_daemon(cfg, config_path=None):
                         print_diff(baseline, snapshot)
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                         log_baseline_change(alias, ip, "CAP NHAT BASELINE")
-                        _con.print(f"  [green](OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
+                        _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
                         live.start()
-                    pending_verifies.append((alias, ip, snapshot))
+                    pending_verifies.append((alias, ip, snapshot, pfx))
 
                 with action_lock: 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -906,8 +1020,8 @@ def run_daemon(cfg, config_path=None):
 
                     if cfg.get("auto_verify", True) and pending_verifies:
                         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                            for alias, ip, snap in pending_verifies:
-                                executor.submit(_thread_verify_only, cfg, alias, ip, snap)
+                            for alias, ip, snap, pfx in pending_verifies:
+                                executor.submit(_thread_verify_only, cfg, alias, ip, snap, pfx)
 
                 _scan_wait(cfg)
         except KeyboardInterrupt: pass
@@ -926,30 +1040,41 @@ def scan_specific_devices(cfg):
             if ip.lower() in target_list or alias.lower() in target_list: hosts_to_scan.append((ip, alias))
     if not hosts_to_scan: return
     
-    _con.print(f"\n  [green][*] Bat dau quet C?u h?nh ?A LU?NG {len(hosts_to_scan)} thiet bi...[/]")
+    _con.print(f"\n  [green][*] Bat dau quet Cau hinh DA LUONG {len(hosts_to_scan)} thiet bi...[/]")
+    
+    total_hosts = len(hosts_to_scan)
+    started_hosts = 0
+    scan_prog_lock = threading.Lock()
     pending_verifies = []
 
     def _scan_single_cli(ip, alias):
-        with ui_print_lock: _con.print(f"\n  [cyan][PING][/] [bold]{alias}[/] ({ip}) ...")
+        nonlocal started_hosts
+        with scan_prog_lock:
+            started_hosts += 1
+            idx = started_hosts
+            pct = (idx / total_hosts) * 100
+        pfx = f"[{idx}/{total_hosts} {pct:.0f}%]"
+
+        with ui_print_lock: _con.print(f"\n  [cyan]{pfx} [PING][/] [bold]{alias}[/] ({ip}) ...")
         alive = ping_host(ip)
         save_device_status(ip, alias=alias, ping=alive)
         if not alive:
-            with ui_print_lock: _con.print(f"  [red][!][/] {alias} ({ip}): Khong ping duoc. Bo qua.")
+            with ui_print_lock: _con.print(f"  [red]{pfx} [!][/] {alias} ({ip}): Khong ping duoc. Bo qua.")
             return
 
-        with ui_print_lock: _con.print(f"  [cyan][SCAN CONFIG][/] [bold]{alias}[/] ({ip}) ...")
+        with ui_print_lock: _con.print(f"  [cyan]{pfx} [SCAN CONFIG][/] [bold]{alias}[/] ({ip}) ...")
         try: hostname, menu_name, snapshot, menu_state = poll_host_multi(ip, cfg, timeout=10)
         except Exception as exc:
             save_device_status(ip, alias=alias, menu_state="conn_failed")
-            with ui_print_lock: _con.print(f"  [red][LOI][/] {alias} ({ip}): {exc}")
+            with ui_print_lock: _con.print(f"  [red]{pfx} [LOI][/] {alias} ({ip}): {exc}")
             return
 
         save_device_status(ip, alias=alias, menu_state=menu_state)
         if menu_state == "fetch_failed":
-            with ui_print_lock: _con.print(f"  [yellow][!][/] {alias}: Da ket noi nhung KHONG lay duoc thong tin menu.")
+            with ui_print_lock: _con.print(f"  [yellow]{pfx} [!][/] {alias}: Da ket noi nhung KHONG lay duoc thong tin menu.")
             return
         if menu_state == "no_menu" or not menu_name or not snapshot:
-            with ui_print_lock: _con.print(f"  [yellow][!][/] {alias}: Thiet bi khong co cau hinh menu.")
+            with ui_print_lock: _con.print(f"  [yellow]{pfx} [!][/] {alias}: Thiet bi khong co cau hinh menu.")
             return
 
         save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
@@ -957,15 +1082,15 @@ def scan_specific_devices(cfg):
 
         if baseline is None:
             with ui_print_lock:
-                _con.print(f"  [yellow][?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
+                _con.print(f"  [yellow]{pfx} [?][/] Chua co baseline cho [bold]{alias}[/] ({ip}).")
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 log_baseline_change(alias, ip, "TAO MOI BASELINE")
-                _con.print(f"  [green](OK)[/] Da TU DONG luu baseline cho {alias}.")
-            pending_verifies.append((alias, ip, snapshot))
+                _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG luu baseline cho {alias}.")
+            pending_verifies.append((alias, ip, snapshot, pfx))
             return
 
         if options_equal(baseline, snapshot):
-            with ui_print_lock: _con.print(f"  [green](OK)[/] {alias}: Khop voi baseline ({len(snapshot)} option).")
+            with ui_print_lock: _con.print(f"  [green]{pfx} (OK)[/] {alias}: Khop voi baseline ({len(snapshot)} option).")
             return
 
         with ui_print_lock:
@@ -973,8 +1098,8 @@ def scan_specific_devices(cfg):
             print_diff(baseline, snapshot)
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
             log_baseline_change(alias, ip, "CAP NHAT BASELINE")
-            _con.print(f"  [green](OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
-        pending_verifies.append((alias, ip, snapshot))
+            _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
+        pending_verifies.append((alias, ip, snapshot, pfx))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(_scan_single_cli, ip, alias) for ip, alias in hosts_to_scan]
@@ -982,8 +1107,8 @@ def scan_specific_devices(cfg):
 
     if cfg.get("auto_verify", True) and pending_verifies:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            for alias, ip, snap in pending_verifies:
-                executor.submit(_thread_verify_only, cfg, alias, ip, snap)
+            for alias, ip, snap, pfx in pending_verifies:
+                executor.submit(_thread_verify_only, cfg, alias, ip, snap, pfx)
 
 def verify_specific_devices(cfg):
     targets_input = _con.input("  [cyan]Nhap IP/Alias can Verify (cach nhau dau phay, de trong quet TAT CA)[/]: ").strip()
@@ -999,12 +1124,23 @@ def verify_specific_devices(cfg):
 
     if not hosts_to_scan: return
     _con.print(f"\n  [green][*] Bat dau Verify vat ly tuc thi {len(hosts_to_scan)} thiet bi...[/]")
+    
+    total_hosts = len(hosts_to_scan)
+    started_hosts = 0
+    prog_lock = threading.Lock()
+
     def cli_print(msg):
         with ui_print_lock: _con.print(f"    {msg}")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         for ip, alias in hosts_to_scan:
-            _con.print(f"\n  [cyan][VERIFY][/] [bold]{alias}[/] ({ip}) ...")
+            with prog_lock:
+                started_hosts += 1
+                idx = started_hosts
+                pct = (idx / total_hosts) * 100
+            pfx = f"[{idx}/{total_hosts} {pct:.0f}%]"
+
+            _con.print(f"\n  [cyan]{pfx} [VERIFY][/] [bold]{alias}[/] ({ip}) ...")
             _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
             if not baseline:
                 _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh truoc (Option 7)!")
@@ -1108,7 +1244,7 @@ def list_devices(cfg):
         if baseline: bl = "[green](OK) Co[/]"; checked_count += 1
         else: bl = "[yellow](X) Chua[/]"; unchecked_count += 1
         table.add_row(alias, ip, device_name or "[dim](chua ro)[/]", bl, updated_at or "[dim]-[/]")
-    _con.print(f"  [cyan]TONG KET: Co [bold]{len(hosts)}[/] thiet bi | ?? check: [green bold]{checked_count}[/] | Ch?a check: [yellow bold]{unchecked_count}[/][/]")
+    _con.print(f"  [cyan]TONG KET: Co [bold]{len(hosts)}[/] thiet bi | Da check: [green bold]{checked_count}[/] | Chua check: [yellow bold]{unchecked_count}[/][/]")
     _con.print(table)
 
 def view_baseline(cfg):
@@ -1124,9 +1260,32 @@ def view_baseline(cfg):
         print_options(baseline)
     if not found: _con.print("  [dim](Chua co baseline nao duoc xac nhan)[/]")
 
+def _export_excel_template():
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError: return _con.print("  [red][!][/] Thieu openpyxl. Chay: pip install openpyxl")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OOB_Import"
+    for col, header in enumerate(["IP", "Alias (ten goi)"], 1):
+        c = ws.cell(1, col, header)
+        c.font = Font(bold=True, color="FFFFFF", size=11)
+        c.fill = PatternFill(fill_type="solid", fgColor="1F4E79")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    for r, (ip, alias) in enumerate([("192.168.1.1", "OOB-HCM-01"), ("192.168.1.2", "OOB-HCM-02")], 2):
+        ws.cell(r, 1, ip); ws.cell(r, 2, alias)
+    ws.column_dimensions['A'].width = 18; ws.column_dimensions['B'].width = 24
+    tpl = "oob_import_template.xlsx"
+    wb.save(tpl)
+    _con.print(f"  [green](OK)[/] Da tao file mau: [bold]{tpl}[/]")
+    _con.print("      Dien IP vao cot A, ten alias vao cot B.")
+
 def import_from_excel(cfg):
     try: import openpyxl
     except ImportError: return _con.print("  [red][!][/] Thieu thu vien openpyxl. (pip install openpyxl)")
+    want_tpl = _con.input("  [cyan]Xuat file mau Excel de tham khao dinh dang? (y/N)[/]: ").strip().lower()
+    if want_tpl == 'y': return _export_excel_template()
     file_path = _con.input("  [cyan]Duong dan file Excel (.xlsx)[/]: ").strip()
     if not file_path or not os.path.exists(file_path): return _con.print(f"  [red][!][/] Khong tim thay file.")
     try:
@@ -1152,8 +1311,109 @@ def import_from_excel(cfg):
     _con.print(f"\n  [green](OK)[/] Da them {added}, bo qua {skipped_dup} trung, bo qua {skipped_invalid} khong hop le.")
 
 def export_menu_report(cfg):
-    _con.print("  [yellow][*][/] Tinh nang export hien dang tat trong ban debug.")
-    pass
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError: return _con.print("  [red][!][/] Thieu thu vien openpyxl. (pip install openpyxl)")
+
+    hosts = load_ip_list(cfg["ip_list"])
+    if not hosts: return _con.print("  [yellow][!][/] Danh sach IP dang trong.")
+    _con.print("  [cyan][*][/] Dang xuat bao cao Excel...")
+    verify_st = _parse_verify_logs_for_status()
+    dev_status = load_device_status()
+
+    def _ping_label(ip):
+        p = dev_status.get(ip, {}).get("ping")
+        if p is True: return "Song (OK)"
+        if p is False: return "Down (khong ping duoc)"
+        return "Chua kiem tra"
+
+    def _menu_state_label(ip):
+        ms = dev_status.get(ip, {}).get("menu_state")
+        if ms == "conn_failed": return "Loi ket noi/xac thuc"
+        return MENU_STATE_LABELS.get(ms, "Chua kiem tra")
+
+    C_MATCH, C_WRONG  = "C6EFCE", "FFC7CE"
+    C_UNVER, C_NO_CON = "FFEB9C", "FFCC99"
+    C_NO_DS           = "D9D9D9"
+    C_HDR, C_HDR2     = "1F4E79", "2E75B6"
+
+    def mk_fill(c): return PatternFill(fill_type="solid", fgColor=c)
+    def mk_bdr():
+        s = Side(style='thin', color='BFBFBF')
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Chi tiet"
+    h1 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Target IP", "Target Port", "Protocol", "Desc Status", "Ghi chu"]
+    for ci, h in enumerate(h1, 1):
+        c = ws1.cell(1, ci, h); c.font = Font(bold=True, color="FFFFFF"); c.fill = mk_fill(C_HDR); c.alignment = Alignment(horizontal="center"); c.border = mk_bdr()
+    ws1.freeze_panes = "A2"
+    ws1.auto_filter.ref = f"A1:{get_column_letter(len(h1))}1"
+    
+    ri, summary = 2, []
+    for ip, alias in hosts:
+        ping_lbl, menu_state_lbl = _ping_label(ip), _menu_state_label(ip)
+        mn, device_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        if baseline is None:
+            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, "(chua co baseline)", "", "", "", "", "", "", "", ""], 1): ws1.cell(ri, ci, val)
+            ri += 1
+            summary.append({"alias": alias, "ip": ip, "ping": ping_lbl, "menu_state": menu_state_lbl, "hn": "", "mn": "", "total": 0, "match": 0, "wrong": 0, "unverif": 0, "no_conn": 0, "no_desc": 0})
+            continue
+
+        hn = device_name or ""
+        cnt = dict(match=0, wrong=0, unverif=0, no_conn=0, no_desc=0)
+        for opt_key in sorted(baseline):
+            opt = baseline[opt_key]
+            desc, t_ip, t_port, proto = opt.get("description", ""), opt.get("ip", ""), opt.get("port", ""), opt.get("protocol", "telnet")
+            if not desc:
+                slabel, note, scolor = "Khong co desc", "O description trong", C_NO_DS
+                cnt["no_desc"] += 1
+            else:
+                vr = verify_st.get((alias, opt_key))
+                if vr is None:
+                    slabel, note, scolor = "Chua Verify", "Chua co du lieu verify", C_UNVER
+                    cnt["unverif"] += 1
+                elif vr["status"] == "OK":
+                    slabel, note, scolor = "OK - Khop", f"Hostname thuc te: {vr.get('act_host', '')}", C_MATCH
+                    cnt["match"] += 1
+                elif vr["status"] == "CANH BAO":
+                    slabel, note, scolor = "SAI - Sai desc", f"Hostname thuc: {vr.get('act_host', '')}", C_WRONG
+                    cnt["wrong"] += 1
+                elif vr["status"] in ("TIMEOUT", "KHONG PIVOT"):
+                    slabel, note, scolor = "Khong ket noi duoc", f"Trang thai: {vr['status']}", C_NO_CON
+                    cnt["no_conn"] += 1
+                else:
+                    slabel, note, scolor = f"? {vr['status']}", vr.get("status", ""), C_UNVER
+                    cnt["unverif"] += 1
+
+            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, hn, mn or "", opt_key, desc, t_ip, t_port, proto, slabel, note], 1):
+                c = ws1.cell(ri, ci, val); c.border = mk_bdr(); c.alignment = Alignment(vertical="center")
+                if ci == 12: c.fill = mk_fill(scolor); c.font = Font(bold=True)
+            ri += 1
+        summary.append({"alias": alias, "ip": ip, "ping": ping_lbl, "menu_state": menu_state_lbl, "hn": hn, "mn": mn or "", "total": len(baseline), **cnt})
+    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 22, 44], 1): ws1.column_dimensions[get_column_letter(i)].width = w
+
+    ws2 = wb.create_sheet("Tom tat")
+    h2 = ["OOB Alias", "OOB IP", "Ping", "Trang thai Menu", "Hostname OOB", "Menu", "Tong Option", "OK Khop", "SAI", "Chua Verify", "Khong KN", "Khong Desc"]
+    for ci, h in enumerate(h2, 1):
+        c = ws2.cell(1, ci, h); c.font = Font(bold=True, color="FFFFFF"); c.fill = mk_fill(C_HDR2); c.alignment = Alignment(horizontal="center"); c.border = mk_bdr()
+    ws2.freeze_panes = "A2"
+    ws2.auto_filter.ref = f"A1:{get_column_letter(len(h2))}1"
+    
+    for ri2, sd in enumerate(summary, 2):
+        for ci, val in enumerate([sd["alias"], sd["ip"], sd["ping"], sd["menu_state"], sd["hn"], sd["mn"], sd["total"], sd["match"], sd["wrong"], sd["unverif"], sd["no_conn"], sd["no_desc"]], 1):
+            c = ws2.cell(ri2, ci, val); c.border = mk_bdr(); c.alignment = Alignment(vertical="center", horizontal="center" if ci>4 else "left")
+        if sd.get("wrong", 0) > 0: ws2.cell(ri2, 9).fill = mk_fill(C_WRONG); ws2.cell(ri2, 9).font = Font(bold=True)
+        if sd.get("match", 0) > 0: ws2.cell(ri2, 8).fill = mk_fill(C_MATCH)
+    for i, w in enumerate([18, 16, 12, 20, 20, 20, 14, 10, 10, 14, 12, 13], 1): ws2.column_dimensions[get_column_letter(i)].width = w
+
+    os.makedirs("reports", exist_ok=True)
+    out = os.path.join("reports", f"OOB_Menu_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    wb.save(out)
+    _con.print(f"\n  [green](OK)[/] Da xuat bao cao Excel: [bold]{out}[/]")
 
 # ---------------------------------------------------------------------------
 # Daemon Heartbeat
