@@ -5,12 +5,12 @@ import threading
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
-# Import thẳng các hàm lõi từ tool CLI (Đã cập nhật chuẩn Vertiv)
+# Import thang cac ham loi tu tool CLI
 import oob_monitor
 
 app = Flask(__name__)
 
-# --- CÁC HÀM TIỆN ÍCH ---
+# --- CAC HAM TIEN ICH ---
 def get_ips():
     return oob_monitor.load_ip_list_cached(oob_monitor.CONFIG_FILE_DEFAULT.replace("json", "txt").replace("oob_config", "oob_ips"))
 
@@ -26,9 +26,9 @@ def query_db(query, args=(), fetchall=True):
         return rv
     except Exception: return []
 
-# --- CÁC TIẾN TRÌNH CHẠY NGẦM (Tránh treo Web) ---
+# --- CAC TIEN TRINH CHAY NGAM (Tranh treo Web) ---
 def _web_print(msg): 
-    pass # Ẩn log CLI để Web không bị rác
+    pass # An log CLI de Web khong bi rac
 
 def bg_task_scan(target_ip=None):
     cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
@@ -72,7 +72,7 @@ def bg_task_push(target_ip=None):
         if not baseline: continue
         
         vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
-        if vendor == "vertiv": continue # Vertiv chưa hỗ trợ Push Config
+        if vendor == "vertiv": continue # Vertiv chua ho tro Push
         
         results = oob_monitor.run_deep_verify(cfg, alias, ip, baseline, print_fn=_web_print)
         if any(r["status"] == "CANH BAO" for r in results):
@@ -114,11 +114,10 @@ def api_action():
     elif action == "push":
         threading.Thread(target=bg_task_push, args=(target_ip,)).start()
         
-    return jsonify({"status": "success", "msg": f"Đã đưa lệnh {action.upper()} vào chạy ngầm!"})
+    return jsonify({"status": "success", "msg": f"Da dua lenh {action.upper()} vao chay ngam!"})
 
 @app.route("/api/search")
 def api_search():
-    """API Tìm kiếm siêu tốc trên Web"""
     query = request.args.get("q", "").strip().lower()
     if not query: return jsonify([])
 
@@ -137,7 +136,6 @@ def api_search():
             act_host = verify_st.get((alias, key), {}).get("act_host", "") or ""
             score = 0
             
-            # Chấm điểm mức độ khớp ưu tiên
             if query == act_host.lower(): score = 100
             elif query in act_host.lower(): score = 90
             elif query == alias.lower() or query == ip: score = 85
@@ -149,19 +147,25 @@ def api_search():
             
             if score > 0:
                 found.append({
-                    "score": score, "oob_ip": ip, "oob_alias": alias, "oob_host": dn,
-                    "opt_key": key, "desc": entry.get("description", ""),
-                    "target_ip": entry.get("ip", ""), "target_port": entry.get("port", 23),
-                    "protocol": entry.get("protocol", "telnet"), "act_host": act_host
+                    "score": score,
+                    "oob_ip": ip,
+                    "oob_alias": alias,
+                    "oob_host": dn,
+                    "opt_key": key,
+                    "desc": entry.get("description", ""),
+                    "target_ip": entry.get("ip", ""),
+                    "target_port": entry.get("port", 23),
+                    "protocol": entry.get("protocol", "telnet"),
+                    "act_host": act_host
                 })
     
     found.sort(key=lambda x: x["score"], reverse=True)
     return jsonify(found)
 
 
-# --- COMMON HTML BLOCKS (Dùng chung cho cả 2 trang) ---
+# --- COMMON HTML BLOCKS (Dung chung cho ca 2 trang) ---
 COMMON_MODALS_JS = """
-    <!-- Modal Cài đặt Hệ thống -->
+    <!-- Modal Cai dat -->
     <div class="modal fade" id="settingsModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog">
             <div class="modal-content bg-dark text-light border-secondary">
@@ -188,7 +192,7 @@ COMMON_MODALS_JS = """
         </div>
     </div>
 
-    <!-- Modal Thêm Thiết bị -->
+    <!-- Modal Them Thiet bi -->
     <div class="modal fade" id="addDeviceModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog">
             <div class="modal-content bg-dark text-light border-secondary">
@@ -207,12 +211,12 @@ COMMON_MODALS_JS = """
         </div>
     </div>
 
-    <!-- Modal Popup HIỂN THỊ KẾT QUẢ TÌM KIẾM -->
+    <!-- Modal Ket qua Tim kiem -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-theme="dark">
         <div class="modal-dialog modal-xl">
             <div class="modal-content bg-dark text-light border-secondary">
                 <div class="modal-header border-secondary bg-primary text-white">
-                    <h5 class="modal-title"><i class="bi bi-search"></i> Kết quả tìm kiếm cho: "<span id="searchKeyword" class="fw-bold"></span>"</h5>
+                    <h5 class="modal-title"><i class="bi bi-search"></i> Kết quả tìm kiếm cho: <span id="searchKeyword" class="fw-bold"></span></h5>
                     <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body p-0">
@@ -229,7 +233,7 @@ COMMON_MODALS_JS = """
                                 </tr>
                             </thead>
                             <tbody id="searchResultsBody">
-                                <!-- Dữ liệu API đổ vào đây -->
+                                <!-- Render tu JS -->
                             </tbody>
                         </table>
                     </div>
@@ -238,7 +242,7 @@ COMMON_MODALS_JS = """
         </div>
     </div>
 
-    <!-- Toast Notification (Thông báo góc dưới) -->
+    <!-- Toast -->
     <div class="toast-container position-fixed bottom-0 end-0 p-3">
         <div id="liveToast" class="toast align-items-center text-bg-primary border-0" role="alert" aria-live="assertive" aria-atomic="true">
             <div class="d-flex">
@@ -260,7 +264,7 @@ COMMON_MODALS_JS = """
         }
 
         async function triggerAction(action, ip) {
-            let confirmMsg = ip ? `Xác nhận chạy lệnh ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy lệnh ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
+            let confirmMsg = ip ? `Xác nhận chạy ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
             if(!confirm(confirmMsg)) return;
 
             let res = await fetch('/api/action', {
@@ -314,7 +318,6 @@ COMMON_MODALS_JS = """
             location.reload();
         }
 
-        // --- JS TÌM KIẾM ---
         async function executeSearch() {
             let q = document.getElementById('searchInput').value.trim();
             if(!q) return;
@@ -348,11 +351,9 @@ COMMON_MODALS_JS = """
             myModal.show();
         }
     </script>
-</body>
-</html>
 """
 
-# --- GIAO DIỆN CHÍNH (Dashboard) ---
+# --- GIAO DIEN CHINH ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi" data-bs-theme="dark">
@@ -374,9 +375,8 @@ HTML_TEMPLATE = """
         <div class="container-fluid">
             <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Web Panel</a>
             
-            <!-- THANH TÌM KIẾM TRÊN NAVBAR -->
             <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
-                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
+                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
                 <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
             </form>
 
@@ -389,7 +389,6 @@ HTML_TEMPLATE = """
     </nav>
 
     <div class="container-fluid px-4">
-        <!-- Nút Hành động Tổng -->
         <div class="card shadow-sm mb-4 border-secondary">
             <div class="card-body bg-dark d-flex gap-2">
                 <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập Data)</button>
@@ -398,7 +397,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Bảng danh sách thiết bị -->
         <div class="card shadow mb-4 border-secondary">
             <div class="card-header py-3 bg-dark border-secondary">
                 <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices ({{ stats.total }} thiết bị)</h6>
@@ -453,7 +451,7 @@ HTML_TEMPLATE = """
     </div>
 """ + COMMON_MODALS_JS
 
-# --- GIAO DIỆN CHI TIẾT OOB ---
+# --- GIAO DIEN CHI TIET OOB ---
 DETAIL_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi" data-bs-theme="dark">
@@ -470,7 +468,6 @@ DETAIL_TEMPLATE = """
         <div class="container-fluid">
             <a class="navbar-brand fw-bold" href="/"><i class="bi bi-arrow-left"></i> Trở về Dashboard</a>
             
-            <!-- THANH TÌM KIẾM TRÊN NAVBAR -->
             <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
                 <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
                 <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
@@ -528,7 +525,7 @@ DETAIL_TEMPLATE = """
     </div>
 """ + COMMON_MODALS_JS
 
-# --- ROUTING GIAO DIỆN ---
+# --- ROUTING ---
 @app.route("/")
 def index():
     ips = get_ips()
@@ -537,7 +534,7 @@ def index():
     stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "err_menu": 0}
 
     for item in ips:
-        ip, alias = item[0], item[1]  
+        ip, alias = item[0], item[1]  # <--- FIX CỨNG TYPE ERROR Ở ĐÂY
         status = dev_status.get(ip, {})
         
         if status.get("ping") is True: stats["online"] += 1
@@ -564,7 +561,7 @@ def device_detail(ip):
 
 if __name__ == "__main__":
     print("=========================================================")
-    print("🚀 GIAO DIỆN WEB OOB (CÓ THANH SEARCH) ĐÃ KHỞI ĐỘNG")
-    print("👉 Mở trình duyệt và truy cập: http://127.0.0.1:5000")
+    print(">> GIAO DIEN WEB OOB (CO THANH SEARCH) DA KHOI DONG")
+    print(">> Mo trinh duyet va truy cap: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False)
