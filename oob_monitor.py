@@ -1332,7 +1332,37 @@ def _scan_wait(cfg):
     time.sleep(sleep_seconds)
 
 
-def run_daemon(cfg):
+def _config_reload_loop(cfg, config_path, check_every=5):
+    """Thread ngam: theo doi file cfg (oob_config.json) qua mtime, giong het
+    co che load_ip_list_cached() dang dung cho danh sach IP. Khi phat hien
+    file thay doi (VD: sua o cua so Menu dang chay song song), tu doc lai va
+    cap nhat TRUC TIEP vao cung 1 dict `cfg` (khong tao dict moi) — nho vay
+    moi noi dang giu tham chieu toi `cfg` (vong lap Luong 1, thread Luong 2,
+    heartbeat...) deu thay gia tri moi ngay lan doc tiep theo, khong can
+    khoi dong lai daemon.
+    """
+    try:
+        last_mtime = os.path.getmtime(config_path)
+    except OSError:
+        last_mtime = 0
+
+    while True:
+        time.sleep(check_every)
+        try:
+            mtime = os.path.getmtime(config_path)
+        except OSError:
+            continue
+        if mtime == last_mtime:
+            continue
+        last_mtime = mtime
+
+        new_cfg = load_config(config_path)
+        with ui_lock:
+            cfg.update(new_cfg)
+        log_oob("[cyan][CONFIG][/] Phat hien oob_config.json thay doi — da tu dong ap dung cau hinh moi.")
+
+
+def run_daemon(cfg, config_path=None):
     """Vòng lặp giám sát hiển thị đa luồng chia đôi màn hình."""
     global _live_ui
     _con.print(Panel("[bold green]OOB MONITOR DAEMON[/]\n[dim]Dang giam sat lien tuc. Nhan Ctrl+C de dung.[/]", border_style="green"))
@@ -1345,6 +1375,10 @@ def run_daemon(cfg):
     
     threading.Thread(target=run_verify_daemon, args=(cfg,), daemon=True).start()
     threading.Thread(target=_daemon_heartbeat_loop, daemon=True).start()  # #12: heartbeat
+    if config_path:
+        threading.Thread(target=_config_reload_loop, args=(cfg, config_path), daemon=True).start()
+    else:
+        log_oob("[yellow][!][/] Khong biet duong dan file config — se KHONG tu dong ap dung thay doi cau hinh.")
     
     with Live(layout, refresh_per_second=4, screen=False) as live:
         _live_ui = live
@@ -2203,7 +2237,7 @@ def main():
         save_config(config_path, cfg)
 
     if "--daemon" in sys.argv:
-        run_daemon(cfg)
+        run_daemon(cfg, config_path)
         return
     elif "--menu" in sys.argv:
         main_menu(cfg, config_path)
@@ -2222,7 +2256,7 @@ def main():
     if choice == "1":
         main_menu(cfg, config_path)
     elif choice == "2":
-        run_daemon(cfg)
+        run_daemon(cfg, config_path)
     elif choice == "3":
         script_name = sys.argv[0]
         if platform.system() == "Windows":
