@@ -16,8 +16,10 @@ Phu thuoc ben ngoai:
     pip install paramiko
 """
 
+import platform
 import re
 import socket
+import subprocess
 import time
 
 try:
@@ -68,6 +70,10 @@ class MiniTelnet:
     def __init__(self, host, port=23, timeout=10):
         self.sock   = socket.create_connection((host, port), timeout=timeout)
         self.buffer = b""
+        # True neu lan doc read_until_prompt() gan nhat bi TIMEOUT (khong thay
+        # prompt that su) thay vi doc du va thanh cong - dung de phan biet
+        # "khong lay duoc thong tin" (fetch that bai) voi "lay duoc nhung rong".
+        self.last_read_timed_out = False
 
     def _strip_iac(self, data: bytes) -> bytes:
         out = bytearray()
@@ -134,7 +140,13 @@ class MiniTelnet:
         an toan cho cac lenh output dai ("show running-config | include menu")
         co the chua ky tu '#' ngay trong noi dung (vd description "##"), khac
         voi read_until("#") se ket thuc SAI ngay khi gap '#' dau tien bat ke
-        no nam o dau."""
+        no nam o dau.
+
+        Sau khi goi ham nay, kiem tra self.last_read_timed_out:
+            True  -> KHONG tim thay prompt that su truoc khi het timeout (fetch
+                     that bai / mat ket noi giua chung).
+            False -> Da doc du toi prompt, du lieu tra ve day du va dang tin cay."""
+        self.last_read_timed_out = False
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(0.3, deadline - time.time()))
@@ -152,6 +164,7 @@ class MiniTelnet:
                 self.buffer = b""
                 return text
         data, self.buffer = self.buffer, b""
+        self.last_read_timed_out = True
         return data.decode(errors="ignore")
 
     def write(self, text: str):
@@ -182,6 +195,8 @@ class MiniSSH:
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._shell  = None
         self.buffer  = b""
+        # Xem giai thich o MiniTelnet.read_until_prompt().
+        self.last_read_timed_out = False
 
     def _connect(self, host, port, username, password, timeout):
         """Goi boi connect_auto() de thiet lap ket noi thuc su."""
@@ -240,7 +255,11 @@ class MiniSSH:
         an toan cho cac lenh output dai ("show running-config | include menu")
         co the chua ky tu '#' ngay trong noi dung (vd description "##"), khac
         voi read_until("#") se ket thuc SAI ngay khi gap '#' dau tien bat ke
-        no nam o dau. Tuong duong ban Telnet, dung cho ca duong SSH (uu tien)."""
+        no nam o dau. Tuong duong ban Telnet, dung cho ca duong SSH (uu tien).
+
+        Sau khi goi ham nay, kiem tra self.last_read_timed_out (xem giai thich
+        chi tiet o MiniTelnet.read_until_prompt())."""
+        self.last_read_timed_out = False
         deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = max(0.3, deadline - time.time())
@@ -259,6 +278,7 @@ class MiniSSH:
                 self.buffer = b""
                 return text
         data, self.buffer = self.buffer, b""
+        self.last_read_timed_out = True
         return data.decode(errors="ignore")
 
     def _drain_pending(self):
@@ -289,6 +309,35 @@ class MiniSSH:
             self._client.close()
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Ping test - kiem tra thiet bi co "song" (reachable qua ICMP) truoc khi
+# thu dang nhap SSH/Telnet (tiet kiem thoi gian neu thiet bi da down).
+# ---------------------------------------------------------------------------
+
+def ping_host(ip: str, timeout: float = 1.0) -> bool:
+    """Gui 1 goi ICMP ping toi ip, tra ve True neu co phan hoi (reachable).
+    Dung lenh ping cua he dieu hanh (khong can quyen root/raw-socket):
+        - Windows : ping -n 1 -w <ms>
+        - Linux/Mac: ping -c 1 -W <s>
+    Tra ve False neu khong phan hoi, loi, hoac khong tim thay lenh ping."""
+    system = platform.system().lower()
+    try:
+        if system == "windows":
+            cmd = ["ping", "-n", "1", "-w", str(max(1, int(timeout * 1000)))]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(max(1, int(round(timeout))))]
+        cmd.append(ip)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 3,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
