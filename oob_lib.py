@@ -157,6 +157,9 @@ class MiniTelnet:
     def write(self, text: str):
         self.sock.sendall((text + "\r\n").encode())
 
+    def write_raw(self, data: bytes):
+        self.sock.sendall(data)
+
     def close(self):
         try:
             self.sock.close()
@@ -276,6 +279,10 @@ class MiniSSH:
         # Drain buffer truoc khi gui lenh moi — tranh stale data lam hong read_until ke tiep
         self._drain_pending()
         self._shell.send((text + "\r\n").encode())
+
+    def write_raw(self, data: bytes):
+        self._drain_pending()
+        self._shell.send(data)
 
     def close(self):
         try:
