@@ -1,63 +1,131 @@
 import sqlite3
 import json
 import os
+import threading
 from datetime import datetime
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request, jsonify
+
+# Import thẳng các hàm lõi từ tool CLI của bạn
+import oob_monitor
 
 app = Flask(__name__)
 
-# --- CONFIG ---
-CONFIG_FILE = "oob_config.json"
-BASELINE_DB = "baseline.db"
-DEVICE_STATUS = "device_status.json"
-IP_LIST_FILE = "oob_ips.txt"
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def load_device_status():
-    if os.path.exists(DEVICE_STATUS):
-        with open(DEVICE_STATUS, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
+# --- CÁC HÀM TIỆN ÍCH ---
 def get_ips():
-    hosts = []
-    if os.path.exists(IP_LIST_FILE):
-        with open(IP_LIST_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip() and not line.startswith("#"):
-                    parts = line.split()
-                    hosts.append({"ip": parts[0], "alias": parts[1] if len(parts) > 1 else parts[0]})
-    return hosts
+    return oob_monitor.load_ip_list_cached(oob_monitor.CONFIG_FILE_DEFAULT.replace("json", "txt").replace("oob_config", "oob_ips"))
 
 def query_db(query, args=(), fetchall=True):
-    if not os.path.exists(BASELINE_DB):
-        return []
+    if not os.path.exists(oob_monitor.DEFAULT_CONFIG["baseline_db"]): return []
     try:
-        conn = sqlite3.connect(BASELINE_DB)
+        conn = sqlite3.connect(oob_monitor.DEFAULT_CONFIG["baseline_db"])
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(query, args)
         rv = cur.fetchall() if fetchall else cur.fetchone()
         conn.close()
         return rv
-    except Exception as e:
-        print(f"DB Error: {e}")
-        return []
+    except Exception: return []
 
-# --- HTML TEMPLATE (Bootstrap 5) ---
+# --- CÁC TIẾN TRÌNH CHẠY NGẦM (Tránh treo Web) ---
+def _web_print(msg): 
+    # Bỏ qua in ra console để tránh rác log của Flask
+    pass
+
+def bg_task_scan(target_ip=None):
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+
+    for ip, alias in hosts:
+        alive = oob_monitor.ping_host(ip)
+        oob_monitor.save_device_status(ip, alias=alias, ping=alive)
+        if not alive: continue
+
+        try: hostname, menu_name, snapshot, menu_state = oob_monitor.poll_host_multi(ip, cfg, timeout=10)
+        except Exception: oob_monitor.save_device_status(ip, alias=alias, menu_state="conn_failed"); continue
+
+        oob_monitor.save_device_status(ip, alias=alias, menu_state=menu_state)
+        if menu_state in ["fetch_failed", "no_menu"] or not snapshot: continue
+
+        oob_monitor.save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
+        _mn, _dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+
+        if baseline is None or not oob_monitor.options_equal(baseline, snapshot):
+            oob_monitor.save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
+            oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB")
+
+def bg_task_verify(target_ip=None):
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+
+    for ip, alias in hosts:
+        _mn, _dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        if baseline: oob_monitor.run_deep_verify(cfg, alias, ip, baseline, print_fn=_web_print)
+
+def bg_task_push(target_ip=None):
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+
+    for ip, alias in hosts:
+        _mn, _dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        if not baseline: continue
+        
+        vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
+        if vendor == "vertiv": continue # Vertiv chưa hỗ trợ Push
+        
+        results = oob_monitor.run_deep_verify(cfg, alias, ip, baseline, print_fn=_web_print)
+        if any(r["status"] == "CANH BAO" for r in results):
+            oob_monitor.process_push_and_reverify(cfg, alias, ip, baseline, results, print_fn=_web_print)
+
+
+# --- API ENDPOINTS ---
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    if request.method == "GET":
+        return jsonify(oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT))
+    else:
+        cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+        cfg.update(request.json)
+        oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+        return jsonify({"status": "success"})
+
+@app.route("/api/device", methods=["POST", "DELETE"])
+def api_device():
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    if request.method == "POST":
+        data = request.json
+        oob_monitor.add_ip(cfg["ip_list"], data["ip"], data.get("alias"))
+        return jsonify({"status": "success"})
+    else:
+        ip = request.json.get("ip")
+        oob_monitor.remove_ip(cfg["ip_list"], ip)
+        return jsonify({"status": "success"})
+
+@app.route("/api/action", methods=["POST"])
+def api_action():
+    action = request.json.get("action")
+    target_ip = request.json.get("ip") # Có thể là IP cụ thể hoặc null (All)
+    
+    if action == "scan":
+        threading.Thread(target=bg_task_scan, args=(target_ip,)).start()
+    elif action == "verify":
+        threading.Thread(target=bg_task_verify, args=(target_ip,)).start()
+    elif action == "push":
+        threading.Thread(target=bg_task_push, args=(target_ip,)).start()
+        
+    return jsonify({"status": "success", "msg": f"Đã đưa lệnh {action.upper()} vào chạy ngầm!"})
+
+
+# --- GIAO DIỆN HTML/JS TÍCH HỢP ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OOB Network Dashboard</title>
-    <!-- Bootstrap 5 CSS -->
+    <title>OOB Manager Web Panel</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
     <style>
@@ -65,83 +133,34 @@ HTML_TEMPLATE = """
         .card { background-color: #1e1e1e; border: 1px solid #333; }
         .table-dark { background-color: #1e1e1e; }
         .stat-card { border-left: 4px solid #0d6efd; }
-        .stat-card.success { border-left-color: #198754; }
-        .stat-card.warning { border-left-color: #ffc107; }
-        .stat-card.danger { border-left-color: #dc3545; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
         <div class="container-fluid">
-            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Manager Web</a>
-            <span class="navbar-text">
-                <i class="bi bi-clock"></i> Cập nhật: {{ time_now }}
-            </span>
+            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Web Panel</a>
+            <div>
+                <button class="btn btn-outline-info btn-sm me-2" onclick="openSettings()"><i class="bi bi-gear"></i> Cài đặt</button>
+                <button class="btn btn-outline-success btn-sm me-2" onclick="openAddDevice()"><i class="bi bi-plus-lg"></i> Thêm Thiết bị</button>
+                <span class="text-muted small"><i class="bi bi-clock"></i> {{ time_now }}</span>
+            </div>
         </div>
     </nav>
 
     <div class="container-fluid px-4">
-        <!-- Metrics -->
-        <div class="row mb-4">
-            <div class="col-md-3">
-                <div class="card stat-card shadow-sm h-100 py-2">
-                    <div class="card-body">
-                        <div class="row no-gutters align-items-center">
-                            <div class="col mr-2">
-                                <div class="text-xs font-weight-bold text-primary text-uppercase mb-1">Tổng thiết bị (File)</div>
-                                <div class="h3 mb-0 fw-bold text-white">{{ stats.total }}</div>
-                            </div>
-                            <div class="col-auto"><i class="bi bi-router fa-2x text-secondary fs-1"></i></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card stat-card success shadow-sm h-100 py-2">
-                    <div class="card-body">
-                        <div class="row no-gutters align-items-center">
-                            <div class="col mr-2">
-                                <div class="text-xs font-weight-bold text-success text-uppercase mb-1">Ping Sống (Online)</div>
-                                <div class="h3 mb-0 fw-bold text-white">{{ stats.online }}</div>
-                            </div>
-                            <div class="col-auto"><i class="bi bi-activity fa-2x text-secondary fs-1"></i></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card stat-card warning shadow-sm h-100 py-2">
-                    <div class="card-body">
-                        <div class="row no-gutters align-items-center">
-                            <div class="col mr-2">
-                                <div class="text-xs font-weight-bold text-warning text-uppercase mb-1">Đã có Baseline</div>
-                                <div class="h3 mb-0 fw-bold text-white">{{ stats.has_baseline }}</div>
-                            </div>
-                            <div class="col-auto"><i class="bi bi-database-check fa-2x text-secondary fs-1"></i></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card stat-card danger shadow-sm h-100 py-2">
-                    <div class="card-body">
-                        <div class="row no-gutters align-items-center">
-                            <div class="col mr-2">
-                                <div class="text-xs font-weight-bold text-danger text-uppercase mb-1">Lỗi Ping / Lỗi Menu</div>
-                                <div class="h3 mb-0 fw-bold text-white">{{ stats.offline + stats.err_menu }}</div>
-                            </div>
-                            <div class="col-auto"><i class="bi bi-exclamation-triangle fa-2x text-secondary fs-1"></i></div>
-                        </div>
-                    </div>
-                </div>
+        <!-- Nút Hành động Tổng -->
+        <div class="card shadow-sm mb-4">
+            <div class="card-body bg-dark d-flex gap-2">
+                <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập)</button>
+                <button class="btn btn-warning" onclick="triggerAction('verify', null)"><i class="bi bi-lightning"></i> Verify All (Kiểm tra)</button>
+                <button class="btn btn-danger" onclick="triggerAction('push', null)"><i class="bi bi-upload"></i> Push Config All (Sửa lỗi)</button>
             </div>
         </div>
 
         <!-- Bảng danh sách thiết bị -->
         <div class="card shadow mb-4">
-            <div class="card-header py-3 d-flex justify-content-between align-items-center bg-dark">
-                <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices</h6>
-                <a href="/" class="btn btn-sm btn-outline-light"><i class="bi bi-arrow-clockwise"></i> Làm mới</a>
+            <div class="card-header py-3 bg-dark">
+                <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices ({{ stats.total }} thiết bị)</h6>
             </div>
             <div class="card-body bg-dark">
                 <div class="table-responsive">
@@ -152,9 +171,9 @@ HTML_TEMPLATE = """
                                 <th>IP Address</th>
                                 <th>Ping</th>
                                 <th>Trạng thái Menu</th>
-                                <th>Tổng Option (Baseline)</th>
+                                <th>Options</th>
                                 <th>Cập nhật lần cuối</th>
-                                <th>Hành động</th>
+                                <th>Hành động (Chạy ngầm)</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -163,37 +182,25 @@ HTML_TEMPLATE = """
                                 <td class="fw-bold">{{ dev.alias }}</td>
                                 <td><code>{{ dev.ip }}</code></td>
                                 <td>
-                                    {% if dev.ping == True %}
-                                        <span class="badge bg-success">Online</span>
-                                    {% elif dev.ping == False %}
-                                        <span class="badge bg-danger">Offline</span>
-                                    {% else %}
-                                        <span class="badge bg-secondary">Chưa quét</span>
-                                    {% endif %}
+                                    {% if dev.ping == True %}<span class="badge bg-success">Online</span>
+                                    {% elif dev.ping == False %}<span class="badge bg-danger">Offline</span>
+                                    {% else %}<span class="badge bg-secondary">-</span>{% endif %}
                                 </td>
                                 <td>
-                                    {% if dev.menu_state == 'ok' %}
-                                        <span class="badge bg-success">OK</span>
-                                    {% elif dev.menu_state == 'conn_failed' %}
-                                        <span class="badge bg-danger">Lỗi kết nối</span>
-                                    {% elif dev.menu_state == 'no_menu' %}
-                                        <span class="badge bg-warning text-dark">Không có Menu</span>
-                                    {% elif dev.menu_state == 'fetch_failed' %}
-                                        <span class="badge bg-warning text-dark">Lỗi đọc data</span>
-                                    {% else %}
-                                        <span class="badge bg-secondary">-</span>
-                                    {% endif %}
+                                    {% if dev.menu_state == 'ok' %}<span class="badge bg-success">OK</span>
+                                    {% elif dev.menu_state == 'conn_failed' %}<span class="badge bg-danger">Lỗi KN</span>
+                                    {% else %}<span class="badge bg-secondary">{{ dev.menu_state or '-' }}</span>{% endif %}
                                 </td>
-                                <td>
-                                    {% if dev.opt_count > 0 %}
-                                        <span class="text-info fw-bold">{{ dev.opt_count }}</span> options
-                                    {% else %}
-                                        <span class="text-muted">Không có</span>
-                                    {% endif %}
-                                </td>
+                                <td><span class="text-info fw-bold">{{ dev.opt_count }}</span></td>
                                 <td class="text-muted small">{{ dev.checked_at }}</td>
                                 <td>
-                                    <a href="/device/{{ dev.ip }}" class="btn btn-sm btn-primary"><i class="bi bi-eye"></i> Xem Menu</a>
+                                    <div class="btn-group btn-group-sm">
+                                        <a href="/device/{{ dev.ip }}" class="btn btn-outline-light" title="Xem chi tiết"><i class="bi bi-eye"></i></a>
+                                        <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ dev.ip }}')" title="Scan"><i class="bi bi-search"></i></button>
+                                        <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ dev.ip }}')" title="Verify"><i class="bi bi-lightning"></i></button>
+                                        <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ dev.ip }}')" title="Push"><i class="bi bi-upload"></i></button>
+                                        <button class="btn btn-outline-secondary" onclick="deleteDevice('{{ dev.ip }}')" title="Xóa"><i class="bi bi-trash"></i></button>
+                                    </div>
                                 </td>
                             </tr>
                             {% endfor %}
@@ -203,9 +210,130 @@ HTML_TEMPLATE = """
             </div>
         </div>
     </div>
-    
-    <!-- Bootstrap JS -->
+
+    <!-- Modal Settings -->
+    <div class="modal fade" id="settingsModal" tabindex="-1" data-bs-theme="dark">
+        <div class="modal-dialog">
+            <div class="modal-content bg-dark text-light border-secondary">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title">Cài đặt Hệ thống</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="settingsForm">
+                        <div class="mb-3"><label>Username</label><input type="text" class="form-control bg-dark text-light" id="cfg_user"></div>
+                        <div class="mb-3"><label>Password</label><input type="password" class="form-control bg-dark text-light" id="cfg_pass"></div>
+                        <div class="mb-3"><label>Enable Password</label><input type="password" class="form-control bg-dark text-light" id="cfg_en_pass"></div>
+                        <div class="mb-3"><label>Vertiv Connect Password</label><input type="password" class="form-control bg-dark text-light" id="cfg_vt_pass"></div>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="cfg_auto_verify">
+                            <label class="form-check-label">Bật Tự động Verify Ngầm (Daemon)</label>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Lưu thay đổi</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Add Device -->
+    <div class="modal fade" id="addDeviceModal" tabindex="-1" data-bs-theme="dark">
+        <div class="modal-dialog">
+            <div class="modal-content bg-dark text-light border-secondary">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title">Thêm Thiết bị OOB</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3"><label>IP Address</label><input type="text" class="form-control bg-dark text-light" id="new_ip"></div>
+                    <div class="mb-3"><label>Alias (Tên gọi)</label><input type="text" class="form-control bg-dark text-light" id="new_alias"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-success" onclick="addDevice()">Thêm mới</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-3">
+        <div id="liveToast" class="toast align-items-center text-bg-primary border-0" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="d-flex">
+                <div class="toast-body" id="toastMsg"></div>
+                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const toastEl = document.getElementById('liveToast');
+        const toast = new bootstrap.Toast(toastEl, {delay: 3000});
+
+        function showToast(msg, isError=false) {
+            document.getElementById('toastMsg').innerText = msg;
+            toastEl.className = isError ? 'toast align-items-center text-bg-danger border-0' : 'toast align-items-center text-bg-success border-0';
+            toast.show();
+        }
+
+        // --- CÁC HÀM GỌI API ---
+        async function triggerAction(action, ip) {
+            let confirmMsg = ip ? `Xác nhận chạy ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
+            if(!confirm(confirmMsg)) return;
+
+            let res = await fetch('/api/action', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: action, ip: ip})
+            });
+            let data = await res.json();
+            showToast(data.msg);
+        }
+
+        async function openSettings() {
+            let res = await fetch('/api/config');
+            let cfg = await res.json();
+            document.getElementById('cfg_user').value = cfg.username || '';
+            document.getElementById('cfg_pass').value = cfg.password || '';
+            document.getElementById('cfg_en_pass').value = cfg.enable_password || '';
+            document.getElementById('cfg_vt_pass').value = cfg.vertiv_connect_password || '';
+            document.getElementById('cfg_auto_verify').checked = cfg.auto_verify;
+            new bootstrap.Modal(document.getElementById('settingsModal')).show();
+        }
+
+        async function saveSettings() {
+            let payload = {
+                username: document.getElementById('cfg_user').value,
+                password: document.getElementById('cfg_pass').value,
+                enable_password: document.getElementById('cfg_en_pass').value,
+                vertiv_connect_password: document.getElementById('cfg_vt_pass').value,
+                auto_verify: document.getElementById('cfg_auto_verify').checked
+            };
+            await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+            showToast('Đã lưu cấu hình!');
+            bootstrap.Modal.getInstance(document.getElementById('settingsModal')).hide();
+        }
+
+        function openAddDevice() {
+            document.getElementById('new_ip').value = '';
+            document.getElementById('new_alias').value = '';
+            new bootstrap.Modal(document.getElementById('addDeviceModal')).show();
+        }
+
+        async function addDevice() {
+            let payload = { ip: document.getElementById('new_ip').value, alias: document.getElementById('new_alias').value };
+            if(!payload.ip) return alert("Vui lòng nhập IP");
+            await fetch('/api/device', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+            location.reload();
+        }
+
+        async function deleteDevice(ip) {
+            if(!confirm(`Xóa OOB ${ip}?`)) return;
+            await fetch('/api/device', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip: ip}) });
+            location.reload();
+        }
+    </script>
 </body>
 </html>
 """
@@ -224,7 +352,7 @@ DETAIL_TEMPLATE = """
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
         <div class="container-fluid">
-            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-arrow-left"></i> Trở về</a>
+            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-arrow-left"></i> Trở về Dashboard</a>
         </div>
     </nav>
 
@@ -275,41 +403,30 @@ DETAIL_TEMPLATE = """
 </html>
 """
 
-# --- ROUTES ---
-
+# --- ROUTING GIAO DIỆN ---
 @app.route("/")
 def index():
     ips = get_ips()
-    dev_status = load_device_status()
-    
+    dev_status = oob_monitor.load_device_status()
     devices = []
     stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "err_menu": 0}
 
     for item in ips:
-        ip = item["ip"]
+        ip, alias = item[0], item[1]
         status = dev_status.get(ip, {})
         
-        # Thống kê Ping
         if status.get("ping") is True: stats["online"] += 1
         elif status.get("ping") is False: stats["offline"] += 1
             
-        # Thống kê Menu
-        if status.get("menu_state") in ["conn_failed", "fetch_failed"]:
-            stats["err_menu"] += 1
+        if status.get("menu_state") in ["conn_failed", "fetch_failed"]: stats["err_menu"] += 1
 
-        # Đếm số lượng option từ SQLite
         opts = query_db("SELECT count(*) as cnt FROM baseline_menu WHERE host=?", (ip,))
         opt_count = opts[0]["cnt"] if opts else 0
-        if opt_count > 0:
-            stats["has_baseline"] += 1
+        if opt_count > 0: stats["has_baseline"] += 1
 
         devices.append({
-            "alias": item["alias"],
-            "ip": ip,
-            "ping": status.get("ping"),
-            "menu_state": status.get("menu_state"),
-            "checked_at": status.get("checked_at", "-"),
-            "opt_count": opt_count
+            "alias": alias, "ip": ip, "ping": status.get("ping"), "menu_state": status.get("menu_state"),
+            "checked_at": status.get("checked_at", "-"), "opt_count": opt_count
         })
 
     time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -318,14 +435,11 @@ def index():
 @app.route("/device/<ip>")
 def device_detail(ip):
     options = query_db("SELECT * FROM baseline_menu WHERE host=? ORDER BY option_key", (ip,))
-    # Format DB rows to dict
-    opts_list = [dict(row) for row in options]
-    return render_template_string(DETAIL_TEMPLATE, ip=ip, options=opts_list)
+    return render_template_string(DETAIL_TEMPLATE, ip=ip, options=[dict(row) for row in options])
 
 if __name__ == "__main__":
     print("=========================================================")
-    print("🚀 GIAO DIỆN WEB OOB ĐÃ KHỞI ĐỘNG")
+    print("🚀 GIAO DIỆN WEB OOB (FULL ACTIONS) ĐÃ KHỞI ĐỘNG")
     print("👉 Mở trình duyệt và truy cập: http://127.0.0.1:5000")
     print("=========================================================")
-    # Chạy trên tất cả IP mạng LAN (0.0.0.0) với port 5000
     app.run(host="0.0.0.0", port=5000, debug=False)
