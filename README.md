@@ -1,16 +1,24 @@
 # OOB Network Manager
 
 Công cụ **giám sát, xác minh vật lý và tự động phục hồi** menu OOB (Out-of-Band
-Console Server chạy Cisco IOS) qua SSH/Telnet. Phát hiện cấu hình menu bị thay
-đổi so với baseline, kiểm tra vật lý từng cổng console (Deep Verify — pivot vào
-từng cổng để xác nhận đúng thiết bị thật đang nối vào), và tự động sửa lại mô tả
-(description) trên menu khi phát hiện sai lệch.
+Console Server chạy Cisco IOS hoặc Vertiv ACS) qua SSH/Telnet. Phát hiện cấu hình
+menu bị thay đổi so với baseline, kiểm tra vật lý từng cổng console (Deep Verify —
+pivot vào từng cổng để xác nhận đúng thiết bị thật đang nối vào), tự động sửa lại
+mô tả (description) trên menu khi phát hiện sai lệch, và có thêm một **giao diện
+Web Dashboard** để thao tác từ trình duyệt thay vì chỉ dùng CLI.
 
-Gồm 2 file chính:
+Gồm 3 file chính:
 - `oob_lib.py` — thư viện kết nối (SSH ưu tiên qua `paramiko`, fallback Telnet tự
-  viết), đọc/parse cấu hình `menu`, và ghi (push) lại đúng 1 dòng mô tả khi cần sửa.
-- `oob_monitor.py` — chương trình chính: daemon giám sát, menu quản lý CLI, Deep
-  Verify / auto push, lập lịch cho cả 2 luồng, Import/Export Excel.
+  viết), đọc/parse cấu hình `menu`, ghi (push) lại đúng 1 dòng mô tả khi cần sửa,
+  và kiểm tra ping tới thiết bị.
+- `oob_monitor.py` — chương trình chính (CLI): daemon giám sát, menu quản lý,
+  Deep Verify / auto push, lập lịch cho cả 2 luồng, Import/Export Excel. Hỗ trợ
+  song song 2 dòng thiết bị OOB: **Cisco IOS** (menu console) và **Vertiv ACS**
+  (serial console server).
+- `oob_web.py` — giao diện **Web Dashboard** (Flask) chạy song song/độc lập với
+  CLI, dùng lại toàn bộ logic của `oob_monitor.py`: xem danh sách thiết bị, trạng
+  thái ping/menu theo thời gian thực, tìm kiếm port/hostname, và bấm nút để chạy
+  Scan / Verify / Push ngay trên trình duyệt (không cần mở terminal).
 
 ---
 
@@ -18,8 +26,10 @@ Gồm 2 file chính:
 
 - Python 3.9 trở lên (dùng cú pháp `str | None`).
 - Truy cập mạng (SSH/Telnet) tới các thiết bị OOB cần giám sát.
-- Quyền ghi thư mục chạy chương trình (để tạo file config, database SQLite, và các
-  thư mục log).
+- Quyền ghi thư mục chạy chương trình (để tạo file config, database SQLite, file
+  trạng thái thiết bị, và các thư mục log).
+- Nếu muốn dùng Web Dashboard (`oob_web.py`): mở thêm 1 cổng TCP (mặc định `5000`)
+  để truy cập bằng trình duyệt.
 
 ## 2. Cài đặt thư viện
 
@@ -28,6 +38,7 @@ Thư viện ngoài cần cài đặt được liệt kê trong `requirements.txt
 ```
 paramiko==3.5.1
 rich>=13.7.0,<15.0.0
+flask>=3.0.0,<4.0.0
 openpyxl>=3.1.0          # cần cho Import/Export Excel
 ```
 
@@ -55,9 +66,12 @@ pip install -r requirements.txt
 > - `paramiko` — SSH vào thiết bị (ưu tiên); nếu SSH thất bại, tự động rớt về
 >   Telnet (tự viết trong `oob_lib.py`, không cần gói nào thêm).
 > - `rich` — vẽ giao diện console (bảng, khung, layout chia đôi màn hình, tự
->   refresh log theo thời gian thực).
-> - `openpyxl` — đọc/ghi file Excel `.xlsx` cho tính năng Import và Export báo cáo.
->   Nếu chưa cài, 3 hàm Import/Export vẫn chạy nhưng sẽ thông báo lỗi và thoát.
+>   refresh log theo thời gian thực) cho `oob_monitor.py`.
+> - `flask` — chạy Web Dashboard `oob_web.py` (routing trang chủ, trang chi tiết
+>   thiết bị, và các API JSON). Không cần nếu bạn chỉ dùng CLI thuần tuý.
+> - `openpyxl` — đọc/ghi file Excel `.xlsx` cho tính năng Import và Export báo cáo
+>   trong `oob_monitor.py`. Nếu chưa cài, 3 hàm Import/Export vẫn chạy nhưng sẽ
+>   thông báo lỗi và thoát.
 
 ## 3. Cấu trúc file khi chạy
 
@@ -65,10 +79,11 @@ Lần chạy đầu tiên, chương trình tự tạo các file/thư mục sau (
 
 | File / Thư mục               | Vai trò                                                              |
 |------------------------------|----------------------------------------------------------------------|
-| `oob_config.json`            | Cấu hình chính (tài khoản, cổng, chu kỳ, lịch chạy, đường dẫn...)   |
+| `oob_config.json`            | Cấu hình chính (tài khoản, mật khẩu Vertiv, cổng, chu kỳ, lịch chạy, đường dẫn...) |
 | `oob_ips.txt`                | Danh sách IP + alias các thiết bị OOB cần giám sát                  |
 | `baseline.db`                | SQLite — cấu hình "chuẩn" dùng để so sánh                           |
 | `snapshot.db`                | SQLite — cấu hình mới nhất vừa quét được                            |
+| `device_status.json`         | Trạng thái ping/kết nối mới nhất của từng thiết bị (dùng bởi Dashboard, cả CLI và Web đều đọc/ghi) |
 | `verify-logs/`               | Log kết quả Deep Verify (mỗi lần quét 1 file `.log`)                |
 | `push-logs/`                 | Log các lần tự động sửa mô tả (push) lên thiết bị                  |
 | `reports/`                   | File báo cáo Excel xuất ra từ tính năng Export (option `[e]`)        |
@@ -83,10 +98,11 @@ File `oob_ips.txt` — mỗi dòng 1 thiết bị, cách nhau bằng khoảng tr
 172.29.10.40 OOB-HAN-02
 ```
 
-> **Mới:** Thay vì nhập tay hoặc sửa file `oob_ips.txt`, bạn có thể Import danh sách
-> thiết bị từ file Excel qua option `[i]` trong Menu Quản Lý (xem mục 6).
+> **Lưu ý:** Ngoài chỉnh tay `oob_ips.txt`, bạn có thể Import danh sách thiết bị
+> từ file Excel qua option `[i]` trong Menu Quản Lý CLI (xem mục 6), hoặc thêm/xoá
+> từng thiết bị trực tiếp trên Web Dashboard (nút "Thêm OOB" / "Xóa OOB", xem mục 7).
 
-## 4. Chạy chương trình
+## 4. Chạy chương trình (CLI)
 
 ```bash
 python oob_monitor.py
@@ -145,9 +161,10 @@ Vào **Menu Quản Lý → [3] Cấu hình** để thiết lập các thông s�
 |-----|---------|
 | `[1]` Username | Tài khoản đăng nhập thiết bị OOB |
 | `[2]` Password | Mật khẩu |
-| `[3]` Enable password | Mật khẩu Enable (Privilege EXEC) |
+| `[3]` Enable password | Mật khẩu Enable (Privilege EXEC, Cisco) |
 | `[5]` SSH port | Cổng SSH (ưu tiên thử trước, mặc định 22) |
 | `[6]` Telnet port | Cổng Telnet (dự phòng khi SSH thất bại, mặc định 23) |
+| `[y]` Vertiv Connect Pass | Mật khẩu xác nhận khi pivot qua thiết bị Vertiv ACS (chỉ áp dụng cho thiết bị Vertiv) |
 
 ### Nhóm FILE DỮ LIỆU
 | Mục | Ý nghĩa |
@@ -158,7 +175,8 @@ Vào **Menu Quản Lý → [3] Cấu hình** để thiết lập các thông s�
 
 ### Nhóm LUỒNG 1 — GIÁM SÁT CẤU HÌNH (daemon chạy liên tục)
 Daemon kết nối định kỳ (hoặc theo lịch cố định) vào từng OOB, đọc toàn bộ cấu
-hình `menu`, so sánh với baseline đã lưu. Nếu khác → cảnh báo ngay.
+hình `menu` (Cisco) hoặc danh sách port (Vertiv ACS), so sánh với baseline đã lưu.
+Nếu khác → cảnh báo ngay.
 
 | Mục | Ý nghĩa |
 |-----|---------|
@@ -184,20 +202,11 @@ Khi chọn `[s]`, chương trình hỏi lần lượt:
 Daemon pivot vào từng port console, lấy hostname thực để kiểm tra description có
 đúng không. Chạy độc lập theo lịch riêng, không phụ thuộc Luồng 1.
 
-| Mục | Ý nghĩa |
-|-----|---------|
-| `[b]` Tự động Verify ngầm | Bật/tắt Deep Verify tự động trong Daemon *(xem lưu ý ở mục 9)* |
-| `[c]` Tự động Sửa lỗi ngầm | Bật/tắt tự động push sửa description khi phát hiện sai lệch — **khi bật, việc sửa diễn ra ngay lập tức, không hỏi xác nhận "y"** |
-| `[d]` Lịch chạy Verify | Chế độ lịch: `interval` (lặp theo chu kỳ) / `daily` (mỗi ngày 1 lần) / `weekly` (mỗi tuần 1 lần) |
-| `[v]` Chu kỳ interval (s) | Số giây giữa các lần Verify **khi `[d]` đang ở chế độ `interval`**; bị bỏ qua hoàn toàn khi dùng `daily`/`weekly` |
-
-> **Cách hiểu đúng về `[7]`/`[s]` và `[v]`/`[d]`:**
-> - `[7]`/`[s]` = tần suất **đọc cấu hình** (so sánh text menu config với baseline).
 > - `[v]`/`[d]` = tần suất **pivot vật lý** vào từng port console để lấy hostname thực.
 > - Đây là **2 luồng hoàn toàn độc lập**, chạy song song trên 2 thread khác nhau,
 >   mỗi luồng có lịch chạy riêng (interval/daily/weekly), không ảnh hưởng lẫn nhau.
 
-## 6. Các chức năng chính (Menu Quản Lý)
+## 6. Các chức năng chính (Menu Quản Lý CLI)
 
 ```
 [1] Them thiet bi OOB              - Them 1 IP + alias vao danh sach
@@ -271,7 +280,7 @@ Mỗi dòng = 1 option trên menu OOB. Các cột:
 | Description | Nội dung text hiển thị trên menu |
 | Target IP | IP đích kết nối |
 | Target Port | Port đích |
-| Protocol | `telnet` / `ssh` |
+| Protocol | `telnet` / `ssh` / `serial` (Vertiv) |
 | **Desc Status** | Kết quả kiểm tra mô tả (xem bảng màu bên dưới) |
 | Ghi chú | Chi tiết thêm về trạng thái |
 
@@ -347,8 +356,70 @@ Khi chạy tự động theo chu kỳ/lịch trong Daemon (Luồng 2), việc pu
 - Không bao giờ tự chạy `write memory` — chỉ sửa running-config, người dùng tự quyết
   định khi nào lưu vĩnh viễn.
 - Luôn ghi log vào `push-logs/` và verify lại sau khi sửa.
+- **Thiết bị Vertiv ACS chưa được hỗ trợ Push** — Deep Verify vẫn chạy và báo cáo
+  bình thường trên Vertiv, nhưng nếu phát hiện sai lệch, chương trình chỉ cảnh báo
+  chứ không tự sửa description (xem mục 9).
 
-## 7. Log
+## 7. Web Dashboard (`oob_web.py`)
+
+Ngoài CLI, có thể chạy một giao diện web (Flask) để xem trạng thái và thao tác
+nhanh từ trình duyệt — không cần mở terminal, không cần cài `rich`.
+
+```bash
+python oob_web.py
+```
+
+Mặc định chạy tại `http://127.0.0.1:5000` (lắng nghe trên `0.0.0.0:5000`, có thể
+truy cập từ máy khác trong mạng qua IP của máy chạy chương trình).
+
+`oob_web.py` **dùng lại trực tiếp** các hàm trong `oob_monitor.py` (đọc cùng
+`oob_config.json`, `oob_ips.txt`, `baseline.db`, `snapshot.db`,
+`device_status.json`) — không cần phải bật daemon `--daemon` trước, các nút Scan/
+Verify/Push trên web sẽ tự kết nối thiết bị và chạy nền (background thread) ngay
+khi bấm.
+
+### Trang chủ (Dashboard)
+
+- Bảng danh sách toàn bộ thiết bị OOB: Alias, IP, trạng thái Ping (Online/Offline),
+  trạng thái Menu (OK / Lỗi Connect / khác), tổng số dòng (option) đang có trong
+  baseline, thời điểm cập nhật gần nhất.
+- 3 nút thao tác hàng loạt: **Scan All** (thu thập lại data), **Verify All** (kiểm
+  tra dây cắm vật lý), **Push Config All** (tự sửa mô tả sai — bỏ qua thiết bị
+  Vertiv vì chưa hỗ trợ).
+- Mỗi dòng thiết bị có nút thao tác riêng: xem chi tiết, Scan, Verify, Push, Xóa.
+- Nút **"Thêm OOB"** — thêm nhanh 1 thiết bị (IP + alias) vào `oob_ips.txt` mà
+  không cần sửa file tay hay vào CLI.
+- Nút **"Cài đặt"** — sửa nhanh username/password/enable password/Vertiv Connect
+  Password và bật/tắt `auto_verify` ngay trên web, ghi thẳng vào `oob_config.json`.
+- Ô tìm kiếm ở góc trên — tra cứu theo hostname thật, alias, IP, hoặc mô tả
+  description; kết quả xếp hạng theo độ khớp và hiện trong 1 modal, có nút "Đi tới"
+  để nhảy thẳng đến trang chi tiết OOB tương ứng.
+
+### Trang chi tiết 1 thiết bị (`/device/<ip>`)
+
+- Hiển thị hostname OOB, hãng sản xuất (Cisco/Vertiv), và toàn bộ danh sách
+  option/port đang lưu trong baseline: phím menu/cổng, description, IP đích, port
+  đích, giao thức (`telnet`/`ssh`/`serial`).
+- 3 nút thao tác riêng cho thiết bị này: Quét Lại Data, K.Tra Dây Cắm (Verify),
+  Sửa Lỗi Desc (Push).
+- Nếu thiết bị chưa có baseline (chưa từng Scan), hiển thị cảnh báo thay vì bảng
+  trống.
+
+### API (dùng nội bộ bởi giao diện web, có thể gọi trực tiếp nếu cần tích hợp)
+
+| Endpoint | Method | Chức năng |
+|---|---|---|
+| `/api/config` | GET / POST | Đọc / cập nhật `oob_config.json` |
+| `/api/device` | POST / DELETE | Thêm / xoá thiết bị trong `oob_ips.txt` |
+| `/api/action` | POST | Chạy `scan` / `verify` / `push` (nền, có thể chỉ định 1 IP hoặc để trống = tất cả) |
+| `/api/search` | GET (`?q=`) | Tìm kiếm port/hostname theo từ khoá, trả JSON đã xếp hạng |
+
+> **Lưu ý:** `oob_web.py` không có xác thực đăng nhập (không có login/password
+> bảo vệ trang web) và mật khẩu thiết bị hiển thị nguyên văn trong modal Cài đặt —
+> chỉ nên chạy trong mạng nội bộ tin cậy, không nên expose ra Internet mà không tự
+> thêm lớp bảo vệ (reverse proxy + auth, VPN, firewall...).
+
+## 8. Log
 
 | File | Nội dung |
 |------|----------|
@@ -356,15 +427,19 @@ Khi chạy tự động theo chu kỳ/lịch trong Daemon (Luồng 2), việc pu
 | `push-logs/Push_<alias>_<timestamp>.log` | Lịch sử các lần tự động sửa mô tả (cũ → mới, kèm lệnh revert nếu cần sửa tay lại) |
 | `reports/OOB_Menu_Report_<timestamp>.xlsx` | Báo cáo Excel xuất từ option `[e]`, dùng dữ liệu tổng hợp từ log verify gần nhất |
 
-Xem nhanh log Verify gần nhất ngay trong menu qua mục **[9]**.
+Xem nhanh log Verify gần nhất ngay trong menu CLI qua mục **[9]**.
 
-## 8. Dừng chương trình
+## 9. Dừng chương trình
 
-- Chế độ Menu: chọn **[0] Thoát**.
-- Chế độ Daemon: `Ctrl+C`.
+- CLI, chế độ Menu: chọn **[0] Thoát**.
+- CLI, chế độ Daemon: `Ctrl+C`.
+- Web Dashboard: `Ctrl+C` trong terminal đang chạy `oob_web.py`.
 
-## 9. Lưu ý & giới hạn hiện tại
+## 10. Lưu ý & giới hạn hiện tại
 
+- **Thiết bị Vertiv ACS chưa hỗ trợ tính năng Push Config.** Deep Verify vẫn chạy
+  và báo cáo `CANH BAO` bình thường trên Vertiv, nhưng cả CLI (`[8]`) lẫn Web
+  Dashboard (nút Push) đều bỏ qua/không tự sửa description cho thiết bị loại này.
 - **`[b]` Tự động Verify ngầm — hiện chưa có tác dụng thực tế.** Cờ này đang chỉ
   được hiển thị/toggle trong màn hình Settings, nhưng logic chạy Daemon (Luồng 2)
   hiện chưa kiểm tra giá trị của nó — Deep Verify vẫn luôn tự chạy theo lịch dù
@@ -379,3 +454,9 @@ Xem nhanh log Verify gần nhất ngay trong menu qua mục **[9]**.
   đổi cấu hình ở cửa sổ Menu chỉ có hiệu lực ngay với 2 mục lịch chạy (`[s]`,
   `[d]`), các mục còn lại (username/password/port/interval số giây...) cần khởi
   động lại `--daemon` mới nhận.
+- `oob_web.py` là 1 tiến trình hoàn toàn riêng biệt với `--daemon`/`--menu` —
+  cũng không chia sẻ bộ nhớ, chỉ chia sẻ file config/DB trên đĩa. Đổi cấu hình
+  trên Web sẽ ghi xuống `oob_config.json` như CLI, nhưng nếu đang có `--daemon`
+  chạy song song thì áp dụng đúng quy tắc ở trên (chỉ 2 mục lịch chạy tự nhận
+  ngay, còn lại cần khởi động lại daemon).
+- `oob_web.py` không có xác thực đăng nhập — xem lưu ý bảo mật ở mục 7.
