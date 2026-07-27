@@ -537,7 +537,7 @@ def index():
     stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "err_menu": 0}
 
     for item in ips:
-        ip, alias = item["ip"], item["alias"]
+        ip, alias = item[0], item[1]  
         status = dev_status.get(ip, {})
         
         if status.get("ping") is True: stats["online"] += 1
