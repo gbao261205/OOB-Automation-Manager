@@ -623,10 +623,50 @@ def _build_verify_report(alias, oob_ip, own_hostname, results):
     lines.extend([fmt_sep(widths), bar])
     return "\n".join(lines)
 
+def extract_hostname(output: str) -> str:
+    """Ham quet va boc tach Hostname tu luong text dau ra cua thiet bi.
+    Da duoc nang cap de d?n sach ky tu an (Control Chars) va tang cuong Regex cho FreeBSD."""
+    output = _ANSI_STRIP_RE.sub('', output)
+    # Loai bo toan bo ky tu dien khien ngoai tru xuong dong (\r, \n)
+    output = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]', '', output)
+    
+    auth_seen = False
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    
+    for line in reversed(lines):
+        if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->", "Welcome to ACS"]) or _CONN_ERR_RE.search(line): 
+            continue
+        
+        # 1. Kieu login chuan Linux/Unix: "hostname login:"
+        m_login = re.search(r'([A-Za-z0-9_\-\.]+)\s+login:', line, re.IGNORECASE)
+        if m_login: return m_login.group(1)
+        
+        # 2. Kieu FreeBSD (Dung tren nhieu OOB/Firewall): "FreeBSD/amd64 (hostname) (ttyu0)" hoac Linux
+        m_bsd = re.search(r'(?:FreeBSD|Linux|NetBSD|OpenBSD).*?\(([A-Za-z0-9_\-\.]+)\)', line, re.IGNORECASE)
+        if m_bsd: return m_bsd.group(1)
+        
+        # 3. Kieu Cisco Console: "hostname con0 is now available"
+        m_con = re.search(r'([A-Za-z0-9_\-\.]+)\s+con\d+\s+is now available', line, re.IGNORECASE)
+        if m_con: return m_con.group(1)
+        
+        # 4. Prompt chung: "hostname>" hoac "hostname#"
+        m_prompt = _HOSTNAME_PROMPT_RE.search(line)
+        if m_prompt: 
+            h = m_prompt.group(1)
+            # Loai tru cac prompt he thong
+            if h.lower() not in ["cli", "cli-", "access", "admin", "root"]: 
+                return h
+                
+        if re.search(r'Username:|Password:|login:', line, re.IGNORECASE): 
+            auth_seen = True
+            
+    return "AUTH_REQUIRED" if auth_seen else None
+
 def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     if print_fn is None: print_fn = log_verify
     max_duration = float(cfg.get("max_verify_duration", 300))
     _verify_deadline = time.time() + max_duration
+    print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
 
     creds = get_all_credentials(cfg)
     own_hostname, working_cred = None, creds[0]
@@ -651,7 +691,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         nonlocal session
         if session is None:
             session = connect_auto(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], working_cred["username"], working_cred["password"], working_cred["enable_password"], timeout=8)
-            # FIX DEEP VERIFY CHO VERTIV (CHUI VAO FOLDER ACCESS)
             if vendor == "vertiv":
                 session.write("cd access/")
                 session.read_until("cli->", timeout=3)
@@ -673,27 +712,36 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         if vendor == "vertiv": 
             cmd = f"connect {t_desc}"
             s.write(cmd)
-            out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->"], timeout=4)
+            
+            # Buoc 1: Cho xem no hoi Pass khong
+            out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->"], timeout=5)
             out += out_tmp
+            
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
                 s.write(v_pass)
-                out += s.read_until(["Type the hot key", "cli->"], timeout=4)
+                # Buoc 2: BAT BUOC cho xac thuc xong, phai thay dong "Type the hot key"
+                out += s.read_until(["Type the hot key", "cli->"], timeout=12)
                 
+            # Buoc 3: session da mo -> Nghi 1s de on dinh, roi go 2 lan Enter
+            time.sleep(1.0)
+            s.write("") 
             time.sleep(0.5)
-            s.write("\r\n\r\n")
-            out += s.read_until(["login:", "Username:", "Password:", ">", "#"], timeout=4)
+            s.write("") 
+            
+            out += s.read_until(["login:", "Username:", "Password:", ">", "#"], timeout=6)
             
         else: 
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
             s.write(cmd)
             time.sleep(float(cfg.get("verify_wait_after_connect", 1.5))) 
-            s.write("\r\n\r\n") 
+            s.write("") 
+            s.write("") 
             out += s.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
         
         try:
             if vendor == "vertiv":
-                s.write_raw(b"\x1a")
+                s.write_raw(b"\x1a") # Gui Ctrl+Z thoat
                 time.sleep(0.5)
                 reset_session()
             else:
@@ -703,6 +751,17 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                     if "[confirm]" in s.read_until(["[confirm]", "#", "No connection"], timeout=2): s.write(""); s.read_until("#", timeout=2)
                 else: reset_session()
         except Exception: reset_session()
+        
+        # Buoc 4: Xoa sach "Bong ma Password" cua Vertiv de tranh Regex nhan nham
+        if vendor == "vertiv":
+            idx = out.rfind("Type the hot key")
+            if idx != -1:
+                idx_nl = out.find("\n", idx)
+                if idx_nl != -1:
+                    out = out[idx_nl:]
+                else:
+                    out = out[idx:]
+                    
         return out
 
     def clear_line_via_oob(t_port, vendor):
@@ -717,9 +776,13 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         except Exception: reset_session(); return False
 
     def extract_hostname(output: str) -> str:
-        output = _ANSI_STRIP_RE.sub('', output)
+        output_clean = _ANSI_STRIP_RE.sub('', output)
+        output_clean = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]', '', output_clean)
+        
         auth_seen = False
-        for line in reversed([l.strip() for l in output.splitlines() if l.strip()]):
+        lines = [l.strip() for l in output_clean.splitlines() if l.strip()]
+        
+        for line in reversed(lines):
             if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->"]) or _CONN_ERR_RE.search(line): 
                 continue
             
@@ -728,6 +791,9 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             
             m_bsd = _HOSTNAME_BSD_RE.search(line)
             if m_bsd: return m_bsd.group(1)
+                
+            m_bsd_new = re.search(r'(?:FreeBSD|Linux|NetBSD|OpenBSD).*?\(([A-Za-z0-9_\-\.]+)\)', line, re.IGNORECASE)
+            if m_bsd_new: return m_bsd_new.group(1)
             
             m_prompt = _HOSTNAME_PROMPT_RE.search(line)
             if m_prompt: 
@@ -735,7 +801,9 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 if h.lower() not in ["cli", "cli-", "access"]: 
                     return h
                     
-            if re.search(r'Username:|Password:|login:', line, re.IGNORECASE): auth_seen = True
+            if re.search(r'Username:|Password:|login:', line, re.IGNORECASE): 
+                auth_seen = True
+                
         return "AUTH_REQUIRED" if auth_seen else None
 
     for key, opt in options.items():
