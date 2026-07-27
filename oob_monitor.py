@@ -110,13 +110,17 @@ def update_ui():
 def log_oob(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     oob_logs.append(f"[dim]\\[{ts}][/] {msg}")
-    # Khong goi update_ui() o day — de Rich Live tu refresh theo refresh_per_second=4
-    # tranh race condition khi nhieu thread ghi log dong thoi (#6)
+    # FIX: update_ui() dung ui_lock nen goi tu nhieu thread van an toan.
+    # Rich Live chi ve lai dung Panel da duoc set trong layout tu lan
+    # update_ui() gan nhat — neu khong goi lai o day, panel se dung yen
+    # o trang thai rong ban dau mai mai du log van duoc append vao deque.
+    update_ui()
 
 def log_verify(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     verify_logs.append(f"[dim]\\[{ts}][/] {msg}")
-    # Khong goi update_ui() o day — de Rich Live tu refresh theo refresh_per_second=4
+    # FIX: xem giai thich o log_oob() phia tren.
+    update_ui()
 
 
 # ---------------------------------------------------------------------------
