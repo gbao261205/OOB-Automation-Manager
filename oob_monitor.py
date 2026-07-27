@@ -1256,13 +1256,17 @@ def run_verify_daemon(cfg):
     time.sleep(15)
 
     while True:
-        hosts = load_ip_list(cfg["ip_list"])
-        if hosts:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                for ip, alias in hosts:
-                    _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-                    if baseline:
-                        executor.submit(_thread_verify_and_push, cfg, alias, ip, baseline)
+        # Bổ sung kiểm tra điều kiện auto_verify tại đây
+        if cfg.get("auto_verify", True):
+            hosts = load_ip_list(cfg["ip_list"])
+            if hosts:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    for ip, alias in hosts:
+                        _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+                        if baseline:
+                            executor.submit(_thread_verify_and_push, cfg, alias, ip, baseline)
+        else:
+            log_verify("[dim][zzz] Tinh nang Verify ngam dang bi TAT trong cau hinh. Dang cho...[/]")
 
         # Doc lai lich moi lan (cho phep nhan thay doi neu cfg duoc cap nhat
         # trong cung tien trinh) roi tinh thoi gian cho toi lan chay tiep theo.
@@ -1430,7 +1434,8 @@ def run_daemon(cfg, config_path=None):
                             _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
                             
                             # Tu dong Verify (Chay Thread de khong dung Daemon)
-                            threading.Thread(target=_thread_verify_and_push, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                            if cfg.get("auto_verify", True):
+                                threading.Thread(target=_thread_verify_and_push, args=(cfg, alias, ip, snapshot), daemon=True).start()
                             
                         else:
                             _con.print("  [dim][--] Het thoi gian hoac tu choi, se hoi lai chu ky sau.[/]")
@@ -1625,7 +1630,8 @@ def scan_specific_devices(cfg):
                 save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
                 _con.print(f"  [green][OK][/] Da luu baseline cho {alias}.")
                 
-                threading.Thread(target=_thread_verify_and_push, args=(cfg, alias, ip, snapshot), daemon=True).start()
+                if cfg.get("auto_verify", True):
+                    threading.Thread(target=_thread_verify_and_push, args=(cfg, alias, ip, snapshot), daemon=True).start()
                 
             else:
                 _con.print("  [dim][--] Bo qua.[/]")
