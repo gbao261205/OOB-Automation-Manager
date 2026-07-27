@@ -324,6 +324,7 @@ def _init_db(path, table):
     if "protocol" not in cols: conn.execute(f"ALTER TABLE {table} ADD COLUMN protocol TEXT DEFAULT 'telnet'")
     if "raw_key" not in cols: conn.execute(f"ALTER TABLE {table} ADD COLUMN raw_key TEXT")
     if "real_menu_name" not in cols: conn.execute(f"ALTER TABLE {table} ADD COLUMN real_menu_name TEXT")
+    if "vendor" not in cols: conn.execute(f"ALTER TABLE {table} ADD COLUMN vendor TEXT DEFAULT 'cisco'")
     conn.commit()
     _DB_INIT_CACHE.add((path, table))
     return conn
@@ -331,12 +332,16 @@ def _init_db(path, table):
 def get_options_by_host(db_path, table, host):
     with db_lock:
         conn = _init_db(db_path, table)
-        rows = conn.execute(f"SELECT menu_name, option_key, device_name, description, target_ip, target_port, protocol, raw_key, real_menu_name FROM {table} WHERE host=?", (host,)).fetchall()
+        rows = conn.execute(f"SELECT menu_name, option_key, device_name, description, target_ip, target_port, protocol, raw_key, real_menu_name, vendor FROM {table} WHERE host=?", (host,)).fetchall()
         conn.close()
     if not rows: return None, None, None
     menu_name, device_name, options = rows[0][0], rows[0][2], {}
-    for _mn, key, _dn, desc, ip, port, proto, raw_key, real_menu_name in rows:
-        options[key] = {"description": desc, "ip": ip, "port": port, "protocol": proto, "_raw_key": raw_key if raw_key else key, "_menu_name": real_menu_name if real_menu_name else _mn}
+    for _mn, key, _dn, desc, ip, port, proto, raw_key, real_menu_name, vendor in rows:
+        options[key] = {
+            "description": desc, "ip": ip, "port": port, "protocol": proto, 
+            "_raw_key": raw_key if raw_key else key, "_menu_name": real_menu_name if real_menu_name else _mn,
+            "vendor": vendor if vendor else "cisco"
+        }
     return menu_name, device_name, options
 
 def get_updated_at_by_host(db_path, table, host):
@@ -353,8 +358,8 @@ def save_options(db_path, table, host, menu_name, device_name, options):
         conn.execute(f"DELETE FROM {table} WHERE host=? AND menu_name=?", (host, menu_name))
         for key, entry in options.items():
             conn.execute(
-                f"INSERT INTO {table} (host, menu_name, option_key, device_name, description, target_ip, target_port, protocol, raw_key, real_menu_name, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (host, menu_name, key, device_name, entry.get("description", ""), entry["ip"], entry.get("port", 23), entry.get("protocol", "telnet"), entry.get("_raw_key", key), entry.get("_menu_name", menu_name), now)
+                f"INSERT INTO {table} (host, menu_name, option_key, device_name, description, target_ip, target_port, protocol, raw_key, real_menu_name, vendor, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (host, menu_name, key, device_name, entry.get("description", ""), entry["ip"], entry.get("port", 23), entry.get("protocol", "telnet"), entry.get("_raw_key", key), entry.get("_menu_name", menu_name), entry.get("vendor", "cisco"), now)
             )
         conn.commit()
         conn.close()
@@ -396,7 +401,7 @@ def print_options(options: dict):
     _con.print(t)
 
 # ---------------------------------------------------------------------------
-# Thu thap Menu
+# Thu thap Menu (Cisco & Vertiv)
 # ---------------------------------------------------------------------------
 MENU_NAME_RE = re.compile(r'^\s*menu\s+(\S+)\s+(?:text|command)\b', re.IGNORECASE | re.MULTILINE)
 TEXT_RE       = re.compile(r'^\s*menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', re.IGNORECASE)
@@ -411,38 +416,90 @@ def poll_host_multi(ip, cfg, timeout=10):
         try:
             tn = connect_auto(ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), c["username"], c["password"], c["enable_password"], timeout=timeout)
             try:
-                hostname = fetch_hostname(tn)
-                tn.write("terminal length 0"); tn.read_until("#", timeout=5)
-                tn.write("show running-config | include menu")
-                raw = tn.read_until_prompt(timeout=15)
-                if tn.last_read_timed_out and not raw.strip(): return hostname, None, {}, "fetch_failed"
+                # Kiem tra Vertiv/Cisco bang cach gui enter lay prompt
+                tn.write("\r\n")
+                initial_prompt = tn.read_until(["#", ">", "cli->"], timeout=5)
 
-                detected_names = list(set(MENU_NAME_RE.findall(raw)))
-                if menu_name_override:
-                    if menu_name_override not in detected_names: raise ValueError(f"Ten menu ep dung khong co tren thiet bi.")
-                    menu_names = [menu_name_override]
-                else: menu_names = detected_names
+                if "cli->" in initial_prompt:
+                    # ==========================================
+                    # VERTIV ACS LOGIC
+                    # ==========================================
+                    tn.write("cd access/")
+                    tn.read_until("cli->", timeout=5)
+                    tn.write("show")
+                    raw = tn.read_until("cli->", timeout=15)
 
-                if not menu_names: return hostname, None, {}, "fetch_failed" if tn.last_read_timed_out else "no_menu"
-                    
-                all_texts, all_commands = {}, {}
-                for r_line in raw.splitlines():
-                    line = r_line.strip()
-                    m_t = TEXT_RE.match(line)
-                    if m_t and m_t.group(1) in menu_names: all_texts[(m_t.group(1), m_t.group(2).strip())] = m_t.group(3).strip(); continue
-                    m_c = CMD_TELNET_RE.match(line)
-                    if m_c and m_c.group(1) in menu_names: all_commands[(m_c.group(1), m_c.group(2).strip())] = {"ip": m_c.group(3), "port": int(m_c.group(4)) if m_c.group(4) else 23, "protocol": "telnet"}; continue
-                    m_s = CMD_SSH_RE.match(line)
-                    if m_s and m_s.group(1) in menu_names: all_commands[(m_s.group(1), m_s.group(2).strip())] = {"ip": m_s.group(3), "port": int(m_s.group(4)) if m_s.group(4) else 22, "protocol": "ssh"}
+                    if tn.last_read_timed_out and not raw.strip():
+                        return None, None, {}, "fetch_failed"
 
-                final_options = {}
-                for (m_name, cmd_k), cmd_data in all_commands.items():
-                    if (m_name, f"[{cmd_k}]") in all_texts: real_key, desc = f"[{cmd_k}]", all_texts[(m_name, f"[{cmd_k}]")]
-                    elif (m_name, cmd_k) in all_texts: real_key, desc = cmd_k, all_texts[(m_name, cmd_k)]
-                    else: real_key, desc = cmd_k, ""
-                    display_key = real_key[1:-1] if real_key.startswith("[") and real_key.endswith("]") else real_key
-                    final_options[f"{m_name} [{display_key}]" if len(menu_names) > 1 else display_key] = {"description": desc, "ip": cmd_data["ip"], "port": cmd_data["port"], "protocol": cmd_data["protocol"], "_raw_key": real_key, "_menu_name": m_name}
-                return hostname, " + ".join(sorted(menu_names)), final_options, "ok"
+                    final_options = {}
+                    hostname = None
+
+                    lines = raw.splitlines()
+                    for i, line in enumerate(lines):
+                        line = line.strip()
+                        # Tim Hostname Vertiv (Dong duoi dau gach ==========)
+                        if line.startswith("===") and i + 1 < len(lines):
+                            potential_host = lines[i+1].strip()
+                            if potential_host and " " not in potential_host:
+                                hostname = potential_host
+
+                        # Parse Port (name port serial idle)
+                        m = re.match(r'^(\S+)\s+(\d+)\s+serial\s+', line, re.IGNORECASE)
+                        if m:
+                            desc, port_str = m.group(1), m.group(2)
+                            key = str(port_str)
+                            final_options[key] = {
+                                "description": desc,
+                                "ip": ip,
+                                "port": int(port_str),
+                                "protocol": "serial",
+                                "_raw_key": key,
+                                "_menu_name": "access",
+                                "vendor": "vertiv"
+                            }
+
+                    if not final_options:
+                        return hostname, None, {}, "no_menu"
+
+                    return hostname, "Vertiv ACS", final_options, "ok"
+
+                else:
+                    # ==========================================
+                    # CISCO LOGIC
+                    # ==========================================
+                    hostname = fetch_hostname(tn)
+                    tn.write("terminal length 0"); tn.read_until("#", timeout=5)
+                    tn.write("show running-config | include menu")
+                    raw = tn.read_until_prompt(timeout=15)
+                    if tn.last_read_timed_out and not raw.strip(): return hostname, None, {}, "fetch_failed"
+
+                    detected_names = list(set(MENU_NAME_RE.findall(raw)))
+                    if menu_name_override:
+                        if menu_name_override not in detected_names: raise ValueError(f"Ten menu ep dung khong co tren thiet bi.")
+                        menu_names = [menu_name_override]
+                    else: menu_names = detected_names
+
+                    if not menu_names: return hostname, None, {}, "fetch_failed" if tn.last_read_timed_out else "no_menu"
+                        
+                    all_texts, all_commands = {}, {}
+                    for r_line in raw.splitlines():
+                        line = r_line.strip()
+                        m_t = TEXT_RE.match(line)
+                        if m_t and m_t.group(1) in menu_names: all_texts[(m_t.group(1), m_t.group(2).strip())] = m_t.group(3).strip(); continue
+                        m_c = CMD_TELNET_RE.match(line)
+                        if m_c and m_c.group(1) in menu_names: all_commands[(m_c.group(1), m_c.group(2).strip())] = {"ip": m_c.group(3), "port": int(m_c.group(4)) if m_c.group(4) else 23, "protocol": "telnet"}; continue
+                        m_s = CMD_SSH_RE.match(line)
+                        if m_s and m_s.group(1) in menu_names: all_commands[(m_s.group(1), m_s.group(2).strip())] = {"ip": m_s.group(3), "port": int(m_s.group(4)) if m_s.group(4) else 22, "protocol": "ssh"}
+
+                    final_options = {}
+                    for (m_name, cmd_k), cmd_data in all_commands.items():
+                        if (m_name, f"[{cmd_k}]") in all_texts: real_key, desc = f"[{cmd_k}]", all_texts[(m_name, f"[{cmd_k}]")]
+                        elif (m_name, cmd_k) in all_texts: real_key, desc = cmd_k, all_texts[(m_name, cmd_k)]
+                        else: real_key, desc = cmd_k, ""
+                        display_key = real_key[1:-1] if real_key.startswith("[") and real_key.endswith("]") else real_key
+                        final_options[f"{m_name} [{display_key}]" if len(menu_names) > 1 else display_key] = {"description": desc, "ip": cmd_data["ip"], "port": cmd_data["port"], "protocol": cmd_data["protocol"], "_raw_key": real_key, "_menu_name": m_name, "vendor": "cisco"}
+                    return hostname, " + ".join(sorted(menu_names)), final_options, "ok"
             finally:
                 try: tn.write("exit")
                 except OSError: pass
@@ -459,7 +516,6 @@ def _build_verify_report(alias, oob_ip, own_hostname, results):
     for r in results: counts[r["status"]] = counts.get(r["status"], 0) + 1
     summary = "   ".join(f"{s}: {counts.get(s, 0)}" for s in ("CANH BAO", "KHONG PIVOT", "TIMEOUT", "YEU CAU DANG NHAP", "OK") if counts.get(s, 0)) or "Khong co opt"
     
-    # Su dung ky tu ASCII cho bang bao cao de khong bi loi text
     def fmt_row(cols, widths): return "| " + " | ".join(cols[i].ljust(widths[i]) for i in range(len(cols))) + " |"
     def fmt_sep(widths): return "+" + "+".join("-" * (w + 2) for w in widths) + "+"
     
@@ -491,7 +547,15 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     for c in creds:
         try:
             tn = connect_auto(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], timeout=6)
-            own_hostname = fetch_hostname(tn); tn.close(); working_cred = c; break
+            # Thue de lay hostname Vertiv/Cisco o verify
+            tn.write("\r\n")
+            prmpt = tn.read_until(["#", ">", "cli->"], timeout=3)
+            if "cli->" in prmpt:
+                m_h = re.search(r'Welcome to [^<]+<([^>]+)>', prmpt)
+                own_hostname = m_h.group(1) if m_h else None
+            else:
+                own_hostname = fetch_hostname(tn)
+            tn.close(); working_cred = c; break
         except Exception: pass
     own_hostname_clean = (own_hostname or "").strip().lower()
 
@@ -508,23 +572,33 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         if session: session.close()
         session = None
 
-    def check_port_via_oob(t_ip, t_port, proto):
+    def check_port_via_oob(t_ip, t_port, proto, vendor):
         try: s = get_session()
         except Exception: raise RuntimeError("Khong the ket noi toi OOB")
-        s.write(f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}")
+        
+        if vendor == "vertiv": cmd = f"connect serial {t_port}"
+        else: cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
+        
+        s.write(cmd)
         time.sleep(float(cfg.get("verify_wait_after_connect", 1.5))) 
         s.write("\r\n\r\n") 
         out = s.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
         try:
-            s.write_raw(b"\x1ex")
-            if "#" in s.read_until("#", timeout=2) or "#" in out:
-                s.write("disconnect")
-                if "[confirm]" in s.read_until(["[confirm]", "#", "No connection"], timeout=2): s.write(""); s.read_until("#", timeout=2)
-            else: reset_session()
+            if vendor == "vertiv":
+                # Ep ngat ket noi Serial Vertiv that sach
+                s.write_raw(b"\x1a\r\n~.\r\n")
+                reset_session()
+            else:
+                s.write_raw(b"\x1ex")
+                if "#" in s.read_until("#", timeout=2) or "#" in out:
+                    s.write("disconnect")
+                    if "[confirm]" in s.read_until(["[confirm]", "#", "No connection"], timeout=2): s.write(""); s.read_until("#", timeout=2)
+                else: reset_session()
         except Exception: reset_session()
         return out
 
-    def clear_line_via_oob(t_port):
+    def clear_line_via_oob(t_port, vendor):
+        if vendor == "vertiv": return False # Chua ho tro clear tren Vertiv
         line_num = t_port - 2000
         if line_num <= 0: return False
         try:
@@ -548,22 +622,22 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         if time.time() > _verify_deadline: print_fn(f"[yellow][!][/] {alias}: Vuot timeout. Bo qua phan con lai."); break
         desc = opt.get("description", "")
         if not desc: continue
-        target_ip, port, proto = opt.get("ip"), opt.get("port", 23), opt.get("protocol", "telnet")
+        target_ip, port, proto, vendor = opt.get("ip"), opt.get("port", 23), opt.get("protocol", "telnet"), opt.get("vendor", "cisco")
         act_host, note_parts = None, []
 
-        try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto))
+        try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor))
         except Exception: pass
             
         if not act_host:
-            if port > 2000:
+            if port > 2000 and vendor != "vertiv":
                 print_fn(f"[yellow][!][/] {alias} (Opt {key}): Dang clear line {port - 2000}...")
                 note_parts.append(f"Da thu clear line {port - 2000}")
-                if clear_line_via_oob(port):
+                if clear_line_via_oob(port, vendor):
                     time.sleep(2) 
-                    try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto))
+                    try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor))
                     except Exception: pass
                 else: note_parts.append("Khong clear duoc line")
-            else: note_parts.append("Port la Direct Access, bo qua clear line")
+            else: note_parts.append("Port la Direct/Vertiv, bo qua clear line")
 
         note = "; ".join(note_parts)
         if not act_host:
@@ -689,6 +763,14 @@ def manual_push_devices(cfg):
         _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if not baseline:
             _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh (Option 7) truoc!")
+            continue
+            
+        # Kiem tra neu la Vertiv thi hoan toan cam PUSH
+        vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
+        if vendor == "vertiv":
+            _con.print(f"  [yellow][!][/] Thiet bi {alias} la Vertiv. Tinh nang Push Config chua duoc ho tro cho hang nay!")
+            # Van Verify de hien thi loi cho user biet, nhung khong thuc hien Push
+            run_deep_verify(cfg, alias, ip, baseline, cli_print)
             continue
             
         results = run_deep_verify(cfg, alias, ip, baseline, cli_print)
