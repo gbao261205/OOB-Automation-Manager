@@ -221,6 +221,64 @@ def _describe_scan_schedule(cfg):
     if mode == "weekly": return f"Hang tuan vao {_WEEKDAY_LABELS.get((cfg.get('scan_schedule_weekday', 'mon') or 'mon').strip().lower()[:3], 'mon')} luc {cfg.get('scan_schedule_time', '01:00')}"
     return f"Lap lai moi {cfg.get('interval', 30)}s"
 
+def _edit_verify_schedule(cfg):
+    _con.print(f"\n  --- Lich chay Deep Verify tu dong ---")
+    _con.print(f"  Hien tai: {_describe_verify_schedule(cfg)}")
+    _con.print("  1. Lap lai theo chu ky (interval)")
+    _con.print("  2. Hang ngay, vao 1 gio co dinh")
+    _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    if mode_choice == "1":
+        cfg["verify_schedule_mode"] = "interval"
+        _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
+    elif mode_choice == "2":
+        cfg["verify_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: Hang ngay luc {cfg.get('verify_schedule_time', '01:00')}.")
+    elif mode_choice == "3":
+        cfg["verify_schedule_mode"] = "weekly"
+        wd_val = _con.input(f"  [cyan]Thu (mon/tue/wed/thu/fri/sat/sun)[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP: cfg["verify_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_verify_schedule(cfg)}.")
+    else:
+        _con.print("  [yellow][!][/] Lua chon khong hop le.")
+
+def _edit_scan_schedule(cfg):
+    _con.print(f"\n  --- Lich chay Thu thap cau hinh ---")
+    _con.print(f"  Hien tai: {_describe_scan_schedule(cfg)}")
+    _con.print("  1. Lap lai theo chu ky (interval)")
+    _con.print("  2. Hang ngay, vao 1 gio co dinh")
+    _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    if mode_choice == "1":
+        cfg["scan_schedule_mode"] = "interval"
+        _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
+    elif mode_choice == "2":
+        cfg["scan_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: Hang ngay luc {cfg.get('scan_schedule_time', '01:00')}.")
+    elif mode_choice == "3":
+        cfg["scan_schedule_mode"] = "weekly"
+        wd_val = _con.input(f"  [cyan]Thu (mon/tue/wed/thu/fri/sat/sun)[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP: cfg["scan_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_scan_schedule(cfg)}.")
+    else:
+        _con.print("  [yellow][!][/] Lua chon khong hop le.")
+
 def settings_menu(cfg, config_path):
     while True:
         v_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("verify_schedule_mode", "interval") in ("daily", "weekly") else "[dim green]<- Dang co hieu luc[/]"
@@ -588,11 +646,18 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
 
     results = [] 
     session = None
-    def get_session():
+
+    def get_session(vendor):
         nonlocal session
         if session is None:
             session = connect_auto(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], working_cred["username"], working_cred["password"], working_cred["enable_password"], timeout=8)
-            session.write("terminal length 0"); session.read_until("#", timeout=2)
+            # FIX DEEP VERIFY CHO VERTIV (CHUI VAO FOLDER ACCESS)
+            if vendor == "vertiv":
+                session.write("cd access/")
+                session.read_until("cli->", timeout=3)
+            else:
+                session.write("terminal length 0")
+                session.read_until("#", timeout=2)
         return session
         
     def reset_session():
@@ -601,24 +666,20 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         session = None
 
     def check_port_via_oob(t_ip, t_port, proto, vendor, t_desc):
-        try: s = get_session()
+        try: s = get_session(vendor)
         except Exception: raise RuntimeError("Khong the ket noi toi OOB")
         
         out = ""
         if vendor == "vertiv": 
-            # Vertiv: dung lenh connect ten_alias
             cmd = f"connect {t_desc}"
             s.write(cmd)
-            # Cho prompt doi password hoac hotkey
             out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->"], timeout=4)
             out += out_tmp
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
                 s.write(v_pass)
-                # Cho sau khi nhap pass se hien dong hotkey
                 out += s.read_until(["Type the hot key", "cli->"], timeout=4)
                 
-            # ?? th?y d?ng hotkey -> G?i 2 l?n Enter ?? thi?t b? ??ch nh? Prompt
             time.sleep(0.5)
             s.write("\r\n\r\n")
             out += s.read_until(["login:", "Username:", "Password:", ">", "#"], timeout=4)
@@ -632,7 +693,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         
         try:
             if vendor == "vertiv":
-                # Gui Ctrl+Z de suspend session console, sau do reset
                 s.write_raw(b"\x1a")
                 time.sleep(0.5)
                 reset_session()
@@ -650,7 +710,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         line_num = t_port - 2000
         if line_num <= 0: return False
         try:
-            s = get_session()
+            s = get_session(vendor)
             s.write(f"clear line {line_num}")
             if "[confirm]" in s.read_until(["[confirm]", "#"], timeout=3): s.write(""); s.read_until("#", timeout=3)
             return True
@@ -660,7 +720,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         output = _ANSI_STRIP_RE.sub('', output)
         auth_seen = False
         for line in reversed([l.strip() for l in output.splitlines() if l.strip()]):
-            # Bo qua hoan toan cac log he thong cua OOB hoac Vertiv
             if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->"]) or _CONN_ERR_RE.search(line): 
                 continue
             
@@ -673,7 +732,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             m_prompt = _HOSTNAME_PROMPT_RE.search(line)
             if m_prompt: 
                 h = m_prompt.group(1)
-                # Chan truong hop nham log "cli->" hoac "access" cua Vertiv
                 if h.lower() not in ["cli", "cli-", "access"]: 
                     return h
                     
