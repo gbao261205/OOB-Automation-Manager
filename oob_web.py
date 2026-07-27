@@ -1,567 +1,1147 @@
-import sqlite3
-import json
-import os
-import threading
-from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify
+"""
+oob_web.py - Web Panel v2.0 cho OOB Network Manager
+Chay: python oob_web.py   |   Mo trinh duyet: http://127.0.0.1:5000
+"""
 
-# Import thang cac ham loi tu tool CLI
+import json, os, queue, sqlite3, threading, time
+from datetime import datetime
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 import oob_monitor
 
 app = Flask(__name__)
 
-# --- CAC HAM TIEN ICH ---
-def get_ips():
-    return oob_monitor.load_ip_list_cached(oob_monitor.CONFIG_FILE_DEFAULT.replace("json", "txt").replace("oob_config", "oob_ips"))
+# --- SSE ---
+_sse_clients = []
+_sse_lock = threading.Lock()
 
-def query_db(query, args=(), fetchall=True):
-    if not os.path.exists(oob_monitor.DEFAULT_CONFIG["baseline_db"]): return []
+def _sse_broadcast(data):
+    import json as _j
+    msg = "data: " + _j.dumps(data, ensure_ascii=False) + "\n\n"
+    with _sse_lock:
+        dead = []
+        for q in _sse_clients:
+            try: q.put_nowait(msg)
+            except queue.Full: dead.append(q)
+        for q in dead: _sse_clients.remove(q)
+
+def _make_print_fn(task_id, ip=None):
+    import re
+    _re = re.compile(r"\[/?[^\[\]]*\]")
+    def _fn(msg):
+        clean = _re.sub("", str(msg)).strip()
+        _sse_broadcast({"type":"log","task":task_id,"ip":ip,"msg":clean,"ts":datetime.now().strftime("%H:%M:%S")})
+    return _fn
+
+# --- Task Manager ---
+_tasks = {}
+_tasks_lock = threading.Lock()
+
+def _new_task(tid):
+    with _tasks_lock: _tasks[tid] = {"status":"running","started":time.time()}
+
+def _finish_task(tid, error=None):
+    with _tasks_lock:
+        _tasks[tid] = {
+            "status": "error" if error else "done",
+            "started": _tasks.get(tid, {}).get("started", 0),
+            "finished": time.time(),
+            "error": str(error) if error else None
+        }
+    _sse_broadcast({"type":"task_done","task":tid,"status":"error" if error else "done"})
+
+def _cfg(): return oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+
+def _query_bl(q, args=(), all_rows=True):
+    db = _cfg().get("baseline_db","baseline.db")
+    if not os.path.exists(db): return [] if all_rows else None
     try:
-        conn = sqlite3.connect(oob_monitor.DEFAULT_CONFIG["baseline_db"])
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(query, args)
-        rv = cur.fetchall() if fetchall else cur.fetchone()
-        conn.close()
-        return rv
-    except Exception: return []
+        conn = sqlite3.connect(db); conn.row_factory = sqlite3.Row
+        cur = conn.cursor(); cur.execute(q, args)
+        rv = cur.fetchall() if all_rows else cur.fetchone(); conn.close(); return rv
+    except: return [] if all_rows else None
 
-# --- CAC TIEN TRINH CHAY NGAM (Tranh treo Web) ---
-def _web_print(msg): 
-    pass # An log CLI de Web khong bi rac
+# --- Background runners ---
+def _run_scan(tid, target_ip=None):
+    try:
+        cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+        if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+        pfn = _make_print_fn(tid, target_ip)
+        pfn("Bat dau SCAN " + str(len(hosts)) + " thiet bi...")
+        for ip, alias in hosts:
+            pfn("  [PING] " + alias + " (" + ip + ")")
+            alive = oob_monitor.ping_host(ip)
+            oob_monitor.save_device_status(ip, alias=alias, ping=alive)
+            if not alive: pfn("  [!] " + alias + ": Khong ping duoc."); continue
+            pfn("  [SCAN] " + alias + " (" + ip + ")")
+            try: hn, mn, snap, ms = oob_monitor.poll_host_multi(ip, cfg, timeout=10)
+            except Exception as e:
+                oob_monitor.save_device_status(ip, alias=alias, menu_state="conn_failed")
+                pfn("  [LOI] " + str(e)); continue
+            oob_monitor.save_device_status(ip, alias=alias, menu_state=ms)
+            if ms in ["fetch_failed","no_menu"] or not snap: pfn("  [!] " + alias + ": Khong co menu."); continue
+            oob_monitor.save_options(cfg["snapshot_db"],"snapshot_menu",ip,mn,hn,snap)
+            _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+            if bl is None or not oob_monitor.options_equal(bl, snap):
+                oob_monitor.save_options(cfg["baseline_db"],"baseline_menu",ip,mn,hn,snap)
+                oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB")
+                pfn("  [OK] " + alias + ": Cap nhat baseline (" + str(len(snap)) + " option).")
+            else: pfn("  [OK] " + alias + ": Khop baseline.")
+        pfn("[OK] Hoan thanh SCAN!"); _finish_task(tid)
+    except Exception as e: _finish_task(tid, e)
 
-def bg_task_scan(target_ip=None):
-    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
-    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
-    if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+def _run_verify(tid, target_ip=None):
+    try:
+        cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+        if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+        pfn = _make_print_fn(tid, target_ip)
+        pfn("Bat dau VERIFY " + str(len(hosts)) + " thiet bi...")
+        for ip, alias in hosts:
+            _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+            if not bl: pfn("  [!] " + alias + ": Chua co baseline."); continue
+            pfn("  [VERIFY] " + alias + " (" + ip + ")")
+            oob_monitor.run_deep_verify(cfg, alias, ip, bl, print_fn=pfn)
+        pfn("[OK] Hoan thanh VERIFY!"); _finish_task(tid)
+    except Exception as e: _finish_task(tid, e)
 
-    for ip, alias in hosts:
-        alive = oob_monitor.ping_host(ip)
-        oob_monitor.save_device_status(ip, alias=alias, ping=alive)
-        if not alive: continue
+def _run_push(tid, target_ip=None):
+    try:
+        cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+        if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
+        pfn = _make_print_fn(tid, target_ip)
+        pfn("Bat dau PUSH " + str(len(hosts)) + " thiet bi...")
+        for ip, alias in hosts:
+            _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+            if not bl: continue
+            vendor = next(iter(bl.values())).get("vendor","cisco") if bl else "cisco"
+            if vendor == "vertiv": pfn("  [!] " + alias + ": Vertiv khong ho tro Push."); continue
+            results = oob_monitor.run_deep_verify(cfg, alias, ip, bl, print_fn=pfn)
+            if any(r["status"]=="CANH BAO" for r in results):
+                oob_monitor.process_push_and_reverify(cfg, alias, ip, bl, results, print_fn=pfn)
+            else: pfn("  [OK] " + alias + ": Khong co sai lech.")
+        pfn("[OK] Hoan thanh PUSH!"); _finish_task(tid)
+    except Exception as e: _finish_task(tid, e)
 
-        try: hostname, menu_name, snapshot, menu_state = oob_monitor.poll_host_multi(ip, cfg, timeout=10)
-        except Exception: oob_monitor.save_device_status(ip, alias=alias, menu_state="conn_failed"); continue
+# --- API ---
+@app.route("/api/events")
+def api_events():
+    q = queue.Queue(maxsize=100)
+    with _sse_lock: _sse_clients.append(q)
+    def gen():
+        try:
+            yield 'data: {"type":"connected"}\n\n'
+            while True:
+                try: yield q.get(timeout=25)
+                except queue.Empty: yield ": hb\n\n"
+        except GeneratorExit:
+            with _sse_lock:
+                if q in _sse_clients: _sse_clients.remove(q)
+    return Response(gen(), mimetype="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-        oob_monitor.save_device_status(ip, alias=alias, menu_state=menu_state)
-        if menu_state in ["fetch_failed", "no_menu"] or not snapshot: continue
+@app.route("/api/stats")
+def api_stats():
+    cfg = _cfg(); ips = oob_monitor.load_ip_list(cfg["ip_list"])
+    ds = oob_monitor.load_device_status()
+    stats = {"total":len(ips),"online":0,"offline":0,"has_baseline":0,"alarms":0}
+    for ip,_ in ips:
+        st = ds.get(ip,{})
+        if st.get("ping") is True: stats["online"] += 1
+        elif st.get("ping") is False: stats["offline"] += 1
+        r = _query_bl("SELECT COUNT(*) as c FROM baseline_menu WHERE host=?",(ip,),all_rows=False)
+        if r and r["c"] > 0: stats["has_baseline"] += 1
+    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0)
+    for v in vst.values():
+        if v.get("status") == "CANH BAO": stats["alarms"] += 1
+    return jsonify(stats)
 
-        oob_monitor.save_options(cfg["snapshot_db"], "snapshot_menu", ip, menu_name, hostname, snapshot)
-        _mn, _dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+@app.route("/api/devices")
+def api_devices():
+    cfg = _cfg(); ips = oob_monitor.load_ip_list(cfg["ip_list"])
+    ds = oob_monitor.load_device_status()
+    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*7)
+    devs = []
+    for ip, alias in ips:
+        st = ds.get(ip,{})
+        r = _query_bl("SELECT COUNT(*) as c FROM baseline_menu WHERE host=?",(ip,),all_rows=False)
+        opt_count = r["c"] if r else 0
+        alarm_c = sum(1 for (a,k),v in vst.items() if a==alias and v.get("status")=="CANH BAO")
+        ok_c = sum(1 for (a,k),v in vst.items() if a==alias and v.get("status")=="OK")
+        mn, dn, _ = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+        upd = oob_monitor.get_updated_at_by_host(cfg["baseline_db"],"baseline_menu",ip)
+        devs.append({"ip":ip,"alias":alias,"ping":st.get("ping"),"menu_state":st.get("menu_state"),
+            "checked_at":st.get("checked_at","-"),"opt_count":opt_count,
+            "device_name":dn or "","menu_name":mn or "","updated_at":upd or "",
+            "alarm_count":alarm_c,"ok_count":ok_c})
+    return jsonify(devs)
 
-        if baseline is None or not oob_monitor.options_equal(baseline, snapshot):
-            oob_monitor.save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
-            oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB")
+@app.route("/api/device/<ip>/options")
+def api_device_options(ip):
+    cfg = _cfg(); vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*7)
+    mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+    if not bl: return jsonify({"device_name":dn,"menu_name":mn,"options":[]})
+    all_ips = oob_monitor.load_ip_list(cfg["ip_list"])
+    alias = next((a for i,a in all_ips if i==ip), ip)
+    opts = []
+    for key in sorted(bl.keys()):
+        o = bl[key]; vr = vst.get((alias,key))
+        opts.append({"key":key,"description":o.get("description",""),"ip":o.get("ip",""),
+            "port":o.get("port",23),"protocol":o.get("protocol","telnet"),"vendor":o.get("vendor","cisco"),
+            "verify_status":vr["status"] if vr else None,"act_host":vr.get("act_host") if vr else None})
+    return jsonify({"device_name":dn,"menu_name":mn,"alias":alias,"options":opts})
 
-def bg_task_verify(target_ip=None):
-    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
-    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
-    if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
-
-    for ip, alias in hosts:
-        _mn, _dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-        if baseline: oob_monitor.run_deep_verify(cfg, alias, ip, baseline, print_fn=_web_print)
-
-def bg_task_push(target_ip=None):
-    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
-    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
-    if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
-
-    for ip, alias in hosts:
-        _mn, _dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-        if not baseline: continue
-        
-        vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
-        if vendor == "vertiv": continue # Vertiv chua ho tro Push
-        
-        results = oob_monitor.run_deep_verify(cfg, alias, ip, baseline, print_fn=_web_print)
-        if any(r["status"] == "CANH BAO" for r in results):
-            oob_monitor.process_push_and_reverify(cfg, alias, ip, baseline, results, print_fn=_web_print)
-
-
-# --- API ENDPOINTS ---
-@app.route("/api/config", methods=["GET", "POST"])
+@app.route("/api/config", methods=["GET","POST"])
 def api_config():
     if request.method == "GET":
-        return jsonify(oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT))
-    else:
-        cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
-        cfg.update(request.json)
-        oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
-        return jsonify({"status": "success"})
-
-@app.route("/api/device", methods=["POST", "DELETE"])
-def api_device():
+        return jsonify({k:v for k,v in oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT).items() if k!="credentials"})
     cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    allowed = ["username","password","enable_password","vertiv_connect_password",
+               "menu_name_override","ssh_port","telnet_port","interval","verify_interval",
+               "ip_list","baseline_db","snapshot_db","auto_verify","verify_schedule_mode",
+               "verify_schedule_time","verify_schedule_weekday","scan_schedule_mode",
+               "scan_schedule_time","scan_schedule_weekday","verify_wait_after_connect","max_verify_duration"]
+    for k in allowed:
+        if k in (request.json or {}): cfg[k] = request.json[k]
+    oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+    return jsonify({"status":"ok"})
+
+@app.route("/api/credentials", methods=["GET","POST","DELETE"])
+def api_creds():
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT); creds = cfg.get("credentials",[])
+    if request.method == "GET":
+        return jsonify([{"username":c.get("username",""),"has_pass":bool(c.get("password")),"has_enable":bool(c.get("enable_password"))} for c in creds])
     if request.method == "POST":
-        data = request.json
-        oob_monitor.add_ip(cfg["ip_list"], data["ip"], data.get("alias"))
-        return jsonify({"status": "success"})
-    else:
-        ip = request.json.get("ip")
-        oob_monitor.remove_ip(cfg["ip_list"], ip)
-        return jsonify({"status": "success"})
+        d = request.json or {}
+        creds.append({"username":d.get("username",""),"password":d.get("password",""),"enable_password":d.get("enable_password","")})
+        cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+        return jsonify({"status":"ok"})
+    idx = (request.json or {}).get("index",-1)
+    if 0 <= idx < len(creds): creds.pop(idx)
+    cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+    return jsonify({"status":"ok"})
+
+@app.route("/api/device", methods=["POST","DELETE"])
+def api_device():
+    cfg = _cfg()
+    if request.method == "POST":
+        d = request.json or {}; ip = d.get("ip","").strip(); alias = d.get("alias","").strip() or None
+        if not ip: return jsonify({"status":"error"}),400
+        oob_monitor.add_ip(cfg["ip_list"],ip,alias); return jsonify({"status":"ok"})
+    ip = (request.json or {}).get("ip","").strip()
+    oob_monitor.remove_ip(cfg["ip_list"],ip); return jsonify({"status":"ok"})
 
 @app.route("/api/action", methods=["POST"])
 def api_action():
-    action = request.json.get("action")
-    target_ip = request.json.get("ip") 
-    
-    if action == "scan":
-        threading.Thread(target=bg_task_scan, args=(target_ip,)).start()
-    elif action == "verify":
-        threading.Thread(target=bg_task_verify, args=(target_ip,)).start()
-    elif action == "push":
-        threading.Thread(target=bg_task_push, args=(target_ip,)).start()
-        
-    return jsonify({"status": "success", "msg": f"Da dua lenh {action.upper()} vao chay ngam!"})
+    d = request.json or {}; action = d.get("action"); tip = d.get("ip") or None
+    tid = action + "_" + (tip or "all") + "_" + str(int(time.time()))
+    _new_task(tid)
+    runners = {"scan":_run_scan,"verify":_run_verify,"push":_run_push}
+    if action not in runners: return jsonify({"status":"error"}),400
+    threading.Thread(target=runners[action], args=(tid,tip), daemon=True).start()
+    return jsonify({"status":"ok","task_id":tid,"msg":"Da dua lenh " + action.upper() + " vao hang doi!"})
+
+@app.route("/api/tasks")
+def api_tasks():
+    with _tasks_lock: return jsonify(dict(_tasks))
 
 @app.route("/api/search")
 def api_search():
-    query = request.args.get("q", "").strip().lower()
+    query = request.args.get("q","").strip().lower()
     if not query: return jsonify([])
-
-    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
-    hosts = oob_monitor.load_ip_list(cfg["ip_list"])
-    verify_st = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0 * 30)
-
+    cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
     found = []
     for ip, alias in hosts:
-        _mn, dn, source = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-        if source is None: _mn, dn, source = oob_monitor.get_options_by_host(cfg["snapshot_db"], "snapshot_menu", ip)
+        _mn,dn,source = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+        if source is None: _mn,dn,source = oob_monitor.get_options_by_host(cfg["snapshot_db"],"snapshot_menu",ip)
         if not source: continue
         dn = dn or alias
-        
         for key, entry in source.items():
-            act_host = verify_st.get((alias, key), {}).get("act_host", "") or ""
-            score = 0
-            
-            if query == act_host.lower(): score = 100
-            elif query in act_host.lower(): score = 90
-            elif query == alias.lower() or query == ip: score = 85
-            elif query == dn.lower(): score = 80
-            elif query in alias.lower() or query in dn.lower(): score = 75
-            elif query in entry.get("description", "").lower(): score = 60
-            elif query in entry.get("ip", "").lower(): score = 50
-            elif query == key.lower(): score = 40
-            
-            if score > 0:
-                found.append({
-                    "score": score,
-                    "oob_ip": ip,
-                    "oob_alias": alias,
-                    "oob_host": dn,
-                    "opt_key": key,
-                    "desc": entry.get("description", ""),
-                    "target_ip": entry.get("ip", ""),
-                    "target_port": entry.get("port", 23),
-                    "protocol": entry.get("protocol", "telnet"),
-                    "act_host": act_host
-                })
-    
-    found.sort(key=lambda x: x["score"], reverse=True)
-    return jsonify(found)
+            ah = vst.get((alias,key),{}).get("act_host","") or ""
+            sc = 0
+            if query==ah.lower(): sc=100
+            elif query in ah.lower(): sc=90
+            elif query==alias.lower() or query==ip: sc=85
+            elif query==dn.lower(): sc=80
+            elif query in alias.lower() or query in dn.lower(): sc=75
+            elif query in entry.get("description","").lower(): sc=60
+            elif query in entry.get("ip","").lower(): sc=50
+            elif query==key.lower(): sc=40
+            if sc>0:
+                found.append({"score":sc,"oob_ip":ip,"oob_alias":alias,"oob_host":dn,
+                    "opt_key":key,"desc":entry.get("description",""),"target_ip":entry.get("ip",""),
+                    "target_port":entry.get("port",23),"protocol":entry.get("protocol","telnet"),
+                    "act_host":ah,"verify_status":vst.get((alias,key),{}).get("status")})
+    found.sort(key=lambda x:x["score"],reverse=True)
+    return jsonify(found[:100])
+
+@app.route("/api/logs")
+def api_logs():
+    d = "verify-logs"
+    if not os.path.exists(d): return jsonify([])
+    files = [{"name":f,"size":os.path.getsize(os.path.join(d,f)),
+              "mtime":datetime.fromtimestamp(os.path.getmtime(os.path.join(d,f))).strftime("%Y-%m-%d %H:%M:%S")}
+             for f in sorted(os.listdir(d),reverse=True) if f.endswith(".log")]
+    return jsonify(files[:50])
+
+@app.route("/api/logs/<path:fn>")
+def api_log_content(fn):
+    fp = os.path.join("verify-logs", os.path.basename(fn))
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}),404
+    try:
+        with open(fp,"r",encoding="utf-8") as f: return jsonify({"content":f.read()})
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+@app.route("/api/export/excel")
+def api_export_excel():
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError: return jsonify({"error":"Thieu openpyxl. pip install openpyxl"}),500
+    cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    vst = oob_monitor._parse_verify_logs_for_status(); ds = oob_monitor.load_device_status()
+    def mk_fill(c): return PatternFill(fill_type="solid",fgColor=c)
+    def mk_bdr():
+        s = Side(style="thin",color="BFBFBF"); return Border(left=s,right=s,top=s,bottom=s)
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Chi tiet OOB"
+    hdrs = ["OOB IP","OOB Alias","Hostname","Menu","Ping","Menu State","Option Key","Description","Target IP","Port","Protocol","Verify","Act Host"]
+    for ci,h in enumerate(hdrs,1):
+        c = ws.cell(1,ci,h); c.font=Font(bold=True,color="FFFFFF"); c.fill=mk_fill("1F4E79"); c.alignment=Alignment(horizontal="center"); c.border=mk_bdr()
+    ws.freeze_panes = "A2"; ri = 2
+    for ip,alias in hosts:
+        st = ds.get(ip,{})
+        pg = "Online" if st.get("ping") is True else ("Offline" if st.get("ping") is False else "-")
+        mn,dn,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
+        if not bl:
+            for ci,v in enumerate([ip,alias,"","",pg,st.get("menu_state","-"),"(chua co baseline)","","","","","",""],1): ws.cell(ri,ci,v).border=mk_bdr()
+            ri+=1; continue
+        for ok_key in sorted(bl):
+            o = bl[ok_key]; vr = vst.get((alias,ok_key))
+            if vr:
+                vs = vr["status"]; ah = vr.get("act_host","") or ""
+                sc = "C6EFCE" if vs=="OK" else ("FFC7CE" if vs=="CANH BAO" else "FFCC99")
+            else: vs,ah,sc = "Chua Verify","","FFEB9C"
+            for ci,v in enumerate([ip,alias,dn or "",mn or "",pg,st.get("menu_state","-"),ok_key,o.get("description",""),o.get("ip",""),o.get("port",""),o.get("protocol",""),vs,ah],1):
+                c = ws.cell(ri,ci,v); c.border=mk_bdr()
+                if ci==12: c.fill=mk_fill(sc); c.font=Font(bold=True)
+            ri+=1
+    for i,w in enumerate([16,16,18,18,10,14,12,36,16,8,10,14,18],1): ws.column_dimensions[get_column_letter(i)].width=w
+    os.makedirs("reports",exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = "OOB_Report_" + ts + ".xlsx"; fp = os.path.join("reports",fn)
+    wb.save(fp)
+    return send_file(fp,as_attachment=True,download_name=fn,mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/api/import", methods=["POST"])
+def api_import():
+    import re; _IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+    cfg = _cfg(); lines = (request.json or {}).get("text","").splitlines()
+    added = skipped = 0; existing = {h[0] for h in oob_monitor.load_ip_list(cfg["ip_list"])}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"): continue
+        parts = line.split(); ip = parts[0]; alias = parts[1] if len(parts)>1 else ip
+        if not _IP.match(ip) or ip in existing: skipped+=1; continue
+        oob_monitor.add_ip(cfg["ip_list"],ip,alias); existing.add(ip); added+=1
+    return jsonify({"added":added,"skipped":skipped})
 
 
-# --- COMMON HTML BLOCKS (Dung chung cho ca 2 trang) ---
-COMMON_MODALS_JS = """
-    <!-- Modal Cai dat -->
-    <div class="modal fade" id="settingsModal" tabindex="-1" data-bs-theme="dark">
-        <div class="modal-dialog">
-            <div class="modal-content bg-dark text-light border-secondary">
-                <div class="modal-header border-secondary">
-                    <h5 class="modal-title">Cài đặt Hệ thống</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                </div>
-                <div class="modal-body">
-                    <form id="settingsForm">
-                        <div class="mb-3"><label>Username</label><input type="text" class="form-control bg-dark text-light" id="cfg_user"></div>
-                        <div class="mb-3"><label>Password</label><input type="password" class="form-control bg-dark text-light" id="cfg_pass"></div>
-                        <div class="mb-3"><label>Enable Password</label><input type="password" class="form-control bg-dark text-light" id="cfg_en_pass"></div>
-                        <div class="mb-3"><label>Vertiv Connect Password</label><input type="password" class="form-control bg-dark text-light" id="cfg_vt_pass"></div>
-                        <div class="form-check form-switch mb-3">
-                            <input class="form-check-input" type="checkbox" id="cfg_auto_verify">
-                            <label class="form-check-label">Bật Tự động Verify Ngầm (Daemon)</label>
-                        </div>
-                    </form>
-                </div>
-                <div class="modal-footer border-secondary">
-                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Lưu thay đổi</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Modal Them Thiet bi -->
-    <div class="modal fade" id="addDeviceModal" tabindex="-1" data-bs-theme="dark">
-        <div class="modal-dialog">
-            <div class="modal-content bg-dark text-light border-secondary">
-                <div class="modal-header border-secondary">
-                    <h5 class="modal-title">Thêm Thiết bị OOB</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                </div>
-                <div class="modal-body">
-                    <div class="mb-3"><label>IP Address</label><input type="text" class="form-control bg-dark text-light" id="new_ip"></div>
-                    <div class="mb-3"><label>Alias (Tên gọi)</label><input type="text" class="form-control bg-dark text-light" id="new_alias"></div>
-                </div>
-                <div class="modal-footer border-secondary">
-                    <button type="button" class="btn btn-success" onclick="addDevice()">Thêm mới</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Modal Ket qua Tim kiem -->
-    <div class="modal fade" id="searchModal" tabindex="-1" data-bs-theme="dark">
-        <div class="modal-dialog modal-xl">
-            <div class="modal-content bg-dark text-light border-secondary">
-                <div class="modal-header border-secondary bg-primary text-white">
-                    <h5 class="modal-title"><i class="bi bi-search"></i> Kết quả tìm kiếm cho: <span id="searchKeyword" class="fw-bold"></span></h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                </div>
-                <div class="modal-body p-0">
-                    <div class="table-responsive">
-                        <table class="table table-dark table-hover table-striped align-middle m-0">
-                            <thead>
-                                <tr>
-                                    <th class="ps-3">Thuộc OOB</th>
-                                    <th>Menu/Port</th>
-                                    <th>Description</th>
-                                    <th>Hostname Thực tế</th>
-                                    <th>Kết nối Đích</th>
-                                    <th class="pe-3">Hành động</th>
-                                </tr>
-                            </thead>
-                            <tbody id="searchResultsBody">
-                                <!-- Render tu JS -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Toast -->
-    <div class="toast-container position-fixed bottom-0 end-0 p-3">
-        <div id="liveToast" class="toast align-items-center text-bg-primary border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body" id="toastMsg"></div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        const toastEl = document.getElementById('liveToast');
-        const toast = new bootstrap.Toast(toastEl, {delay: 3000});
-
-        function showToast(msg, isError=false) {
-            document.getElementById('toastMsg').innerText = msg;
-            toastEl.className = isError ? 'toast align-items-center text-bg-danger border-0' : 'toast align-items-center text-bg-success border-0';
-            toast.show();
-        }
-
-        async function triggerAction(action, ip) {
-            let confirmMsg = ip ? `Xác nhận chạy ${action.toUpperCase()} cho IP ${ip}?` : `Xác nhận chạy ${action.toUpperCase()} cho TOÀN BỘ thiết bị?`;
-            if(!confirm(confirmMsg)) return;
-
-            let res = await fetch('/api/action', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({action: action, ip: ip})
-            });
-            let data = await res.json();
-            showToast(data.msg);
-        }
-
-        async function openSettings() {
-            let res = await fetch('/api/config');
-            let cfg = await res.json();
-            document.getElementById('cfg_user').value = cfg.username || '';
-            document.getElementById('cfg_pass').value = cfg.password || '';
-            document.getElementById('cfg_en_pass').value = cfg.enable_password || '';
-            document.getElementById('cfg_vt_pass').value = cfg.vertiv_connect_password || '';
-            document.getElementById('cfg_auto_verify').checked = cfg.auto_verify;
-            new bootstrap.Modal(document.getElementById('settingsModal')).show();
-        }
-
-        async function saveSettings() {
-            let payload = {
-                username: document.getElementById('cfg_user').value,
-                password: document.getElementById('cfg_pass').value,
-                enable_password: document.getElementById('cfg_en_pass').value,
-                vertiv_connect_password: document.getElementById('cfg_vt_pass').value,
-                auto_verify: document.getElementById('cfg_auto_verify').checked
-            };
-            await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-            showToast('Đã lưu cấu hình!');
-            bootstrap.Modal.getInstance(document.getElementById('settingsModal')).hide();
-        }
-
-        function openAddDevice() {
-            document.getElementById('new_ip').value = '';
-            document.getElementById('new_alias').value = '';
-            new bootstrap.Modal(document.getElementById('addDeviceModal')).show();
-        }
-
-        async function addDevice() {
-            let payload = { ip: document.getElementById('new_ip').value, alias: document.getElementById('new_alias').value };
-            if(!payload.ip) return alert("Vui lòng nhập IP");
-            await fetch('/api/device', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-            location.reload();
-        }
-
-        async function deleteDevice(ip) {
-            if(!confirm(`Xóa OOB ${ip}?`)) return;
-            await fetch('/api/device', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip: ip}) });
-            location.reload();
-        }
-
-        async function executeSearch() {
-            let q = document.getElementById('searchInput').value.trim();
-            if(!q) return;
-            document.getElementById('searchKeyword').innerText = q;
-            
-            let res = await fetch('/api/search?q=' + encodeURIComponent(q));
-            let data = await res.json();
-            
-            let tbody = document.getElementById('searchResultsBody');
-            tbody.innerHTML = '';
-            
-            if(data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-warning py-4">Không tìm thấy thiết bị nào khớp!</td></tr>';
-            } else {
-                data.forEach(item => {
-                    let actHostHtml = item.act_host ? `<span class="text-success fw-bold">${item.act_host}</span>` : '<span class="text-muted">-</span>';
-                    tbody.innerHTML += `
-                        <tr>
-                            <td class="ps-3"><strong class="text-info">${item.oob_alias}</strong><br><small class="text-muted">${item.oob_ip}</small></td>
-                            <td><kbd>${item.opt_key}</kbd></td>
-                            <td>${item.desc}</td>
-                            <td>${actHostHtml}</td>
-                            <td><code>${item.protocol}://${item.target_ip}:${item.target_port}</code></td>
-                            <td class="pe-3"><a href="/device/${item.oob_ip}" class="btn btn-sm btn-outline-primary" title="Tới thiết bị OOB"><i class="bi bi-box-arrow-in-right"></i> Đi tới</a></td>
-                        </tr>
-                    `;
-                });
-            }
-            
-            let myModal = new bootstrap.Modal(document.getElementById('searchModal'));
-            myModal.show();
-        }
-    </script>
-"""
-
-# --- GIAO DIEN CHINH ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="vi" data-bs-theme="dark">
+HTML = r"""<!DOCTYPE html>
+<html lang="vi">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OOB Manager Web Panel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
-    <style>
-        body { background-color: #121212; color: #e0e0e0; }
-        .card { background-color: #1e1e1e; border: 1px solid #333; }
-        .table-dark { background-color: #1e1e1e; }
-        .stat-card { border-left: 4px solid #0d6efd; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OOB Network Manager</title>
+<meta name="description" content="OOB Network Manager - Giam sat va quan ly thiet bi Out-of-Band">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07070f;--bg-card:rgba(255,255,255,0.04);--bg-hover:rgba(255,255,255,0.08);--bg-input:rgba(255,255,255,0.06);
+  --border:rgba(255,255,255,0.1);--border-hv:rgba(255,255,255,0.2);
+  --violet:#7c3aed;--teal:#06d6a0;--pink:#f72585;--amber:#fbbf24;--blue:#3b82f6;--red:#ef4444;--green:#22c55e;
+  --text:#f1f0ff;--text2:#a09db8;--text3:#6b6880;
+  --sw:240px;--r:12px;--rs:8px;--tr:all 0.2s cubic-bezier(0.4,0,0.2,1);
+}
+html,body{height:100%;font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:rgba(124,58,237,0.4);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--violet)}
+.app{display:flex;height:100vh}
+
+/* SIDEBAR */
+.sidebar{width:var(--sw);min-height:100vh;background:linear-gradient(180deg,rgba(124,58,237,0.12) 0%,rgba(7,7,15,0.95) 60%);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;left:0;z-index:100;backdrop-filter:blur(20px)}
+.sb-logo{padding:20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.sb-icon{width:38px;height:38px;background:linear-gradient(135deg,var(--violet),var(--teal));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.sb-logo-t{font-size:14px;font-weight:700;line-height:1.2}
+.sb-logo-s{font-size:10px;color:var(--text3);font-weight:400}
+.sb-nav{flex:1;padding:12px 0;overflow-y:auto}
+.sb-sec{padding:0 12px;margin-bottom:4px}
+.sb-sec-lbl{font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;padding:8px 8px 4px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--rs);cursor:pointer;transition:var(--tr);color:var(--text2);font-size:13.5px;font-weight:500;position:relative;user-select:none;border:none;background:none;width:100%;text-align:left}
+.nav-item:hover{background:var(--bg-hover);color:var(--text)}
+.nav-item.active{background:linear-gradient(135deg,rgba(124,58,237,0.25),rgba(6,214,160,0.1));color:#fff;box-shadow:inset 0 0 0 1px rgba(124,58,237,0.3)}
+.nav-item.active::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:60%;background:var(--violet);border-radius:0 3px 3px 0}
+.nav-ic{width:18px;height:18px;flex-shrink:0;opacity:.8}
+.nav-item.active .nav-ic{opacity:1}
+.nav-badge{margin-left:auto;background:var(--pink);color:#fff;font-size:10px;font-weight:700;padding:2px 7px;border-radius:100px;min-width:20px;text-align:center}
+.sb-foot{padding:14px 16px;border-top:1px solid var(--border);font-size:11px;color:var(--text3)}
+.d-dot{width:7px;height:7px;border-radius:50%;background:var(--text3);flex-shrink:0}
+.d-dot.on{background:var(--green);box-shadow:0 0 8px var(--green);animation:pdot 2s infinite}
+@keyframes pdot{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* MAIN */
+.main{margin-left:var(--sw);flex:1;min-height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:60px;padding:0 24px;display:flex;align-items:center;gap:16px;background:rgba(7,7,15,.8);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
+.tb-title{font-size:17px;font-weight:600;flex:1}
+.sw{position:relative}
+.sw input{background:var(--bg-input);border:1px solid var(--border);color:var(--text);border-radius:var(--rs);padding:7px 14px 7px 36px;font-size:13px;font-family:inherit;width:260px;transition:var(--tr);outline:none}
+.sw input:focus{border-color:var(--violet);box-shadow:0 0 0 3px rgba(124,58,237,.2)}
+.sw .si{position:absolute;left:11px;top:50%;transform:translateY(-50%);opacity:.5;pointer-events:none}
+.content{flex:1;overflow-y:auto;padding:24px}
+
+/* PAGES */
+.page{display:none}
+.page.active{display:block;animation:fIn .25s ease}
+@keyframes fIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+/* STATS */
+.sg{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.sc{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;position:relative;overflow:hidden;transition:var(--tr)}
+.sc:hover{border-color:var(--border-hv);transform:translateY(-2px);box-shadow:0 4px 24px rgba(0,0,0,.4)}
+.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--acc,var(--violet))}
+.sc .sv{font-size:32px;font-weight:700;line-height:1;margin-bottom:6px}
+.sc .sl{font-size:12px;color:var(--text2);font-weight:500;text-transform:uppercase;letter-spacing:.06em}
+.sc .si2{position:absolute;right:16px;top:16px;font-size:28px;opacity:.12}
+.sc.c1{--acc:var(--violet)}.sc.c2{--acc:var(--teal)}.sc.c3{--acc:var(--amber)}.sc.c4{--acc:var(--pink)}
+
+/* SECTION HEADER */
+.sh{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.st{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+.st .dot{width:8px;height:8px;border-radius:50%;background:var(--violet)}
+
+/* TABLE */
+.tw{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+table{width:100%;border-collapse:collapse}
+thead tr{background:rgba(255,255,255,.04)}
+th{padding:11px 14px;text-align:left;font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.04);font-size:13px;vertical-align:middle}
+tbody tr:hover{background:var(--bg-hover)}
+tbody tr:last-child td{border-bottom:none}
+.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
+
+/* BADGES */
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:100px;font-size:11px;font-weight:600;white-space:nowrap}
+.bg{background:rgba(34,197,94,.15);color:var(--green)}
+.br{background:rgba(239,68,68,.15);color:var(--red)}
+.ba{background:rgba(251,191,36,.15);color:var(--amber)}
+.bv{background:rgba(124,58,237,.15);color:#a78bfa}
+.bt{background:rgba(6,214,160,.15);color:var(--teal)}
+.bm{background:rgba(255,255,255,.08);color:var(--text3)}
+.bp{background:rgba(247,37,133,.15);color:var(--pink)}
+.bpulse{animation:bbl 1.5s ease infinite}
+@keyframes bbl{0%,100%{opacity:1}50%{opacity:.6}}
+
+/* BUTTONS */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--rs);font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;border:none;transition:var(--tr);text-decoration:none;white-space:nowrap}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-p{background:var(--violet);color:#fff}
+.btn-p:hover:not(:disabled){background:#6d28d9;box-shadow:0 4px 15px rgba(124,58,237,.4)}
+.btn-t{background:rgba(6,214,160,.15);color:var(--teal);border:1px solid rgba(6,214,160,.3)}
+.btn-t:hover:not(:disabled){background:rgba(6,214,160,.25)}
+.btn-a{background:rgba(251,191,36,.15);color:var(--amber);border:1px solid rgba(251,191,36,.3)}
+.btn-a:hover:not(:disabled){background:rgba(251,191,36,.25)}
+.btn-pk{background:rgba(247,37,133,.15);color:var(--pink);border:1px solid rgba(247,37,133,.3)}
+.btn-pk:hover:not(:disabled){background:rgba(247,37,133,.25)}
+.btn-g{background:var(--bg-input);color:var(--text2);border:1px solid var(--border)}
+.btn-g:hover:not(:disabled){border-color:var(--border-hv);color:var(--text)}
+.btn-d{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.btn-d:hover:not(:disabled){background:rgba(239,68,68,.25)}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-ic{padding:6px;width:30px;height:30px}
+.bg2{display:flex;gap:6px;flex-wrap:wrap}
+
+/* FORMS */
+.fg{margin-bottom:16px}
+.fl{display:block;font-size:12px;font-weight:500;color:var(--text2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.fc{width:100%;background:var(--bg-input);border:1px solid var(--border);color:var(--text);border-radius:var(--rs);padding:9px 12px;font-size:13.5px;font-family:inherit;outline:none;transition:var(--tr)}
+.fc:focus{border-color:var(--violet);box-shadow:0 0 0 3px rgba(124,58,237,.15)}
+.fc::placeholder{color:var(--text3)}
+select.fc option{background:#1a1a2e}
+.tg{display:flex;align-items:center;gap:10px}
+.toggle{position:relative;width:44px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.ts{position:absolute;inset:0;background:rgba(255,255,255,.1);border-radius:100px;cursor:pointer;transition:var(--tr)}
+.ts::before{content:'';position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:var(--text3);transition:var(--tr)}
+.toggle input:checked+.ts{background:var(--violet)}
+.toggle input:checked+.ts::before{left:23px;background:#fff}
+
+/* MODAL */
+.mo{display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);align-items:center;justify-content:center}
+.mo.open{display:flex;animation:fIn .2s ease}
+.mb{background:#111120;border:1px solid var(--border);border-radius:16px;width:90%;max-width:560px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.6);animation:sUp .25s ease}
+.mb.lg{max-width:880px}.mb.xl{max-width:1100px}
+@keyframes sUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.mh{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.mt{font-size:15px;font-weight:600}
+.mc{background:none;border:none;color:var(--text3);cursor:pointer;font-size:20px;padding:2px;line-height:1;transition:var(--tr)}
+.mc:hover{color:var(--text)}
+.mbody{padding:22px;overflow-y:auto;flex:1}
+.mf{padding:14px 22px;border-top:1px solid var(--border);display:flex;gap:10px;justify-content:flex-end;flex-shrink:0}
+
+/* LOG CONSOLE */
+.lc{background:#020208;border:1px solid var(--border);border-radius:var(--r);font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7;padding:14px;overflow-y:auto;max-height:380px;min-height:180px;color:#8fffcb}
+.lts{color:var(--text3)}.lok{color:var(--teal)}.lwarn{color:var(--amber)}.lerr{color:var(--red)}.linf{color:#60a5fa}
+
+/* TOAST */
+.tc{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+.toast{background:#1a1a2e;border:1px solid var(--border);border-radius:var(--rs);padding:12px 18px;font-size:13px;min-width:260px;max-width:380px;display:flex;align-items:flex-start;gap:10px;box-shadow:0 4px 24px rgba(0,0,0,.4);animation:sIR .3s ease}
+.toast.success{border-left:3px solid var(--green)}.toast.error{border-left:3px solid var(--red)}
+.toast.info{border-left:3px solid var(--blue)}.toast.warning{border-left:3px solid var(--amber)}
+@keyframes sIR{from{transform:translateX(30px);opacity:0}to{transform:translateY(0);opacity:1}}
+
+/* SPINNER */
+.sp{width:18px;height:18px;border:2px solid rgba(255,255,255,.2);border-top-color:var(--violet);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.lr td{text-align:center;padding:40px;color:var(--text3)}
+
+/* TABS */
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:24px}
+.tab-btn{padding:10px 18px;font-size:13px;font-weight:500;color:var(--text2);background:none;border:none;cursor:pointer;border-bottom:2px solid transparent;transition:var(--tr);font-family:inherit}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--text);border-bottom-color:var(--violet)}
+.tc2{display:none}
+.tc2.active{display:block;animation:fIn .2s ease}
+
+/* TASK BAR */
+.tp{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px}
+#atb{display:none}.#atb.vis{display:block;margin-bottom:20px}
+#atb.vis{display:block;margin-bottom:20px}
+
+/* LOG FILE LIST */
+.lfl{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.lfi{display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--rs);cursor:pointer;transition:var(--tr);font-size:13px}
+.lfi:hover{border-color:var(--violet);background:rgba(124,58,237,.08)}
+
+/* IMPORT */
+.ia{width:100%;min-height:180px;background:var(--bg-input);border:1px solid var(--border);color:var(--teal);border-radius:var(--rs);padding:12px;font-size:13px;font-family:'JetBrains Mono',monospace;line-height:1.6;outline:none;resize:vertical;transition:var(--tr)}
+.ia:focus{border-color:var(--violet)}
+.ia::placeholder{color:var(--text3);font-family:inherit}
+
+/* DEVICE HEADER */
+.dh{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px 24px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.dt{font-size:20px;font-weight:700;margin-bottom:4px}
+.dm{font-size:12px;color:var(--text2);display:flex;gap:16px;flex-wrap:wrap}
+
+@media(max-width:900px){.sidebar{transform:translateX(-100%)}.main{margin-left:0}.sg{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.sg{grid-template-columns:1fr}}
+.divider{height:1px;background:var(--border);margin:20px 0}
+.fw6{font-weight:600}.text-t{color:var(--teal)}.text-v{color:#a78bfa}.text-m{color:var(--text3)}.text-g{color:var(--green)}
+.flex{display:flex}.aic{align-items:center}.ml-a{margin-left:auto}
+.mb16{margin-bottom:16px}.mb8{margin-bottom:8px}
+.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+</style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
-        <div class="container-fluid">
-            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-hdd-network text-primary"></i> OOB Web Panel</a>
-            
-            <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
-                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
-                <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
-            </form>
-
-            <div>
-                <button class="btn btn-outline-info btn-sm me-2" onclick="openSettings()"><i class="bi bi-gear"></i> Cài đặt</button>
-                <button class="btn btn-outline-success btn-sm me-2" onclick="openAddDevice()"><i class="bi bi-plus-lg"></i> Thêm OOB</button>
-                <span class="text-muted small"><i class="bi bi-clock"></i> {{ time_now }}</span>
-            </div>
-        </div>
-    </nav>
-
-    <div class="container-fluid px-4">
-        <div class="card shadow-sm mb-4 border-secondary">
-            <div class="card-body bg-dark d-flex gap-2">
-                <button class="btn btn-primary" onclick="triggerAction('scan', null)"><i class="bi bi-search"></i> Scan All (Thu thập Data)</button>
-                <button class="btn btn-warning" onclick="triggerAction('verify', null)"><i class="bi bi-lightning"></i> Verify All (Kiểm tra cáp)</button>
-                <button class="btn btn-danger" onclick="triggerAction('push', null)"><i class="bi bi-upload"></i> Push Config All (Sửa lỗi Desc)</button>
-            </div>
-        </div>
-
-        <div class="card shadow mb-4 border-secondary">
-            <div class="card-header py-3 bg-dark border-secondary">
-                <h6 class="m-0 fw-bold text-primary"><i class="bi bi-list-ul"></i> Danh sách OOB Devices ({{ stats.total }} thiết bị)</h6>
-            </div>
-            <div class="card-body bg-dark p-0">
-                <div class="table-responsive">
-                    <table class="table table-dark table-hover table-striped align-middle m-0">
-                        <thead>
-                            <tr>
-                                <th class="ps-4">Alias</th>
-                                <th>IP Address</th>
-                                <th>Ping</th>
-                                <th>Trạng thái Menu</th>
-                                <th>Tổng Line</th>
-                                <th>Cập nhật lần cuối</th>
-                                <th class="pe-4">Hành động OOB</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for dev in devices %}
-                            <tr>
-                                <td class="fw-bold ps-4">{{ dev.alias }}</td>
-                                <td><code>{{ dev.ip }}</code></td>
-                                <td>
-                                    {% if dev.ping == True %}<span class="badge bg-success">Online</span>
-                                    {% elif dev.ping == False %}<span class="badge bg-danger">Offline</span>
-                                    {% else %}<span class="badge bg-secondary">-</span>{% endif %}
-                                </td>
-                                <td>
-                                    {% if dev.menu_state == 'ok' %}<span class="badge bg-success">OK</span>
-                                    {% elif dev.menu_state == 'conn_failed' %}<span class="badge bg-danger">Lỗi Connect</span>
-                                    {% else %}<span class="badge bg-secondary">{{ dev.menu_state or '-' }}</span>{% endif %}
-                                </td>
-                                <td><span class="text-info fw-bold">{{ dev.opt_count }}</span></td>
-                                <td class="text-muted small">{{ dev.checked_at }}</td>
-                                <td class="pe-4">
-                                    <div class="btn-group btn-group-sm">
-                                        <a href="/device/{{ dev.ip }}" class="btn btn-outline-light" title="Xem chi tiết line"><i class="bi bi-eye"></i></a>
-                                        <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ dev.ip }}')" title="Scan OOB"><i class="bi bi-search"></i></button>
-                                        <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ dev.ip }}')" title="Verify OOB"><i class="bi bi-lightning"></i></button>
-                                        <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ dev.ip }}')" title="Push OOB"><i class="bi bi-upload"></i></button>
-                                        <button class="btn btn-outline-secondary" onclick="deleteDevice('{{ dev.ip }}')" title="Xóa OOB"><i class="bi bi-trash"></i></button>
-                                    </div>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
+<div class="app">
+<aside class="sidebar" id="sidebar">
+  <div class="sb-logo">
+    <div class="sb-icon">🌐</div>
+    <div><div class="sb-logo-t">OOB Manager</div><div class="sb-logo-s">Network Control Panel</div></div>
+  </div>
+  <nav class="sb-nav">
+    <div class="sb-sec">
+      <div class="sb-sec-lbl">Tổng quan</div>
+      <button class="nav-item active" data-page="dashboard" onclick="sPage('dashboard',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Dashboard
+      </button>
+      <button class="nav-item" data-page="devices" onclick="sPage('devices',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M8 12h8M8 9h8M8 15h5"/></svg>
+        Thiết bị OOB
+        <span class="nav-badge" id="sAlBadge" style="display:none">!</span>
+      </button>
     </div>
-""" + COMMON_MODALS_JS
-
-# --- GIAO DIEN CHI TIET OOB ---
-DETAIL_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="vi" data-bs-theme="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Chi tiết OOB: {{ ip }}</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
-    <style>body { background-color: #121212; color: #e0e0e0; } .card { background-color: #1e1e1e; border: 1px solid #333; } .table-dark { background-color: #1e1e1e; }</style>
-</head>
-<body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
-        <div class="container-fluid">
-            <a class="navbar-brand fw-bold" href="/"><i class="bi bi-arrow-left"></i> Trở về Dashboard</a>
-            
-            <form class="d-flex ms-auto me-4" onsubmit="event.preventDefault(); executeSearch();">
-                <input class="form-control me-2 bg-dark text-light border-secondary" type="search" id="searchInput" placeholder="Tìm tên Port, IP, Hostname..." aria-label="Search" style="width: 320px;">
-                <button class="btn btn-outline-info" type="submit"><i class="bi bi-search"></i></button>
-            </form>
-        </div>
-    </nav>
-
-    <div class="container">
-        <div class="card shadow mb-4 border-secondary">
-            <div class="card-header py-3 bg-dark d-flex justify-content-between align-items-center border-secondary">
-                <h4 class="m-0 fw-bold text-primary">Cấu hình Menu OOB: {{ ip }}</h4>
-                <div class="btn-group btn-group-sm">
-                    <button class="btn btn-outline-primary" onclick="triggerAction('scan', '{{ ip }}')" title="Scan"><i class="bi bi-search"></i> Quét Lại Data</button>
-                    <button class="btn btn-outline-warning" onclick="triggerAction('verify', '{{ ip }}')" title="Verify"><i class="bi bi-lightning"></i> K.Tra Dây Cắm</button>
-                    <button class="btn btn-outline-danger" onclick="triggerAction('push', '{{ ip }}')" title="Push"><i class="bi bi-upload"></i> Sửa Lỗi Desc</button>
-                </div>
-            </div>
-            <div class="card-body bg-dark p-0">
-                {% if options %}
-                <div class="row p-3 m-0 border-bottom border-secondary">
-                    <div class="col-md-6"><p class="mb-0"><strong>Tên thiết bị (Hostname OOB):</strong> {{ options[0]['device_name'] }}</p></div>
-                    <div class="col-md-6 text-end"><p class="mb-0"><strong>Hãng sản xuất:</strong> <span class="badge bg-secondary text-uppercase">{{ options[0]['vendor'] }}</span></p></div>
-                </div>
-                <div class="table-responsive">
-                    <table class="table table-dark table-striped table-hover m-0">
-                        <thead>
-                            <tr>
-                                <th class="ps-4">Phím Menu / Cổng</th>
-                                <th>Mô tả (Description)</th>
-                                <th>Target IP</th>
-                                <th>Target Port</th>
-                                <th class="pe-4">Giao thức</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for opt in options %}
-                            <tr>
-                                <td class="ps-4"><kbd>{{ opt['option_key'] }}</kbd></td>
-                                <td>{{ opt['description'] }}</td>
-                                <td><code>{{ opt['target_ip'] }}</code></td>
-                                <td>{{ opt['target_port'] }}</td>
-                                <td class="pe-4"><span class="badge {% if opt['protocol'] == 'ssh' %}bg-success{% elif opt['protocol'] == 'serial' %}bg-info text-dark{% else %}bg-warning text-dark{% endif %}">{{ opt['protocol'] | upper }}</span></td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-                {% else %}
-                <div class="alert alert-warning m-4">
-                    <i class="bi bi-exclamation-circle"></i> Chưa có dữ liệu Baseline cho thiết bị này, hoặc thiết bị chưa được Scan.
-                </div>
-                {% endif %}
-            </div>
-        </div>
+    <div class="sb-sec">
+      <div class="sb-sec-lbl">Vận hành</div>
+      <button class="nav-item" data-page="verify" onclick="sPage('verify',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+        Verify & Scan
+      </button>
+      <button class="nav-item" data-page="logs" onclick="sPage('logs',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+        Nhật ký Verify
+      </button>
     </div>
-""" + COMMON_MODALS_JS
+    <div class="sb-sec">
+      <div class="sb-sec-lbl">Quản lý</div>
+      <button class="nav-item" data-page="import" onclick="sPage('import',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Import / Export
+      </button>
+      <button class="nav-item" data-page="settings" onclick="sPage('settings',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Cài đặt
+      </button>
+    </div>
+  </nav>
+  <div class="sb-foot">
+    <div class="flex aic" style="gap:6px"><div class="d-dot" id="dDot"></div><span id="dTxt">Đang kiểm tra...</span></div>
+    <div style="margin-top:6px;font-size:10px" id="clk"></div>
+  </div>
+</aside>
 
-# --- ROUTING ---
+<div class="main">
+  <div class="topbar">
+    <div class="tb-title" id="tbTitle">Dashboard</div>
+    <div class="sw">
+      <svg class="si" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      <input type="text" id="gSearch" placeholder="Tìm IP, hostname, description..." onkeydown="if(event.key==='Enter')doSearch()">
+    </div>
+    <button class="btn btn-p" onclick="doSearch()" style="padding:8px 14px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>Tìm
+    </button>
+    <button class="btn btn-g btn-sm" onclick="oModal('addDev')">+ Thêm OOB</button>
+  </div>
+  <div class="content">
+    <div id="atb"></div>
+
+    <!-- DASHBOARD -->
+    <div class="page active" id="page-dashboard">
+      <div class="sg">
+        <div class="sc c1"><div class="sv" id="s-total">-</div><div class="sl">Tổng thiết bị</div><div class="si2">🌐</div></div>
+        <div class="sc c2"><div class="sv" id="s-online">-</div><div class="sl">Đang online</div><div class="si2">📶</div></div>
+        <div class="sc c3"><div class="sv" id="s-baseline">-</div><div class="sl">Có baseline</div><div class="si2">📋</div></div>
+        <div class="sc c4"><div class="sv" id="s-alarms">-</div><div class="sl">Cảnh báo</div><div class="si2">⚠️</div></div>
+      </div>
+      <div class="sh">
+        <div class="st"><span class="dot"></span>Thiết bị OOB</div>
+        <div class="bg2">
+          <button class="btn btn-t btn-sm" onclick="runAction('scan',null)">🔍 Scan All</button>
+          <button class="btn btn-a btn-sm" onclick="runAction('verify',null)">⚡ Verify All</button>
+          <button class="btn btn-pk btn-sm" onclick="runAction('push',null)">🚀 Push All</button>
+          <button class="btn btn-g btn-sm" onclick="loadDash()">↻ Làm mới</button>
+        </div>
+      </div>
+      <div class="tw">
+        <table id="dashTable">
+          <thead><tr><th>Alias</th><th>IP</th><th>Hostname</th><th>Ping</th><th>Menu</th><th style="text-align:center">Lines</th><th>Verify</th><th>Cập nhật</th><th style="text-align:right">Hành động</th></tr></thead>
+          <tbody id="dashBody"><tr class="lr"><td colspan="9"><div class="sp" style="margin:0 auto"></div></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- DEVICES -->
+    <div class="page" id="page-devices">
+      <div class="dh" id="devHdr" style="display:none">
+        <div>
+          <div class="dt" id="devTitle">-</div>
+          <div class="dm">
+            <span>📡 IP: <strong id="devIP">-</strong></span>
+            <span>🖧 Menu: <strong id="devMenu">-</strong></span>
+            <span>📦 Lines: <strong id="devLines">-</strong></span>
+          </div>
+        </div>
+        <div class="bg2">
+          <button class="btn btn-t btn-sm" onclick="runAction('scan',curIP)">🔍 Scan</button>
+          <button class="btn btn-a btn-sm" onclick="runAction('verify',curIP)">⚡ Verify</button>
+          <button class="btn btn-pk btn-sm" onclick="runAction('push',curIP)">🚀 Push</button>
+          <button class="btn btn-g btn-sm" onclick="sPage('dashboard')">← Quay lại</button>
+        </div>
+      </div>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Option Key</th><th>Description</th><th>Target IP</th><th>Port</th><th>Protocol</th><th>Verify</th><th>Hostname Thực tế</th></tr></thead>
+          <tbody id="devOptsBody"><tr class="lr"><td colspan="7"><div class="sp" style="margin:0 auto"></div></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- VERIFY & SCAN -->
+    <div class="page" id="page-verify">
+      <div class="sh mb16"><div class="st"><span class="dot"></span>Vận hành Tức thì</div></div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px">
+        <div class="sc c1" style="cursor:pointer" onclick="runAction('scan',null)"><div style="font-size:28px;margin-bottom:10px">🔍</div><div class="sl">SCAN CONFIG</div><div style="font-size:12px;color:var(--text2);margin-top:6px">Thu thập cấu hình menu từ tất cả OOB</div></div>
+        <div class="sc c3" style="cursor:pointer" onclick="runAction('verify',null)"><div style="font-size:28px;margin-bottom:10px">⚡</div><div class="sl">DEEP VERIFY</div><div style="font-size:12px;color:var(--text2);margin-top:6px">Kiểm tra vật lý PIVOT tất cả line console</div></div>
+        <div class="sc c4" style="cursor:pointer" onclick="runAction('push',null)"><div style="font-size:28px;margin-bottom:10px">🚀</div><div class="sl">PUSH CONFIG</div><div style="font-size:12px;color:var(--text2);margin-top:6px">Tự động sửa Description sai lệch</div></div>
+      </div>
+      <div class="sh"><div class="st"><span class="dot"></span>Chạy cho thiết bị cụ thể</div></div>
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:24px">
+        <div class="fg"><label class="fl">IP hoặc Alias (để trống = Tất cả)</label><input type="text" id="specIP" class="fc" placeholder="VD: 192.168.1.1"></div>
+        <div class="bg2">
+          <button class="btn btn-t" onclick="runAction('scan',document.getElementById('specIP').value.trim()||null)">🔍 Scan Device</button>
+          <button class="btn btn-a" onclick="runAction('verify',document.getElementById('specIP').value.trim()||null)">⚡ Verify Device</button>
+          <button class="btn btn-pk" onclick="runAction('push',document.getElementById('specIP').value.trim()||null)">🚀 Push Device</button>
+        </div>
+      </div>
+      <div class="sh"><div class="st"><span class="dot"></span>Live Console</div><button class="btn btn-g btn-sm" onclick="document.getElementById('liveCon').innerHTML='<span class=text-m>Console da xoa.</span>'">Xóa</button></div>
+      <div class="lc" id="liveCon" style="min-height:260px;max-height:500px"><span class="text-m">Chờ lệnh...</span></div>
+    </div>
+
+    <!-- LOGS -->
+    <div class="page" id="page-logs">
+      <div class="sh mb16"><div class="st"><span class="dot"></span>Nhật ký Verify</div><button class="btn btn-g btn-sm" onclick="loadLogs()">↻ Làm mới</button></div>
+      <div style="display:grid;grid-template-columns:300px 1fr;gap:16px">
+        <div><div class="lfl" id="logList"><div class="text-m" style="padding:12px;font-size:13px">Đang tải...</div></div></div>
+        <div><div class="lc" id="logView" style="max-height:70vh;min-height:300px;font-size:11.5px;white-space:pre-wrap;word-break:break-all"><span class="text-m">← Chọn file log bên trái để xem.</span></div></div>
+      </div>
+    </div>
+
+    <!-- IMPORT / EXPORT -->
+    <div class="page" id="page-import">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:22px">
+          <div class="st mb16"><span class="dot"></span>Import Danh sách IP</div>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Mỗi dòng 1 thiết bị. Format: <code style="color:var(--teal)">IP [alias]</code></p>
+          <textarea id="importTxt" class="ia" placeholder="192.168.1.1 OOB-HCM-01&#10;192.168.1.2 OOB-HCM-02"></textarea>
+          <div style="margin-top:14px"><button class="btn btn-p" onclick="doImport()">⬆ Import</button></div>
+          <div id="importRes" style="margin-top:12px;font-size:13px;display:none"></div>
+        </div>
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:22px">
+          <div class="st mb16"><span class="dot"></span>Xuất Báo cáo Excel</div>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Xuất toàn bộ dữ liệu baseline và kết quả verify ra .xlsx</p>
+          <div style="background:rgba(6,214,160,.06);border:1px solid rgba(6,214,160,.2);border-radius:var(--rs);padding:14px;margin-bottom:20px;font-size:12.5px;color:var(--text2)">
+            📊 Bao gồm: Tất cả OOB + trạng thái ping · Danh sách option baseline · Kết quả verify
+          </div>
+          <a href="/api/export/excel" class="btn btn-t" download>⬇ Tải về Excel</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div class="page" id="page-settings">
+      <div class="tabs">
+        <button class="tab-btn active" onclick="sTab('tab-conn',this)">🔐 Kết nối</button>
+        <button class="tab-btn" onclick="sTab('tab-multi',this)">👥 Multi-Account</button>
+        <button class="tab-btn" onclick="sTab('tab-sched',this)">⏱️ Lịch chạy</button>
+        <button class="tab-btn" onclick="sTab('tab-files',this)">📂 Files</button>
+      </div>
+      <!-- Ket noi -->
+      <div class="tc2 active" id="tab-conn">
+        <div style="max-width:600px">
+          <div class="fg"><label class="fl">Username chính</label><input type="text" id="cu" class="fc" placeholder="admin"></div>
+          <div class="fg"><label class="fl">Password chính</label><input type="password" id="cp" class="fc"></div>
+          <div class="fg"><label class="fl">Enable Password</label><input type="password" id="ce" class="fc"></div>
+          <div class="fg"><label class="fl">Vertiv Connect Password</label><input type="password" id="cv" class="fc"></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+            <div class="fg"><label class="fl">SSH Port</label><input type="number" id="csp" class="fc" placeholder="22"></div>
+            <div class="fg"><label class="fl">Telnet Port</label><input type="number" id="ctp" class="fc" placeholder="23"></div>
+          </div>
+          <div class="fg"><label class="fl">Tên menu ép dùng (trống = tự dò)</label><input type="text" id="cmno" class="fc" placeholder="OOB_MENU"></div>
+          <div class="fg"><div class="tg"><label class="toggle"><input type="checkbox" id="cav"><span class="ts"></span></label><span style="font-size:13.5px">Bật Tự động Verify ngầm</span></div></div>
+          <button class="btn btn-p" onclick="saveCfg()">💾 Lưu cài đặt</button>
+        </div>
+      </div>
+      <!-- Multi Account -->
+      <div class="tc2" id="tab-multi">
+        <div style="max-width:700px">
+          <p style="font-size:13px;color:var(--text2);margin-bottom:18px">Tool sẽ thử lần lượt khi tài khoản chính thất bại.</p>
+          <div id="credList" style="margin-bottom:18px"></div>
+          <button class="btn btn-g" onclick="oModal('addCred')">+ Thêm tài khoản phụ</button>
+        </div>
+      </div>
+      <!-- Lich chay -->
+      <div class="tc2" id="tab-sched">
+        <div style="max-width:600px">
+          <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:20px">
+            <div class="st mb16">🔍 Lịch Thu thập Config (Scan)</div>
+            <div class="fg"><label class="fl">Chế độ</label><select id="csm" class="fc" onchange="togSF('scan')"><option value="interval">Lặp lại theo chu kỳ</option><option value="daily">Hàng ngày</option><option value="weekly">Hàng tuần</option></select></div>
+            <div class="fg"><label class="fl">Chu kỳ scan (giây)</label><input type="number" id="ci" class="fc" placeholder="30"></div>
+            <div id="s_tf" style="display:none">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                <div class="fg"><label class="fl">Giờ chạy (HH:MM)</label><input type="text" id="cst" class="fc" placeholder="01:00"></div>
+                <div class="fg" id="s_wf" style="display:none"><label class="fl">Thứ (mon/tue.../sun)</label><input type="text" id="csw" class="fc" placeholder="mon"></div>
+              </div>
+            </div>
+          </div>
+          <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:20px">
+            <div class="st mb16">⚡ Lịch Deep Verify</div>
+            <div class="fg"><label class="fl">Chế độ</label><select id="cvm" class="fc" onchange="togSF('verify')"><option value="interval">Lặp lại theo chu kỳ</option><option value="daily">Hàng ngày</option><option value="weekly">Hàng tuần</option></select></div>
+            <div class="fg"><label class="fl">Chu kỳ verify (giây)</label><input type="number" id="cvi" class="fc" placeholder="3600"></div>
+            <div id="v_tf" style="display:none">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                <div class="fg"><label class="fl">Giờ chạy (HH:MM)</label><input type="text" id="cvt" class="fc" placeholder="01:00"></div>
+                <div class="fg" id="v_wf" style="display:none"><label class="fl">Thứ</label><input type="text" id="cvw" class="fc" placeholder="mon"></div>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              <div class="fg"><label class="fl">Chờ sau connect (s)</label><input type="number" id="cvwac" class="fc" step="0.5" placeholder="1.5"></div>
+              <div class="fg"><label class="fl">Timeout Verify (s)</label><input type="number" id="cmvd" class="fc" placeholder="300"></div>
+            </div>
+          </div>
+          <button class="btn btn-p" onclick="saveSched()">💾 Lưu lịch</button>
+        </div>
+      </div>
+      <!-- Files -->
+      <div class="tc2" id="tab-files">
+        <div style="max-width:600px">
+          <div class="fg"><label class="fl">File danh sách IP</label><input type="text" id="cil" class="fc" placeholder="oob_ips.txt"></div>
+          <div class="fg"><label class="fl">File Baseline DB</label><input type="text" id="cbd" class="fc" placeholder="baseline.db"></div>
+          <div class="fg"><label class="fl">File Snapshot DB</label><input type="text" id="csd" class="fc" placeholder="snapshot.db"></div>
+          <button class="btn btn-p" onclick="saveFiles()">💾 Lưu</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</div>
+
+<!-- MODALS -->
+<div class="mo" id="addDev">
+  <div class="mb">
+    <div class="mh"><div class="mt">➕ Thêm thiết bị OOB</div><button class="mc" onclick="cModal('addDev')">×</button></div>
+    <div class="mbody">
+      <div class="fg"><label class="fl">IP Address *</label><input type="text" id="nip" class="fc" placeholder="192.168.1.100"></div>
+      <div class="fg"><label class="fl">Alias (Tên gọi)</label><input type="text" id="nal" class="fc" placeholder="OOB-HCM-01"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="cModal('addDev')">Hủy</button><button class="btn btn-p" onclick="addDevice()">Thêm mới</button></div>
+  </div>
+</div>
+
+<div class="mo" id="addCred">
+  <div class="mb">
+    <div class="mh"><div class="mt">👤 Thêm tài khoản phụ</div><button class="mc" onclick="cModal('addCred')">×</button></div>
+    <div class="mbody">
+      <div class="fg"><label class="fl">Username *</label><input type="text" id="cru" class="fc" placeholder="admin"></div>
+      <div class="fg"><label class="fl">Password</label><input type="password" id="crp" class="fc"></div>
+      <div class="fg"><label class="fl">Enable Password</label><input type="password" id="cre" class="fc"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="cModal('addCred')">Hủy</button><button class="btn btn-p" onclick="addCred()">Thêm</button></div>
+  </div>
+</div>
+
+<div class="mo" id="searchMod">
+  <div class="mb xl">
+    <div class="mh"><div class="mt">🔍 Kết quả: "<span id="skw"></span>"</div><button class="mc" onclick="cModal('searchMod')">×</button></div>
+    <div class="mbody" style="padding:0;overflow-x:auto">
+      <table>
+        <thead><tr><th style="padding-left:18px">OOB</th><th>Port</th><th>Description</th><th>Hostname Thực tế</th><th>Kết nối</th><th>Verify</th><th style="padding-right:18px">Đi tới</th></tr></thead>
+        <tbody id="sBdy"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="tc" id="toastCnt"></div>
+
+<script>
+let curPage='dashboard', curIP=null, sse=null, actTasks={};
+
+function initSSE(){
+  if(sse)sse.close();
+  sse=new EventSource('/api/events');
+  sse.onmessage=e=>{
+    try{
+      const d=JSON.parse(e.data);
+      if(d.type==='log')logMsg(d);
+      if(d.type==='task_done')taskDone(d);
+    }catch{}
+  };
+  sse.onerror=()=>setTimeout(initSSE,5000);
+}
+
+function logMsg(d){
+  const con=document.getElementById('liveCon');
+  const msg=esc(d.msg||'');
+  let cls='linf';
+  if(/OK|thanh cong|khop/i.test(msg))cls='lok';
+  else if(/LOI|that bai|error/i.test(msg))cls='lerr';
+  else if(/CANH BAO|warn/i.test(msg))cls='lwarn';
+  con.innerHTML+=`<div><span class="lts">[${d.ts||''}]</span> <span class="${cls}">${msg}</span></div>`;
+  con.scrollTop=con.scrollHeight;
+}
+
+function taskDone(d){
+  const tid=d.task;
+  if(actTasks[tid]){
+    delete actTasks[tid]; renderTasks();
+    toast(tid.split('_')[0].toUpperCase()+' hoàn thành!','success');
+    if(curPage==='dashboard')loadDash();
+    if(curPage==='devices'&&curIP)loadDevOpts(curIP);
+  }
+}
+
+function addTask(tid,lbl){actTasks[tid]={label:lbl};renderTasks();}
+function renderTasks(){
+  const bar=document.getElementById('atb');
+  const ts=Object.entries(actTasks);
+  if(!ts.length){bar.className='';bar.innerHTML='';return;}
+  bar.className='vis';
+  bar.innerHTML=ts.map(([id,t])=>`<div class="tp"><div class="sp"></div><div style="flex:1"><div style="font-size:13px;font-weight:500">${esc(t.label)}</div><div style="font-size:11px;color:var(--text3)">Đang chạy...</div></div><span class="badge bv bpulse">RUNNING</span></div>`).join('');
+}
+
+const ptitles={dashboard:'Dashboard',devices:'Chi tiết thiết bị',verify:'Verify & Scan',logs:'Nhật ký Verify',import:'Import / Export',settings:'Cài đặt'};
+function sPage(page,btn){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  const el=document.getElementById('page-'+page);
+  if(el)el.classList.add('active');
+  if(btn)btn.classList.add('active');
+  else{const n=document.querySelector('[data-page="'+page+'"]');if(n)n.classList.add('active');}
+  curPage=page;
+  document.getElementById('tbTitle').textContent=ptitles[page]||page;
+  if(page==='dashboard')loadDash();
+  if(page==='logs')loadLogs();
+  if(page==='settings')loadSettings();
+}
+
+function sTab(tabId,btn){
+  document.querySelectorAll('.tc2').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  btn.classList.add('active');
+  if(tabId==='tab-multi')loadCreds();
+}
+
+async function loadDash(){
+  const[stats,devs]=await Promise.all([fetch('/api/stats').then(r=>r.json()).catch(()=>({})),fetch('/api/devices').then(r=>r.json()).catch(()=>[])]);
+  document.getElementById('s-total').textContent=stats.total??0;
+  document.getElementById('s-online').textContent=stats.online??0;
+  document.getElementById('s-baseline').textContent=stats.has_baseline??0;
+  document.getElementById('s-alarms').textContent=stats.alarms??0;
+  const ab=document.getElementById('sAlBadge');
+  if(stats.alarms>0){ab.style.display='';ab.textContent=stats.alarms;}else ab.style.display='none';
+  const tbody=document.getElementById('dashBody');
+  if(!devs.length){tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:50px;color:var(--text3)">Chưa có thiết bị. Nhấn <strong>+ Thêm OOB</strong> để bắt đầu.</td></tr>';return;}
+  tbody.innerHTML=devs.map(d=>{
+    const pb=d.ping===true?'<span class="badge bg">● Online</span>':d.ping===false?'<span class="badge br">● Offline</span>':'<span class="badge bm">- Chưa</span>';
+    const mb=d.menu_state==='ok'?'<span class="badge bg">OK</span>':d.menu_state==='conn_failed'?'<span class="badge br">Lỗi</span>':d.menu_state==='no_menu'?'<span class="badge ba">No Menu</span>':'<span class="badge bm">'+(d.menu_state||'-')+'</span>';
+    const ab2=d.alarm_count>0?'<span class="badge bp">'+(d.alarm_count)+' ⚠️</span>':d.ok_count>0?'<span class="badge bt">'+d.ok_count+' ✓</span>':'<span class="badge bm">-</span>';
+    const upd=(d.updated_at||d.checked_at||'-').replace('T',' ').slice(0,16);
+    return`<tr>
+      <td><span class="fw6">${esc(d.alias)}</span></td>
+      <td><span class="mono">${esc(d.ip)}</span></td>
+      <td><span class="text-m" style="font-size:12px">${esc(d.device_name||'-')}</span></td>
+      <td>${pb}</td><td>${mb}</td>
+      <td style="text-align:center"><span class="badge bv">${d.opt_count}</span></td>
+      <td>${ab2}</td>
+      <td style="font-size:11px;color:var(--text3)">${esc(upd)}</td>
+      <td style="text-align:right">
+        <div class="bg2" style="justify-content:flex-end">
+          <button class="btn btn-g btn-sm btn-ic" onclick="openDev('${esc(d.ip)}','${esc(d.alias)}')" title="Chi tiết">👁</button>
+          <button class="btn btn-t btn-sm btn-ic" onclick="runAction('scan','${esc(d.ip)}')" title="Scan">🔍</button>
+          <button class="btn btn-a btn-sm btn-ic" onclick="runAction('verify','${esc(d.ip)}')" title="Verify">⚡</button>
+          <button class="btn btn-pk btn-sm btn-ic" onclick="runAction('push','${esc(d.ip)}')" title="Push">🚀</button>
+          <button class="btn btn-d btn-sm btn-ic" onclick="delDev('${esc(d.ip)}')" title="Xóa">🗑</button>
+        </div>
+      </td></tr>`;
+  }).join('');
+}
+
+function openDev(ip,alias){
+  curIP=ip; sPage('devices');
+  document.getElementById('devHdr').style.display='';
+  document.getElementById('devTitle').textContent=alias||ip;
+  document.getElementById('devIP').textContent=ip;
+  loadDevOpts(ip);
+}
+
+async function loadDevOpts(ip){
+  document.getElementById('devOptsBody').innerHTML='<tr class="lr"><td colspan="7"><div class="sp" style="margin:0 auto"></div></td></tr>';
+  const d=await fetch('/api/device/'+encodeURIComponent(ip)+'/options').then(r=>r.json()).catch(()=>null);
+  if(!d){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3)">Lỗi tải dữ liệu</td></tr>';return;}
+  document.getElementById('devMenu').textContent=d.menu_name||'-';
+  document.getElementById('devLines').textContent=d.options.length;
+  if(!d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Chạy Scan trước.</td></tr>';return;}
+  document.getElementById('devOptsBody').innerHTML=d.options.map(o=>{
+    const pc=o.protocol==='ssh'?'bt':o.protocol==='serial'?'bv':'ba';
+    let vb='<span class="badge bm">-</span>';
+    if(o.verify_status==='OK')vb='<span class="badge bg">✓ OK</span>';
+    else if(o.verify_status==='CANH BAO')vb='<span class="badge bp bpulse">⚠ Cảnh báo</span>';
+    else if(o.verify_status==='TIMEOUT')vb='<span class="badge ba">⏱ Timeout</span>';
+    else if(o.verify_status==='KHONG PIVOT')vb='<span class="badge br">↩ No Pivot</span>';
+    else if(o.verify_status==='YEU CAU DANG NHAP')vb='<span class="badge ba">🔑 Auth</span>';
+    const ah=o.act_host?'<span class="text-t fw6">'+esc(o.act_host)+'</span>':'<span class="text-m">-</span>';
+    return`<tr>
+      <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
+      <td>${esc(o.description)}</td>
+      <td><span class="mono text-t">${esc(o.ip)}</span></td>
+      <td><span class="mono">${o.port}</span></td>
+      <td><span class="badge ${pc}">${esc(o.protocol.toUpperCase())}</span></td>
+      <td>${vb}</td><td>${ah}</td></tr>`;
+  }).join('');
+}
+
+async function runAction(action,ip){
+  const lbl=action.toUpperCase()+' '+(ip||'Tất cả');
+  if(!confirm('Xác nhận chạy '+lbl+'?'))return;
+  if(curPage!=='verify')sPage('verify');
+  const con=document.getElementById('liveCon');
+  con.innerHTML+='<div><span class="lts">['+nw()+']</span> <span class="linf">▶ Bắt đầu '+esc(lbl)+'...</span></div>';
+  con.scrollTop=con.scrollHeight;
+  const res=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,ip})}).then(r=>r.json()).catch(()=>null);
+  if(res&&res.task_id){addTask(res.task_id,lbl);toast(res.msg||'Đã đưa vào hàng đợi!','info');}
+  else toast('Lỗi gửi lệnh!','error');
+}
+
+async function addDevice(){
+  const ip=document.getElementById('nip').value.trim(),alias=document.getElementById('nal').value.trim();
+  if(!ip){toast('Vui lòng nhập IP!','error');return;}
+  await fetch('/api/device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,alias})});
+  cModal('addDev');toast('Đã thêm '+ip+'!','success');loadDash();
+}
+
+async function delDev(ip){
+  if(!confirm('Xóa OOB '+ip+'?'))return;
+  await fetch('/api/device',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+  toast('Đã xóa '+ip+'!','success');loadDash();
+}
+
+async function doSearch(){
+  const q=document.getElementById('gSearch').value.trim();
+  if(!q)return;
+  document.getElementById('skw').textContent=q;
+  document.getElementById('sBdy').innerHTML='<tr class="lr"><td colspan="7"><div class="sp" style="margin:0 auto"></div></td></tr>';
+  oModal('searchMod');
+  const data=await fetch('/api/search?q='+encodeURIComponent(q)).then(r=>r.json()).catch(()=>[]);
+  if(!data.length){document.getElementById('sBdy').innerHTML='<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Không tìm thấy kết quả cho "'+esc(q)+'"</td></tr>';return;}
+  const vbadge=s=>{if(!s)return'';if(s==='OK')return'<span class="badge bg">✓</span>';if(s==='CANH BAO')return'<span class="badge bp">⚠️</span>';return'<span class="badge bm">'+s+'</span>';};
+  document.getElementById('sBdy').innerHTML=data.map(item=>`
+    <tr>
+      <td style="padding-left:18px"><strong class="text-t">${esc(item.oob_alias)}</strong><br><small class="text-m mono">${esc(item.oob_ip)}</small></td>
+      <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;padding:2px 8px;border-radius:4px;font-family:monospace">${esc(item.opt_key)}</kbd></td>
+      <td>${esc(item.desc)}</td>
+      <td>${item.act_host?'<span class="text-g fw6">'+esc(item.act_host)+'</span>':'<span class="text-m">-</span>'}</td>
+      <td><span class="mono text-m" style="font-size:11px">${esc(item.protocol)}://${esc(item.target_ip)}:${item.target_port}</span></td>
+      <td>${vbadge(item.verify_status)}</td>
+      <td style="padding-right:18px"><button class="btn btn-g btn-sm" onclick="cModal('searchMod');openDev('${esc(item.oob_ip)}','${esc(item.oob_alias)}')">Đi tới →</button></td>
+    </tr>`).join('');
+}
+
+async function loadLogs(){
+  const files=await fetch('/api/logs').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('logList');
+  if(!files.length){el.innerHTML='<div style="padding:16px;color:var(--text3);font-size:13px">Chưa có file log.</div>';return;}
+  el.innerHTML=files.map(f=>`<div class="lfi" onclick="loadLogCnt('${encodeURIComponent(f.name)}')"><span style="font-size:16px">📄</span><div style="flex:1;overflow:hidden"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${esc(f.name)}</div><div style="font-size:10px;color:var(--text3)">${f.mtime}</div></div></div>`).join('');
+}
+
+async function loadLogCnt(fn){
+  document.getElementById('logView').textContent='Đang tải...';
+  const d=await fetch('/api/logs/'+fn).then(r=>r.json()).catch(()=>null);
+  document.getElementById('logView').textContent=d&&d.content?d.content:'Lỗi tải file.';
+}
+
+async function loadSettings(){
+  const cfg=await fetch('/api/config').then(r=>r.json()).catch(()=>({}));
+  const m={'username':'cu','password':'cp','enable_password':'ce','vertiv_connect_password':'cv',
+           'ssh_port':'csp','telnet_port':'ctp','menu_name_override':'cmno',
+           'interval':'ci','verify_interval':'cvi','ip_list':'cil','baseline_db':'cbd','snapshot_db':'csd',
+           'verify_wait_after_connect':'cvwac','max_verify_duration':'cmvd',
+           'scan_schedule_time':'cst','scan_schedule_weekday':'csw','verify_schedule_time':'cvt','verify_schedule_weekday':'cvw'};
+  for(const[k,id] of Object.entries(m)){const el=document.getElementById(id);if(el)el.value=cfg[k]??'';}
+  const av=document.getElementById('cav');if(av)av.checked=cfg.auto_verify??true;
+  const sm=document.getElementById('csm');if(sm){sm.value=cfg.scan_schedule_mode||'interval';togSF('scan');}
+  const vm=document.getElementById('cvm');if(vm){vm.value=cfg.verify_schedule_mode||'interval';togSF('verify');}
+}
+
+function togSF(p){
+  const mode=document.getElementById(p==='scan'?'csm':'cvm').value;
+  const tf=document.getElementById(p[0]+'_tf'),wf=document.getElementById(p[0]+'_wf');
+  if(tf)tf.style.display=mode!=='interval'?'':'none';
+  if(wf)wf.style.display=mode==='weekly'?'':'none';
+}
+
+async function saveCfg(){
+  const pay={username:g('cu').value,password:g('cp').value,enable_password:g('ce').value,
+             vertiv_connect_password:g('cv').value,ssh_port:parseInt(g('csp').value)||22,
+             telnet_port:parseInt(g('ctp').value)||23,menu_name_override:g('cmno').value,
+             auto_verify:g('cav').checked};
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
+  if(r.ok)toast('Đã lưu cài đặt!','success');else toast('Lỗi lưu!','error');
+}
+
+async function saveSched(){
+  const pay={scan_schedule_mode:g('csm').value,interval:parseInt(g('ci').value)||30,
+             scan_schedule_time:g('cst').value,scan_schedule_weekday:g('csw').value,
+             verify_schedule_mode:g('cvm').value,verify_interval:parseInt(g('cvi').value)||3600,
+             verify_schedule_time:g('cvt').value,verify_schedule_weekday:g('cvw').value,
+             verify_wait_after_connect:parseFloat(g('cvwac').value)||1.5,max_verify_duration:parseInt(g('cmvd').value)||300};
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
+  if(r.ok)toast('Đã lưu lịch!','success');else toast('Lỗi!','error');
+}
+
+async function saveFiles(){
+  const pay={ip_list:g('cil').value,baseline_db:g('cbd').value,snapshot_db:g('csd').value};
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
+  if(r.ok)toast('Đã lưu!','success');else toast('Lỗi!','error');
+}
+
+async function loadCreds(){
+  const creds=await fetch('/api/credentials').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('credList');
+  if(!creds.length){el.innerHTML='<div style="color:var(--text3);font-size:13px;padding:12px">(Chưa có tài khoản phụ)</div>';return;}
+  el.innerHTML=creds.map((c,i)=>`<div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--rs);margin-bottom:8px"><span style="font-size:18px">👤</span><div style="flex:1"><div style="font-weight:600;font-size:13.5px">${esc(c.username)}</div><div style="font-size:11px;color:var(--text3)">${c.has_pass?'🔑 Có pass':''} ${c.has_enable?'· Enable ✓':''}</div></div><button class="btn btn-d btn-sm" onclick="delCred(${i})">Xóa</button></div>`).join('');
+}
+
+async function addCred(){
+  const user=g('cru').value.trim();
+  if(!user){toast('Cần nhập username!','error');return;}
+  await fetch('/api/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:g('crp').value,enable_password:g('cre').value})});
+  cModal('addCred');toast('Đã thêm!','success');loadCreds();
+}
+
+async function delCred(idx){
+  if(!confirm('Xóa tài khoản này?'))return;
+  await fetch('/api/credentials',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx})});
+  toast('Đã xóa!','success');loadCreds();
+}
+
+async function doImport(){
+  const text=document.getElementById('importTxt').value.trim();
+  if(!text){toast('Vui lòng nhập dữ liệu!','error');return;}
+  const res=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}).then(r=>r.json()).catch(()=>null);
+  const el=document.getElementById('importRes');el.style.display='';
+  if(res){el.innerHTML='<span class="text-t">✓ Thêm '+res.added+' thiết bị, bỏ qua '+res.skipped+'.</span>';toast('Import xong! +'+res.added,'success');}
+  else{el.innerHTML='<span style="color:var(--red)">✗ Lỗi import!</span>';toast('Lỗi!','error');}
+}
+
+function oModal(id){document.getElementById(id).classList.add('open');}
+function cModal(id){document.getElementById(id).classList.remove('open');}
+document.addEventListener('click',e=>{if(e.target.classList.contains('mo'))e.target.classList.remove('open');});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.open').forEach(m=>m.classList.remove('open'));});
+
+function toast(msg,type='info'){
+  const c=document.getElementById('toastCnt');
+  const t=document.createElement('div');t.className='toast '+type;
+  const icons={success:'✅',error:'❌',info:'ℹ️',warning:'⚠️'};
+  t.innerHTML='<span>'+(icons[type]||'ℹ️')+'</span><span style="flex:1">'+esc(msg)+'</span>';
+  c.appendChild(t);setTimeout(()=>{t.style.opacity='0';t.style.transform='translateX(20px)';t.style.transition='.3s';setTimeout(()=>t.remove(),300);},4000);
+}
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function nw(){return new Date().toLocaleTimeString('vi-VN');}
+function g(id){return document.getElementById(id);}
+
+setInterval(()=>{document.getElementById('clk').textContent=new Date().toLocaleString('vi-VN');},1000);
+document.getElementById('clk').textContent=new Date().toLocaleString('vi-VN');
+
+async function chkDaemon(){
+  try{
+    const tasks=await fetch('/api/tasks').then(r=>r.json());
+    const run=Object.values(tasks).filter(t=>t.status==='running').length;
+    const dot=document.getElementById('dDot'),txt=document.getElementById('dTxt');
+    if(run>0){dot.className='d-dot on';txt.textContent=run+' task đang chạy';}
+    else{dot.className='d-dot';txt.textContent='Web server hoạt động';}
+  }catch{}
+}
+setInterval(chkDaemon,8000);chkDaemon();
+initSSE();loadDash();
+</script>
+</body>
+</html>"""
+
 @app.route("/")
 def index():
-    ips = get_ips()
-    dev_status = oob_monitor.load_device_status()
-    devices = []
-    stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "err_menu": 0}
-
-    for item in ips:
-        ip, alias = item[0], item[1]  # <--- FIX CỨNG TYPE ERROR Ở ĐÂY
-        status = dev_status.get(ip, {})
-        
-        if status.get("ping") is True: stats["online"] += 1
-        elif status.get("ping") is False: stats["offline"] += 1
-            
-        if status.get("menu_state") in ["conn_failed", "fetch_failed"]: stats["err_menu"] += 1
-
-        opts = query_db("SELECT count(*) as cnt FROM baseline_menu WHERE host=?", (ip,))
-        opt_count = opts[0]["cnt"] if opts else 0
-        if opt_count > 0: stats["has_baseline"] += 1
-
-        devices.append({
-            "alias": alias, "ip": ip, "ping": status.get("ping"), "menu_state": status.get("menu_state"),
-            "checked_at": status.get("checked_at", "-"), "opt_count": opt_count
-        })
-
-    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return render_template_string(HTML_TEMPLATE, devices=devices, stats=stats, time_now=time_now)
+    return render_template_string(HTML)
 
 @app.route("/device/<ip>")
-def device_detail(ip):
-    options = query_db("SELECT * FROM baseline_menu WHERE host=? ORDER BY CAST(option_key AS INTEGER)", (ip,))
-    return render_template_string(DETAIL_TEMPLATE, ip=ip, options=[dict(row) for row in options])
+def device_redir(ip):
+    return render_template_string(HTML)
 
 if __name__ == "__main__":
-    print("=========================================================")
-    print(">> GIAO DIEN WEB OOB (CO THANH SEARCH) DA KHOI DONG")
-    print(">> Mo trinh duyet va truy cap: http://127.0.0.1:5000")
-    print("=========================================================")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print("=" * 60)
+    print("  OOB Network Manager - Web Panel v2.0")
+    print("  Truy cap: http://127.0.0.1:5000")
+    print("=" * 60)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
