@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
     "username": "",
     "password": "",
     "enable_password": "",
-    "vertiv_connect_password": "",  # Pass dung de connect vao cac line cua Vertiv
+    "vertiv_connect_password": "",  
     "credentials": [],          
     "menu_name_override": "",
     "ssh_port": 22,
@@ -221,6 +221,64 @@ def _describe_scan_schedule(cfg):
     if mode == "weekly": return f"Hang tuan vao {_WEEKDAY_LABELS.get((cfg.get('scan_schedule_weekday', 'mon') or 'mon').strip().lower()[:3], 'mon')} luc {cfg.get('scan_schedule_time', '01:00')}"
     return f"Lap lai moi {cfg.get('interval', 30)}s"
 
+def _edit_verify_schedule(cfg):
+    _con.print(f"\n  --- Lich chay Deep Verify tu dong ---")
+    _con.print(f"  Hien tai: {_describe_verify_schedule(cfg)}")
+    _con.print("  1. Lap lai theo chu ky (interval)")
+    _con.print("  2. Hang ngay, vao 1 gio co dinh")
+    _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    if mode_choice == "1":
+        cfg["verify_schedule_mode"] = "interval"
+        _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
+    elif mode_choice == "2":
+        cfg["verify_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: Hang ngay luc {cfg.get('verify_schedule_time', '01:00')}.")
+    elif mode_choice == "3":
+        cfg["verify_schedule_mode"] = "weekly"
+        wd_val = _con.input(f"  [cyan]Thu (mon/tue/wed/thu/fri/sat/sun)[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP: cfg["verify_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_verify_schedule(cfg)}.")
+    else:
+        _con.print("  [yellow][!][/] Lua chon khong hop le.")
+
+def _edit_scan_schedule(cfg):
+    _con.print(f"\n  --- Lich chay Thu thap cau hinh ---")
+    _con.print(f"  Hien tai: {_describe_scan_schedule(cfg)}")
+    _con.print("  1. Lap lai theo chu ky (interval)")
+    _con.print("  2. Hang ngay, vao 1 gio co dinh")
+    _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    if mode_choice == "1":
+        cfg["scan_schedule_mode"] = "interval"
+        _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
+    elif mode_choice == "2":
+        cfg["scan_schedule_mode"] = "daily"
+        val = _con.input(f"  [cyan]Gio chay moi ngay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: Hang ngay luc {cfg.get('scan_schedule_time', '01:00')}.")
+    elif mode_choice == "3":
+        cfg["scan_schedule_mode"] = "weekly"
+        wd_val = _con.input(f"  [cyan]Thu (mon/tue/wed/thu/fri/sat/sun)[/]: ").strip().lower()
+        if wd_val[:3] in _WEEKDAY_MAP: cfg["scan_schedule_weekday"] = wd_val[:3]
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_scan_schedule(cfg)}.")
+    else:
+        _con.print("  [yellow][!][/] Lua chon khong hop le.")
+
 def settings_menu(cfg, config_path):
     while True:
         v_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("verify_schedule_mode", "interval") in ("daily", "weekly") else "[dim green]<- Dang co hieu luc[/]"
@@ -265,7 +323,7 @@ def settings_menu(cfg, config_path):
         if choice == "1": cfg["username"] = input("  Username moi (Enter de bo trong): ").strip()
         elif choice == "2": cfg["password"] = getpass.getpass("  Password moi: ").strip()
         elif choice == "3": cfg["enable_password"] = getpass.getpass("  Enable password moi: ").strip()
-        elif choice == "y": cfg["vertiv_connect_password"] = getpass.getpass("  Vertiv Connect Password: ").strip()
+        elif choice == "y": cfg["vertiv_connect_password"] = getpass.getpass("  Vertiv Connect Pass: ").strip()
         elif choice == "4": cfg["menu_name_override"] = input(f"  Ten menu ep dung: ").strip()
         elif choice == "5": val = input("  SSH port moi: ").strip(); cfg["ssh_port"] = int(val) if val.isdigit() else cfg["ssh_port"]
         elif choice == "6": val = input("  Telnet port moi: ").strip(); cfg["telnet_port"] = int(val) if val.isdigit() else cfg["telnet_port"]
@@ -279,7 +337,6 @@ def settings_menu(cfg, config_path):
         elif choice == "b": cfg["auto_verify"] = not cfg.get("auto_verify", True)
         elif choice == "d": _edit_verify_schedule(cfg)
         elif choice == "s": _edit_scan_schedule(cfg)
-        elif choice == "t": _test_connection(cfg)
         elif choice == "k": 
             _con.print("\n  [bold]Danh sach Tai khoan phu (Multi-Account)[/]")
             creds = cfg.setdefault("credentials", [])
@@ -304,6 +361,22 @@ def settings_menu(cfg, config_path):
             elif sub == "c":
                 cfg["credentials"] = []
                 _con.print("  [green](OK)[/] Da xoa toan bo tai khoan phu.")
+        elif choice == "t":
+            test_ip = _con.input("  [cyan]Nhap IP OOB can thu ket noi[/]: ").strip()
+            if test_ip:
+                creds = get_all_credentials(cfg)
+                _con.print(f"  [cyan][*][/] Dang thu ket noi toi [bold]{test_ip}[/] ...")
+                last_exc = None
+                for idx, c in enumerate(creds):
+                    try:
+                        session = connect_auto(test_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), c["username"], c["password"], c["enable_password"], timeout=8)
+                        hn = fetch_hostname(session)
+                        session.close()
+                        _con.print(f"  [green](OK)[/] Ket noi thanh cong ({c['username']})! Hostname: [bold cyan]{hn or '?'}[/]")
+                        break
+                    except Exception as e: last_exc = e
+                else:
+                    _con.print(f"  [red][!][/] Ket noi that bai: {last_exc}")
         elif choice == "0":
             save_config(config_path, cfg)
             _con.print(f"[green][*][/] Da luu cau hinh vao {config_path}")
@@ -312,31 +385,6 @@ def settings_menu(cfg, config_path):
             _con.print("[yellow][!][/] Lua chon khong hop le.")
             continue
         save_config(config_path, cfg)
-
-def _test_connection(cfg):
-    test_ip = _con.input("  [cyan]Nhap IP OOB can thu ket noi[/]: ").strip()
-    if not test_ip:
-        _con.print("  [yellow][!][/] Khong nhap IP. Huy.")
-        return
-    creds = get_all_credentials(cfg)
-    if not any(c.get("password") for c in creds):
-        _con.print("  [yellow][!][/] Chua cau hinh bat ky password nao. Vui long cau hinh truoc.")
-        return
-    _con.print(f"  [cyan][*][/] Dang thu ket noi toi [bold]{test_ip}[/] (Multi-Account)...")
-    last_exc = None
-    for idx, c in enumerate(creds):
-        try:
-            session = connect_auto(
-                test_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23),
-                c["username"], c["password"], c["enable_password"], timeout=8,
-            )
-            hn = fetch_hostname(session)
-            session.close()
-            _con.print(f"  [green](OK)[/] Ket noi thanh cong bang tai khoan: ({c['username']})! Hostname: [bold cyan]{hn or '?'}[/]")
-            return
-        except Exception as e:
-            last_exc = e
-    _con.print(f"  [red][!][/] Ket noi that bai (thu {len(creds)} tai khoan): {last_exc}")
 
 def load_ip_list(path):
     hosts = []
@@ -613,26 +661,27 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         try: s = get_session()
         except Exception: raise RuntimeError("Khong the ket noi toi OOB")
         
-        # S?A: Dung description cho Vertiv thay vi port
-        if vendor == "vertiv": cmd = f"connect {t_desc}"
-        else: cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
-        
-        s.write(cmd)
-        time.sleep(float(cfg.get("verify_wait_after_connect", 1.5))) 
-        
-        # S?A: X? l? h?i m?t kh?u c?a Vertiv Session
         out = ""
-        if vendor == "vertiv" and cfg.get("vertiv_connect_password"):
-            out = s.read_until(["assword:", "Password:", ">", "#", "login:"], timeout=2)
+        if vendor == "vertiv": 
+            cmd = f"connect {t_desc}"
+            s.write(cmd)
+            # Vertiv hoac se doi Pass, hoac se ra thang Type the hot key
+            out = s.read_until(["assword:", "Password:", "Type the hot key", "login:", "cli->"], timeout=4)
             if "assword:" in out or "Password:" in out:
-                s.write(cfg.get("vertiv_connect_password"))
-                time.sleep(1.0)
-
+                v_pass = cfg.get("vertiv_connect_password", "")
+                s.write(v_pass)
+                out += s.read_until(["Type the hot key", "login:", "cli->"], timeout=3)
+        else: 
+            cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
+            s.write(cmd)
+        
+        time.sleep(float(cfg.get("verify_wait_after_connect", 1.5))) 
         s.write("\r\n\r\n") 
         out += s.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
         
         try:
             if vendor == "vertiv":
+                # Ep ngat Vertiv ve lai menu ACS
                 s.write_raw(b"\x1a\r\n~.\r\n")
                 reset_session()
             else:
@@ -659,9 +708,23 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         output = _ANSI_STRIP_RE.sub('', output)
         auth_seen = False
         for line in reversed([l.strip() for l in output.splitlines() if l.strip()]):
-            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line"]) or _CONN_ERR_RE.search(line): continue
-            m = _HOSTNAME_PROMPT_RE.search(line) or _HOSTNAME_LOGIN_RE.search(line) or _HOSTNAME_BSD_RE.search(line)
-            if m: return m.group(1)
+            # Bo qua hoan toan cac log he thong cua OOB hoac Vertiv
+            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->"]) or _CONN_ERR_RE.search(line): 
+                continue
+            
+            m_login = _HOSTNAME_LOGIN_RE.search(line)
+            if m_login: return m_login.group(1)
+            
+            m_bsd = _HOSTNAME_BSD_RE.search(line)
+            if m_bsd: return m_bsd.group(1)
+            
+            m_prompt = _HOSTNAME_PROMPT_RE.search(line)
+            if m_prompt: 
+                h = m_prompt.group(1)
+                # Chan truong hop nham log "cli->" hoac "access" cua Vertiv
+                if h.lower() not in ["cli", "cli-", "access"]: 
+                    return h
+                    
             if re.search(r'Username:|Password:|login:', line, re.IGNORECASE): auth_seen = True
         return "AUTH_REQUIRED" if auth_seen else None
 
@@ -996,7 +1059,7 @@ def scan_specific_devices(cfg):
             if ip.lower() in target_list or alias.lower() in target_list: hosts_to_scan.append((ip, alias))
     if not hosts_to_scan: return
     
-    _con.print(f"\n  [green][*] Bat dau quet C?u h?nh ?A LU?NG {len(hosts_to_scan)} thiet bi...[/]")
+    _con.print(f"\n  [green][*] Bat dau quet Cau hinh DA LUONG {len(hosts_to_scan)} thiet bi...[/]")
     
     total_hosts = len(hosts_to_scan)
     started_hosts = 0
@@ -1366,6 +1429,24 @@ def export_menu_report(cfg):
         if sd.get("match", 0) > 0: ws2.cell(ri2, 8).fill = mk_fill(C_MATCH)
     for i, w in enumerate([18, 16, 12, 20, 20, 20, 14, 10, 10, 14, 12, 13], 1): ws2.column_dimensions[get_column_letter(i)].width = w
 
+    ws3 = wb.create_sheet("Canh bao")
+    h3 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Target IP", "Target Port", "Protocol", "Desc Status", "Ghi chu"]
+    for ci, h in enumerate(h3, 1):
+        c = ws3.cell(1, ci, h); c.font = Font(bold=True, color="FFFFFF"); c.fill = mk_fill("C00000"); c.alignment = Alignment(horizontal="center"); c.border = mk_bdr()
+    ws3.freeze_panes = "A2"
+    ws3.auto_filter.ref = f"A1:{get_column_letter(len(h3))}1"
+
+    alert_statuses = {"SAI - Sai desc", "Khong ket noi duoc"}
+    ri3 = 2
+    for row_idx in range(2, ri):
+        if ws1.cell(row_idx, 12).value in alert_statuses:
+            for ci in range(1, len(h3) + 1):
+                dst = ws3.cell(ri3, ci, ws1.cell(row_idx, ci).value); dst.border = mk_bdr(); dst.alignment = Alignment(vertical="center")
+                if ci == 12: dst.fill = mk_fill(C_WRONG); dst.font = Font(bold=True); dst.alignment = Alignment(horizontal="center", vertical="center")
+            ri3 += 1
+    if ri3 == 2: ws3.cell(2, 1, "(Khong co canh bao nao)")
+    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 22, 44], 1): ws3.column_dimensions[get_column_letter(i)].width = w
+
     os.makedirs("reports", exist_ok=True)
     out = os.path.join("reports", f"OOB_Menu_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     wb.save(out)
@@ -1405,7 +1486,7 @@ def _show_menu(cfg):
     grid.add_row("[8]", "[bold magenta]Deep Verify Vat ly tuc thi (Chi dinh hoac Tat ca)[/]")
     grid.add_row("\\[p]", "[bold yellow]Push cau hinh sua loi Description (Thu cong)[/]")
     grid.add_row("[9]", "[dim magenta]Xem ket qua Verify vat ly gan nhat[/]")
-    grid.add_row("\\[e]", "[yellow]Xuat bao cao menu OOB ra Excel (tat ca thiet bi)[/]")
+    grid.add_row("\\[e]", "[yellow]Xuat bao cao menu OOB ra Excel (3 Sheet)[/]")
     grid.add_row("", ""); grid.add_row("[0]", "[bold red]Thoat[/]")
 
     _con.print()
