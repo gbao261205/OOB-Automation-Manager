@@ -1446,7 +1446,7 @@ def export_menu_report(cfg):
     wb = openpyxl.Workbook()
     ws1 = wb.active
     ws1.title = "Chi tiet"
-    h1 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Target IP", "Target Port", "Protocol", "Desc Status", "Ghi chu"]
+    h1 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Target IP", "Target Port", "Protocol", "Vendor", "Desc Status", "Ghi chu"]
     for ci, h in enumerate(h1, 1):
         c = ws1.cell(1, ci, h); c.font = Font(bold=True, color="FFFFFF"); c.fill = mk_fill(C_HDR); c.alignment = Alignment(horizontal="center"); c.border = mk_bdr()
     ws1.freeze_panes = "A2"
@@ -1467,6 +1467,7 @@ def export_menu_report(cfg):
         for opt_key in sorted(baseline):
             opt = baseline[opt_key]
             desc, t_ip, t_port, proto = opt.get("description", ""), opt.get("ip", ""), opt.get("port", ""), opt.get("protocol", "telnet")
+            vendor = opt.get("vendor", "cisco").upper()
             if not desc:
                 slabel, note, scolor = "Khong co desc", "O description trong", C_NO_DS
                 cnt["no_desc"] += 1
@@ -1488,12 +1489,12 @@ def export_menu_report(cfg):
                     slabel, note, scolor = f"? {vr['status']}", vr.get("status", ""), C_UNVER
                     cnt["unverif"] += 1
 
-            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, hn, mn or "", opt_key, desc, t_ip, t_port, proto, slabel, note], 1):
+            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, hn, mn or "", opt_key, desc, t_ip, t_port, proto, vendor, slabel, note], 1):
                 c = ws1.cell(ri, ci, val); c.border = mk_bdr(); c.alignment = Alignment(vertical="center")
-                if ci == 12: c.fill = mk_fill(scolor); c.font = Font(bold=True)
+                if ci == 13: c.fill = mk_fill(scolor); c.font = Font(bold=True) 
             ri += 1
         summary.append({"alias": alias, "ip": ip, "ping": ping_lbl, "menu_state": menu_state_lbl, "hn": hn, "mn": mn or "", "total": len(baseline), **cnt})
-    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 22, 44], 1): ws1.column_dimensions[get_column_letter(i)].width = w
+    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 12, 22, 44], 1): ws1.column_dimensions[get_column_letter(i)].width = w
 
     ws2 = wb.create_sheet("Tom tat")
     h2 = ["OOB Alias", "OOB IP", "Ping", "Trang thai Menu", "Hostname OOB", "Menu", "Tong Option", "OK Khop", "SAI", "Chua Verify", "Khong KN", "Khong Desc"]
@@ -1510,7 +1511,7 @@ def export_menu_report(cfg):
     for i, w in enumerate([18, 16, 12, 20, 20, 20, 14, 10, 10, 14, 12, 13], 1): ws2.column_dimensions[get_column_letter(i)].width = w
 
     ws3 = wb.create_sheet("Canh bao")
-    h3 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Target IP", "Target Port", "Protocol", "Desc Status", "Ghi chu"]
+    h3 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Target IP", "Target Port", "Protocol", "Vendor", "Desc Status", "Ghi chu"]
     for ci, h in enumerate(h3, 1):
         c = ws3.cell(1, ci, h); c.font = Font(bold=True, color="FFFFFF"); c.fill = mk_fill("C00000"); c.alignment = Alignment(horizontal="center"); c.border = mk_bdr()
     ws3.freeze_panes = "A2"
@@ -1519,13 +1520,13 @@ def export_menu_report(cfg):
     alert_statuses = {"SAI - Sai desc", "Khong ket noi duoc"}
     ri3 = 2
     for row_idx in range(2, ri):
-        if ws1.cell(row_idx, 12).value in alert_statuses:
+        if ws1.cell(row_idx, 13).value in alert_statuses: # Đã đổi 12 -> 13
             for ci in range(1, len(h3) + 1):
                 dst = ws3.cell(ri3, ci, ws1.cell(row_idx, ci).value); dst.border = mk_bdr(); dst.alignment = Alignment(vertical="center")
-                if ci == 12: dst.fill = mk_fill(C_WRONG); dst.font = Font(bold=True); dst.alignment = Alignment(horizontal="center", vertical="center")
+                if ci == 13: dst.fill = mk_fill(C_WRONG); dst.font = Font(bold=True); dst.alignment = Alignment(horizontal="center", vertical="center") # Đã đổi 12 -> 13
             ri3 += 1
     if ri3 == 2: ws3.cell(2, 1, "(Khong co canh bao nao)")
-    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 22, 44], 1): ws3.column_dimensions[get_column_letter(i)].width = w
+    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 12, 22, 44], 1): ws3.column_dimensions[get_column_letter(i)].width = w
 
     os.makedirs("reports", exist_ok=True)
     out = os.path.join("reports", f"OOB_Menu_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
