@@ -979,6 +979,8 @@ def run_verify_daemon(cfg):
     log_verify(f"[green][START][/] Khoi dong Verify vat ly - lich: {_describe_verify_schedule(cfg)}.")
     time.sleep(15)
     while True:
+        cfg = load_config(config_path)
+        
         if cfg.get("auto_verify", True):
             hosts = load_ip_list(cfg["ip_list"])
             if hosts:
@@ -1031,7 +1033,7 @@ def run_daemon(cfg, config_path=None):
         return
 
     update_ui()
-    threading.Thread(target=run_verify_daemon, args=(cfg,), daemon=True).start()
+    threading.Thread(target=run_verify_daemon, args=(config_path or CONFIG_FILE_DEFAULT,), daemon=True).start()
     threading.Thread(target=_daemon_heartbeat_loop, daemon=True).start()
     
     with Live(layout, refresh_per_second=4, screen=False) as live:

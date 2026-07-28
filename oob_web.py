@@ -560,6 +560,10 @@ def api_device():
 @login_required
 def api_action():
     d = request.json or {}; action = d.get("action"); tip = d.get("ip") or None
+    
+    if not tip or tip == "all":
+        return jsonify({"status": "error", "msg": "Tác vụ chạy hàng loạt (all) đã bị vô hiệu hóa!"}), 400
+    
     tid = action + "_" + (tip or "all") + "_" + str(int(time.time()))
     _new_task(tid, action=action, ip=tip)
     runners = {"scan":_run_scan,"verify":_run_verify,"push":_run_push}
@@ -613,16 +617,50 @@ def api_revert():
 @app.route("/api/import", methods=["POST"])
 @login_required
 def api_import():
-    import re; _IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-    cfg = _cfg(); lines = (request.json or {}).get("text","").splitlines()
-    added = skipped = 0; existing = {h[0] for h in oob_monitor.load_ip_list_cached(cfg["ip_list"])}
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"): continue
-        parts = line.split(); ip = parts[0]; alias = parts[1] if len(parts)>1 else ip
-        if not _IP.match(ip) or ip in existing: skipped+=1; continue
-        oob_monitor.add_ip(cfg["ip_list"],ip,alias); existing.add(ip); added+=1
-    return jsonify({"added":added,"skipped":skipped})
+    import re
+    _IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+    cfg = _cfg()
+    
+    # Kiểm tra file upload
+    if 'file' not in request.files:
+        return jsonify({"status": "error", "msg": "Không tìm thấy file tải lên"}), 400
+        
+    file = request.files['file']
+    if not file.filename.endswith('.xlsx'):
+        return jsonify({"status": "error", "msg": "Chỉ chấp nhận định dạng .xlsx"}), 400
+        
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        return jsonify({"status": "error", "msg": f"Lỗi đọc file: {e}"}), 400
+
+    added = skipped_dup = skipped_invalid = 0
+    existing_ips = {h[0] for h in oob_monitor.load_ip_list_cached(cfg["ip_list"])}
+    
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None: continue
+        ip_raw = str(row[0]).strip()
+        alias = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ip_raw
+        
+        if not _IP.match(ip_raw): 
+            skipped_invalid += 1
+            continue
+        if ip_raw in existing_ips: 
+            skipped_dup += 1
+            continue
+            
+        oob_monitor.add_ip(cfg["ip_list"], ip_raw, alias)
+        existing_ips.add(ip_raw)
+        added += 1
+        
+    return jsonify({
+        "status": "ok", 
+        "added": added, 
+        "skipped": skipped_dup, 
+        "invalid": skipped_invalid
+    })
 
 
 HTML = r"""<!DOCTYPE html>
@@ -983,11 +1021,6 @@ select.fc option{background:#1a1a2e}
     <!-- VERIFY & SCAN (Chi Admin) -->
     <div class="page" id="page-verify">
       <div class="sh mb16"><div class="st"><span class="dot"></span>Vận hành Tức thì</div></div>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px">
-        <div class="sc c1" style="cursor:pointer" onclick="runAction('scan',null)"><div style="font-size:28px;margin-bottom:10px">🔍</div><div class="sl">SCAN CONFIG</div><div style="font-size:12px;color:var(--text2);margin-top:6px">Thu thập cấu hình menu từ tất cả OOB</div></div>
-        <div class="sc c3" style="cursor:pointer" onclick="runAction('verify',null)"><div style="font-size:28px;margin-bottom:10px">⚡</div><div class="sl">DEEP VERIFY</div><div style="font-size:12px;color:var(--text2);margin-top:6px">Kiểm tra vật lý PIVOT tất cả line console</div></div>
-        <div class="sc c4" style="cursor:pointer" onclick="runAction('push',null)"><div style="font-size:28px;margin-bottom:10px">🚀</div><div class="sl">PUSH CONFIG</div><div style="font-size:12px;color:var(--text2);margin-top:6px">Tự động sửa Description sai lệch</div></div>
-      </div>
       <div class="sh"><div class="st"><span class="dot"></span>Chạy cho thiết bị cụ thể</div></div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:24px">
         <div class="fg"><label class="fl">IP hoặc Alias (để trống = Tất cả)</label><input type="text" id="specIP" class="fc" placeholder="VD: 192.168.1.1"></div>
@@ -1028,9 +1061,11 @@ select.fc option{background:#1a1a2e}
         {% if is_admin %}
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:22px">
           <div class="st mb16"><span class="dot"></span>Import Danh sách IP</div>
-          <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Mỗi dòng 1 thiết bị. Format: <code style="color:var(--teal)">IP [alias]</code></p>
-          <textarea id="importTxt" class="ia" placeholder="192.168.1.1 OOB-HCM-01&#10;192.168.1.2 OOB-HCM-02"></textarea>
-          <div style="margin-top:14px"><button class="btn btn-p" onclick="doImport()">⬆ Import</button></div>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Upload file Excel (.xlsx). Cột A = IP, Cột B = Alias.</p>
+          <input type="file" id="importFile" class="fc" accept=".xlsx" style="padding: 9px; cursor: pointer;">
+          <div style="margin-top:14px">
+            <button class="btn btn-p" onclick="doImportExcel()">⬆ Upload Excel</button>
+          </div>
           <div id="importRes" style="margin-top:12px;font-size:13px;display:none"></div>
         </div>
         {% endif %}
@@ -1522,14 +1557,26 @@ async function delCred(idx){
   toast('Đã xóa!','success');loadCreds();
 }
 
-async function doImport(){
-  if(!isAdmin) return;
-  const text=document.getElementById('importTxt').value.trim();
-  if(!text){toast('Vui lòng nhập dữ liệu!','error');return;}
-  const res=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}).then(r=>r.json()).catch(()=>null);
-  const el=document.getElementById('importRes');el.style.display='';
-  if(res&&res.added!==undefined){el.innerHTML='<span class="text-t">✓ Thêm '+res.added+' thiết bị, bỏ qua '+res.skipped+'.</span>';toast('Import xong! +'+res.added,'success');}
-  else{el.innerHTML='<span style="color:var(--red)">✗ Lỗi import!</span>';toast('Lỗi!','error');}
+async function doImportExcel() {
+    if(!isAdmin) return;
+    const fileInput = document.getElementById('importFile');
+    if(!fileInput.files.length) { toast('Vui lòng chọn file .xlsx!', 'error'); return; }
+    
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+    
+    const res = await fetch('/api/import', { method: 'POST', body: formData }).then(r=>r.json()).catch(()=>null);
+    const el = document.getElementById('importRes'); 
+    el.style.display = '';
+    
+    if (res && res.status === 'ok') {
+        el.innerHTML = `<span class="text-t">✓ Đã thêm ${res.added} thiết bị (Bỏ qua ${res.skipped} trùng, ${res.invalid} lỗi).</span>`;
+        toast(`Import thành công ${res.added} thiết bị!`, 'success');
+        fileInput.value = ''; // Reset input
+    } else {
+        el.innerHTML = `<span style="color:var(--red)">✗ ${res?.msg || 'Lỗi xử lý file!'}</span>`;
+        toast('Lỗi tải lên!', 'error');
+    }
 }
 
 function oModal(id){
