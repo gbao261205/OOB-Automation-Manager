@@ -19,20 +19,6 @@ Gồm 3 file chính:
   tiến trình hoàn toàn tách biệt, không tự động lặp lại gì cả** — mọi hành động
   (Scan/Verify/Push) chỉ chạy khi có người bấm nút. Xem mục 8 để biết chi tiết
   Web đang thiếu gì so với CLI.
-
-> ⚠️ **Trước khi đọc tiếp:** README này được viết lại dựa trên việc đọc lại toàn
-> bộ `oob_web.py` hiện có trong repo. Có 1 điểm cần bạn xác nhận lại: bạn nói là
-> **đã xóa tính năng "chạy cho tất cả thiết bị" trên bản Web**, nhưng trong code
-> `oob_web.py` hiện tại (trang **"Vận hành Tức thì"**, 3 thẻ SCAN CONFIG / DEEP
-> VERIFY / PUSH CONFIG, và ô "IP hoặc Alias — để trống = Tất cả") **vẫn còn** gọi
-> `runAction('scan', null)` / `runAction('verify', null)` / `runAction('push',
-> null)`, và backend (`_run_scan`/`_run_verify`/`_run_push` với `target_ip=None`)
-> vẫn xử lý toàn bộ danh sách thiết bị khi `ip` để trống. Tức là về mặt code, nút
-> "chạy cho tất cả" (thủ công, bấm 1 lần) **vẫn đang tồn tại** — thứ **thực sự
-> không có** là **lặp lại tự động theo lịch** (xem mục 8.1). README dưới đây mô
-> tả đúng theo code hiện tại; nếu bạn đã xóa ở 1 bản khác chưa upload lên đây thì
-> báo lại để mình cập nhật.
-
 ---
 
 ## 1. Yêu cầu hệ thống
