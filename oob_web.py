@@ -3,7 +3,7 @@ oob_web.py - Web Panel v2.0 cho OOB Network Manager
 Chay: python oob_web.py   |   Mo trinh duyet: http://127.0.0.1:5000
 """
 
-import json, os, queue, sqlite3, threading, time
+import json, os, queue, sqlite3, threading, time, concurrent.futures
 from datetime import datetime
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 import oob_monitor
@@ -35,18 +35,41 @@ def _make_print_fn(task_id, ip=None):
 # --- Task Manager ---
 _tasks = {}
 _tasks_lock = threading.Lock()
+TASKS_FILE = "task_history.json"
 
-def _new_task(tid):
-    with _tasks_lock: _tasks[tid] = {"status":"running","started":time.time()}
+def _load_tasks():
+    global _tasks
+    try:
+        if os.path.exists(TASKS_FILE):
+            with open(TASKS_FILE, "r") as f: _tasks = json.load(f)
+            # Reset any stuck running tasks to error
+            for t in _tasks.values():
+                if t.get("status") == "running": t["status"] = "error"
+    except: _tasks = {}
+
+_load_tasks()
+
+def _save_tasks():
+    try:
+        with _tasks_lock:
+            keys = sorted(_tasks.keys(), key=lambda k: _tasks[k].get("started", 0), reverse=True)[:50]
+            to_save = {k: _tasks[k] for k in keys}
+        with open(TASKS_FILE, "w") as f: json.dump(to_save, f)
+    except: pass
+
+def _new_task(tid, action="unknown", ip=None):
+    with _tasks_lock: _tasks[tid] = {"status":"running","started":time.time(),"action":action,"ip":ip}
+    _save_tasks()
 
 def _finish_task(tid, error=None):
     with _tasks_lock:
-        _tasks[tid] = {
-            "status": "error" if error else "done",
-            "started": _tasks.get(tid, {}).get("started", 0),
-            "finished": time.time(),
-            "error": str(error) if error else None
-        }
+        if tid in _tasks:
+            _tasks[tid].update({
+                "status": "error" if error else "done",
+                "finished": time.time(),
+                "error": str(error) if error else None
+            })
+    _save_tasks()
     _sse_broadcast({"type":"task_done","task":tid,"status":"error" if error else "done"})
 
 def _cfg(): return oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
@@ -63,22 +86,23 @@ def _query_bl(q, args=(), all_rows=True):
 # --- Background runners ---
 def _run_scan(tid, target_ip=None):
     try:
-        cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+        cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
         if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
         pfn = _make_print_fn(tid, target_ip)
-        pfn("Bat dau SCAN " + str(len(hosts)) + " thiet bi...")
-        for ip, alias in hosts:
+        pfn("Bat dau SCAN " + str(len(hosts)) + " thiet bi (5 threads)...")
+        def _scan_single(h):
+            ip, alias = h[0], h[1]
             pfn("  [PING] " + alias + " (" + ip + ")")
             alive = oob_monitor.ping_host(ip)
             oob_monitor.save_device_status(ip, alias=alias, ping=alive)
-            if not alive: pfn("  [!] " + alias + ": Khong ping duoc."); continue
+            if not alive: pfn("  [!] " + alias + ": Khong ping duoc."); return
             pfn("  [SCAN] " + alias + " (" + ip + ")")
             try: hn, mn, snap, ms = oob_monitor.poll_host_multi(ip, cfg, timeout=10)
             except Exception as e:
                 oob_monitor.save_device_status(ip, alias=alias, menu_state="conn_failed")
-                pfn("  [LOI] " + str(e)); continue
+                pfn("  [LOI] " + alias + ": " + str(e)); return
             oob_monitor.save_device_status(ip, alias=alias, menu_state=ms)
-            if ms in ["fetch_failed","no_menu"] or not snap: pfn("  [!] " + alias + ": Khong co menu."); continue
+            if ms in ["fetch_failed","no_menu"] or not snap: pfn("  [!] " + alias + ": Khong co menu."); return
             oob_monitor.save_options(cfg["snapshot_db"],"snapshot_menu",ip,mn,hn,snap)
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
             if bl is None or not oob_monitor.options_equal(bl, snap):
@@ -86,38 +110,49 @@ def _run_scan(tid, target_ip=None):
                 oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB")
                 pfn("  [OK] " + alias + ": Cap nhat baseline (" + str(len(snap)) + " option).")
             else: pfn("  [OK] " + alias + ": Khop baseline.")
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            ex.map(_scan_single, hosts)
         pfn("[OK] Hoan thanh SCAN!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
 
 def _run_verify(tid, target_ip=None):
     try:
-        cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+        cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
         if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
         pfn = _make_print_fn(tid, target_ip)
-        pfn("Bat dau VERIFY " + str(len(hosts)) + " thiet bi...")
-        for ip, alias in hosts:
+        pfn("Bat dau VERIFY " + str(len(hosts)) + " thiet bi (5 threads)...")
+        def _verify_single(h):
+            ip, alias = h[0], h[1]
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
-            if not bl: pfn("  [!] " + alias + ": Chua co baseline."); continue
+            if not bl: pfn("  [!] " + alias + ": Chua co baseline."); return
             pfn("  [VERIFY] " + alias + " (" + ip + ")")
             oob_monitor.run_deep_verify(cfg, alias, ip, bl, print_fn=pfn)
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            ex.map(_verify_single, hosts)
         pfn("[OK] Hoan thanh VERIFY!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
 
 def _run_push(tid, target_ip=None):
     try:
-        cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+        cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
         if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
         pfn = _make_print_fn(tid, target_ip)
-        pfn("Bat dau PUSH " + str(len(hosts)) + " thiet bi...")
-        for ip, alias in hosts:
+        pfn("Bat dau PUSH " + str(len(hosts)) + " thiet bi (5 threads)...")
+        def _push_single(h):
+            ip, alias = h[0], h[1]
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
-            if not bl: continue
+            if not bl: return
             vendor = next(iter(bl.values())).get("vendor","cisco") if bl else "cisco"
-            if vendor == "vertiv": pfn("  [!] " + alias + ": Vertiv khong ho tro Push."); continue
+            if vendor == "vertiv": pfn("  [!] " + alias + ": Vertiv khong ho tro Push."); return
             results = oob_monitor.run_deep_verify(cfg, alias, ip, bl, print_fn=pfn)
             if any(r["status"]=="CANH BAO" for r in results):
                 oob_monitor.process_push_and_reverify(cfg, alias, ip, bl, results, print_fn=pfn)
             else: pfn("  [OK] " + alias + ": Khong co sai lech.")
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            ex.map(_push_single, hosts)
         pfn("[OK] Hoan thanh PUSH!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
 
@@ -137,9 +172,10 @@ def api_events():
                 if q in _sse_clients: _sse_clients.remove(q)
     return Response(gen(), mimetype="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
+
 @app.route("/api/stats")
 def api_stats():
-    cfg = _cfg(); ips = oob_monitor.load_ip_list(cfg["ip_list"])
+    cfg = _cfg(); ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     ds = oob_monitor.load_device_status()
     stats = {"total":len(ips),"online":0,"offline":0,"has_baseline":0,"alarms":0}
     for ip,_ in ips:
@@ -155,7 +191,7 @@ def api_stats():
 
 @app.route("/api/devices")
 def api_devices():
-    cfg = _cfg(); ips = oob_monitor.load_ip_list(cfg["ip_list"])
+    cfg = _cfg(); ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     ds = oob_monitor.load_device_status()
     vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*7)
     devs = []
@@ -178,7 +214,7 @@ def api_device_options(ip):
     cfg = _cfg(); vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*7)
     mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
     if not bl: return jsonify({"device_name":dn,"menu_name":mn,"options":[]})
-    all_ips = oob_monitor.load_ip_list(cfg["ip_list"])
+    all_ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     alias = next((a for i,a in all_ips if i==ip), ip)
     opts = []
     for key in sorted(bl.keys()):
@@ -232,7 +268,7 @@ def api_device():
 def api_action():
     d = request.json or {}; action = d.get("action"); tip = d.get("ip") or None
     tid = action + "_" + (tip or "all") + "_" + str(int(time.time()))
-    _new_task(tid)
+    _new_task(tid, action=action, ip=tip)
     runners = {"scan":_run_scan,"verify":_run_verify,"push":_run_push}
     if action not in runners: return jsonify({"status":"error"}),400
     threading.Thread(target=runners[action], args=(tid,tip), daemon=True).start()
@@ -246,7 +282,7 @@ def api_tasks():
 def api_search():
     query = request.args.get("q","").strip().lower()
     if not query: return jsonify([])
-    cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
     found = []
     for ip, alias in hosts:
@@ -290,6 +326,65 @@ def api_log_content(fn):
         with open(fp,"r",encoding="utf-8") as f: return jsonify({"content":f.read()})
     except Exception as e: return jsonify({"error":str(e)}),500
 
+@app.route("/api/push-logs/<path:fn>")
+def api_push_log_content(fn):
+    fp = os.path.join("push-logs", os.path.basename(fn))
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}),404
+    try:
+        with open(fp,"r",encoding="utf-8") as f: return jsonify({"content":f.read()})
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+@app.route("/api/push-logs")
+def api_push_logs():
+    d = "push-logs"
+    if not os.path.exists(d): return jsonify([])
+    files = [{"name":f,"size":os.path.getsize(os.path.join(d,f)),
+              "mtime":datetime.fromtimestamp(os.path.getmtime(os.path.join(d,f))).strftime("%Y-%m-%d %H:%M:%S")}
+             for f in sorted(os.listdir(d),reverse=True) if f.endswith(".log")]
+    return jsonify(files[:50])
+
+@app.route("/api/revert", methods=["POST"])
+def api_revert():
+    fn = (request.json or {}).get("filename")
+    if not fn: return jsonify({"error":"Missing filename"}), 400
+    fp = os.path.join("push-logs", os.path.basename(fn))
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}), 404
+    
+    import re
+    revert_cmds = []
+    oob_ip = None
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=== PUSH LOG TỰ ĐỘNG:" in line:
+                    m = re.search(r'\(([\d\.]+)\)', line)
+                    if m: oob_ip = m.group(1)
+                elif "REVERT CMD:" in line:
+                    m = re.search(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', line)
+                    if m: revert_cmds.append((m.group(1), m.group(2), m.group(3).strip()))
+    except Exception as e: return jsonify({"error":str(e)}), 500
+    
+    if not oob_ip or not revert_cmds: return jsonify({"error":"Khong the parse revert commands hoac OOB IP tu log"}), 400
+    
+    cfg = _cfg()
+    c = oob_monitor.get_all_credentials(cfg)[0] if oob_monitor.get_all_credentials(cfg) else {"username":"","password":"","enable_password":""}
+    
+    def _run_rev():
+        tid = "revert_" + str(int(time.time()))
+        _new_task(tid, "revert", oob_ip)
+        pfn = _make_print_fn(tid, oob_ip)
+        pfn(f"Bat dau REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
+        try:
+            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10)
+            pfn("[OK] Hoan thien Revert!")
+            _finish_task(tid)
+        except Exception as e:
+            pfn(f"[LOI] Revert that bai: {e}")
+            _finish_task(tid, e)
+            
+    threading.Thread(target=_run_rev, daemon=True).start()
+    return jsonify({"status":"ok","msg":f"Da bat dau revert {len(revert_cmds)} muc."})
+
 @app.route("/api/export/excel")
 def api_export_excel():
     try:
@@ -297,7 +392,7 @@ def api_export_excel():
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
         from openpyxl.utils import get_column_letter
     except ImportError: return jsonify({"error":"Thieu openpyxl. pip install openpyxl"}),500
-    cfg = _cfg(); hosts = oob_monitor.load_ip_list(cfg["ip_list"])
+    cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     vst = oob_monitor._parse_verify_logs_for_status(); ds = oob_monitor.load_device_status()
     def mk_fill(c): return PatternFill(fill_type="solid",fgColor=c)
     def mk_bdr():
@@ -335,7 +430,7 @@ def api_export_excel():
 def api_import():
     import re; _IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
     cfg = _cfg(); lines = (request.json or {}).get("text","").splitlines()
-    added = skipped = 0; existing = {h[0] for h in oob_monitor.load_ip_list(cfg["ip_list"])}
+    added = skipped = 0; existing = {h[0] for h in oob_monitor.load_ip_list_cached(cfg["ip_list"])}
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"): continue
@@ -608,11 +703,31 @@ select.fc option{background:#1a1a2e}
 
     <!-- DASHBOARD -->
     <div class="page active" id="page-dashboard">
-      <div class="sg">
-        <div class="sc c1"><div class="sv" id="s-total">-</div><div class="sl">Tổng thiết bị</div><div class="si2">🌐</div></div>
-        <div class="sc c2"><div class="sv" id="s-online">-</div><div class="sl">Đang online</div><div class="si2">📶</div></div>
-        <div class="sc c3"><div class="sv" id="s-baseline">-</div><div class="sl">Có baseline</div><div class="si2">📋</div></div>
-        <div class="sc c4"><div class="sv" id="s-alarms">-</div><div class="sl">Cảnh báo</div><div class="si2">⚠️</div></div>
+      <div style="display:flex;gap:24px;margin-bottom:24px;flex-wrap:wrap">
+        <div class="sg" style="flex:1;margin-bottom:0;min-width:400px">
+          <div class="sc c1"><div class="sv" id="s-total">-</div><div class="sl">Tổng thiết bị</div><div class="si2">🌐</div></div>
+          <div class="sc c2"><div class="sv" id="s-online">-</div><div class="sl">Đang online</div><div class="si2">📶</div></div>
+          <div class="sc c3"><div class="sv" id="s-baseline">-</div><div class="sl">Có baseline</div><div class="si2">📋</div></div>
+          <div class="sc c4"><div class="sv" id="s-alarms">-</div><div class="sl">Cảnh báo</div><div class="si2">⚠️</div></div>
+        </div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <div class="sc" style="width:200px;text-align:center;padding:15px;display:flex;flex-direction:column;align-items:center">
+            <div class="st mb8"><span class="dot" style="background:var(--teal)"></span>Ping Status</div>
+            <svg viewBox="0 0 36 36" style="width:100px;height:100px;margin-top:10px">
+              <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="3.5" />
+              <path id="svg-ping" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--teal)" stroke-width="3.5" stroke-dasharray="0, 100" style="transition:stroke-dasharray 1s ease"/>
+              <text id="svg-ping-txt" x="18" y="21.5" fill="var(--text)" font-size="9" text-anchor="middle" font-weight="600">0%</text>
+            </svg>
+          </div>
+          <div class="sc" style="width:200px;text-align:center;padding:15px;display:flex;flex-direction:column;align-items:center">
+            <div class="st mb8"><span class="dot" style="background:var(--amber)"></span>Baseline</div>
+            <svg viewBox="0 0 36 36" style="width:100px;height:100px;margin-top:10px">
+              <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="3.5" />
+              <path id="svg-baseline" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--amber)" stroke-width="3.5" stroke-dasharray="0, 100" style="transition:stroke-dasharray 1s ease"/>
+              <text id="svg-baseline-txt" x="18" y="21.5" fill="var(--text)" font-size="9" text-anchor="middle" font-weight="600">0%</text>
+            </svg>
+          </div>
+        </div>
       </div>
       <div class="sh">
         <div class="st"><span class="dot"></span>Thiết bị OOB</div>
@@ -680,10 +795,19 @@ select.fc option{background:#1a1a2e}
 
     <!-- LOGS -->
     <div class="page" id="page-logs">
-      <div class="sh mb16"><div class="st"><span class="dot"></span>Nhật ký Verify</div><button class="btn btn-g btn-sm" onclick="loadLogs()">↻ Làm mới</button></div>
+      <div class="tabs mb16">
+        <button class="tab-btn active" id="btn-vlogs" onclick="sTabLogs('vlogs',this)">📋 Nhật ký Verify</button>
+        <button class="tab-btn" id="btn-plogs" onclick="sTabLogs('plogs',this)">🚀 Lịch sử Push & Revert</button>
+        <button class="btn btn-g btn-sm ml-a" onclick="loadLogs()">↻ Làm mới</button>
+      </div>
       <div style="display:grid;grid-template-columns:300px 1fr;gap:16px">
         <div><div class="lfl" id="logList"><div class="text-m" style="padding:12px;font-size:13px">Đang tải...</div></div></div>
-        <div><div class="lc" id="logView" style="max-height:70vh;min-height:300px;font-size:11.5px;white-space:pre-wrap;word-break:break-all"><span class="text-m">← Chọn file log bên trái để xem.</span></div></div>
+        <div>
+          <div class="lc" id="logView" style="max-height:70vh;min-height:300px;font-size:11.5px;white-space:pre-wrap;word-break:break-all"><span class="text-m">← Chọn file log bên trái để xem.</span></div>
+          <div id="revertAction" style="display:none;margin-top:10px;text-align:right">
+            <button class="btn btn-d" id="btnRevert" onclick="doRevert()">↩ Revert Changes</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -900,6 +1024,14 @@ async function loadDash(){
   document.getElementById('s-online').textContent=stats.online??0;
   document.getElementById('s-baseline').textContent=stats.has_baseline??0;
   document.getElementById('s-alarms').textContent=stats.alarms??0;
+  
+  const pctPing=stats.total>0?Math.round(((stats.online||0)/stats.total)*100):0;
+  document.getElementById('svg-ping').style.strokeDasharray=pctPing+', 100';
+  document.getElementById('svg-ping-txt').textContent=pctPing+'%';
+  const pctBase=stats.total>0?Math.round(((stats.has_baseline||0)/stats.total)*100):0;
+  document.getElementById('svg-baseline').style.strokeDasharray=pctBase+', 100';
+  document.getElementById('svg-baseline-txt').textContent=pctBase+'%';
+  
   const ab=document.getElementById('sAlBadge');
   if(stats.alarms>0){ab.style.display='';ab.textContent=stats.alarms;}else ab.style.display='none';
   const tbody=document.getElementById('dashBody');
@@ -1009,17 +1141,50 @@ async function doSearch(){
     </tr>`).join('');
 }
 
+let curLogTab='vlogs', curLogFile='';
+function sTabLogs(tab,btn){
+  document.querySelectorAll('#page-logs .tab-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  curLogTab=tab;
+  loadLogs();
+}
+
 async function loadLogs(){
-  const files=await fetch('/api/logs').then(r=>r.json()).catch(()=>[]);
+  const isP = curLogTab === 'plogs';
+  const api = isP ? '/api/push-logs' : '/api/logs';
+  const files=await fetch(api).then(r=>r.json()).catch(()=>[]);
   const el=document.getElementById('logList');
   if(!files.length){el.innerHTML='<div style="padding:16px;color:var(--text3);font-size:13px">Chưa có file log.</div>';return;}
-  el.innerHTML=files.map(f=>`<div class="lfi" onclick="loadLogCnt('${encodeURIComponent(f.name)}')"><span style="font-size:16px">📄</span><div style="flex:1;overflow:hidden"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${esc(f.name)}</div><div style="font-size:10px;color:var(--text3)">${f.mtime}</div></div></div>`).join('');
+  el.innerHTML=files.map(f=>`<div class="lfi" onclick="loadLogCnt('${encodeURIComponent(f.name)}')"><span style="font-size:16px">${isP?'🚀':'📄'}</span><div style="flex:1;overflow:hidden"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${esc(f.name)}</div><div style="font-size:10px;color:var(--text3)">${f.mtime}</div></div></div>`).join('');
+  document.getElementById('revertAction').style.display='none';
+  document.getElementById('logView').innerHTML='<span class="text-m">← Chọn file log bên trái để xem.</span>';
 }
 
 async function loadLogCnt(fn){
+  curLogFile = fn;
   document.getElementById('logView').textContent='Đang tải...';
-  const d=await fetch('/api/logs/'+fn).then(r=>r.json()).catch(()=>null);
-  document.getElementById('logView').textContent=d&&d.content?d.content:'Lỗi tải file.';
+  const api = (curLogTab === 'plogs' ? '/api/push-logs/' : '/api/logs/') + fn;
+  const d=await fetch(api).then(r=>r.json()).catch(()=>null);
+  let txt = d&&d.content?d.content:'Lỗi tải file.';
+  txt = esc(txt);
+  txt = txt.replace(/OK|thành công/gi, '<span class="lok">$&</span>')
+           .replace(/CANH BAO|KHONG PIVOT|TIMEOUT|YEU CAU DANG NHAP/g, '<span class="lwarn">$&</span>')
+           .replace(/LOI|LỖI/g, '<span class="lerr">$&</span>')
+           .replace(/REVERT CMD/g, '<span class="bpulse" style="color:var(--pink)">$&</span>');
+  document.getElementById('logView').innerHTML=txt;
+  
+  if(curLogTab === 'plogs' && d && d.content && txt.includes('REVERT CMD')) {
+    document.getElementById('revertAction').style.display='';
+  } else {
+    document.getElementById('revertAction').style.display='none';
+  }
+}
+
+async function doRevert(){
+  if(!confirm('Chắc chắn chạy lệnh REVERT dựa trên log này?')) return;
+  const r=await fetch('/api/revert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:curLogFile})}).then(x=>x.json()).catch(()=>null);
+  if(r&&r.status==='ok') toast(r.msg, 'success');
+  else toast((r&&r.error)||'Lỗi!', 'error');
 }
 
 async function loadSettings(){
