@@ -484,7 +484,7 @@ def api_export_excel():
     def mk_bdr():
         s = Side(style="thin",color="BFBFBF"); return Border(left=s,right=s,top=s,bottom=s)
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Chi tiet OOB"
-    hdrs = ["OOB IP","OOB Alias","Hostname","Menu","Ping","Menu State","Option Key","Description","Target IP","Port","Protocol","Verify","Act Host"]
+    hdrs = ["OOB IP","OOB Alias","Hostname","Menu","Ping","Menu State","Option Key","Description","Target IP","Port","Protocol","Vendor","Verify","Act Host"]
     for ci,h in enumerate(hdrs,1):
         c = ws.cell(1,ci,h); c.font=Font(bold=True,color="FFFFFF"); c.fill=mk_fill("1F4E79"); c.alignment=Alignment(horizontal="center"); c.border=mk_bdr()
     ws.freeze_panes = "A2"; ri = 2
@@ -496,16 +496,19 @@ def api_export_excel():
             for ci,v in enumerate([ip,alias,"","",pg,st.get("menu_state","-"),"(chua co baseline)","","","","","",""],1): ws.cell(ri,ci,v).border=mk_bdr()
             ri+=1; continue
         for ok_key in sorted(bl):
-            o = bl[ok_key]; vr = vst.get((alias,ok_key))
-            if vr:
-                vs = vr["status"]; ah = vr.get("act_host","") or ""
-                sc = "C6EFCE" if vs=="OK" else ("FFC7CE" if vs=="CANH BAO" else "FFCC99")
-            else: vs,ah,sc = "Chua Verify","","FFEB9C"
-            for ci,v in enumerate([ip,alias,dn or "",mn or "",pg,st.get("menu_state","-"),ok_key,o.get("description",""),o.get("ip",""),o.get("port",""),o.get("protocol",""),vs,ah],1):
-                c = ws.cell(ri,ci,v); c.border=mk_bdr()
-                if ci==12: c.fill=mk_fill(sc); c.font=Font(bold=True)
-            ri+=1
-    for i,w in enumerate([16,16,18,18,10,14,12,36,16,8,10,14,18],1): ws.column_dimensions[get_column_letter(i)].width=w
+          o = bl[ok_key]; vr = vst.get((alias,ok_key))
+          if vr:
+              vs = vr["status"]; ah = vr.get("act_host","") or ""
+              sc = "C6EFCE" if vs=="OK" else ("FFC7CE" if vs=="CANH BAO" else "FFCC99")
+          else: vs,ah,sc = "Chua Verify","","FFEB9C"
+          
+          # THÊM o.get("vendor","cisco") vào mảng dữ liệu
+          for ci,v in enumerate([ip,alias,dn or "",mn or "",pg,st.get("menu_state","-"),ok_key,o.get("description",""),o.get("ip",""),o.get("port",""),o.get("protocol",""),o.get("vendor","cisco").upper(),vs,ah],1):
+              c = ws.cell(ri,ci,v); c.border=mk_bdr()
+              # Đổi ci==12 thành ci==13 vì "Verify" đã bị đẩy sang cột 13
+              if ci==13: c.fill=mk_fill(sc); c.font=Font(bold=True)
+          ri+=1
+    for i,w in enumerate([16,16,18,18,10,14,12,36,16,8,10,12,14,18],1): ws.column_dimensions[get_column_letter(i)].width=w
     os.makedirs("reports",exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fn = "OOB_Report_" + ts + ".xlsx"; fp = os.path.join("reports",fn)
@@ -1011,7 +1014,7 @@ select.fc option{background:#1a1a2e}
       </div>
       <div class="tw">
         <table>
-          <thead><tr><th>Option Key</th><th>Description</th><th>Target IP</th><th>Port</th><th>Protocol</th><th>Verify</th><th>Hostname Thực tế</th></tr></thead>
+          <thead><tr><th>Option Key</th><th>Description</th><th>Hãng (Vendor)</th><th>Target IP</th><th>Port</th><th>Protocol</th><th>Verify</th><th>Hostname Thực tế</th></tr></thead>
           <tbody id="devOptsBody"><tr class="lr"><td colspan="7"><div class="sp" style="margin:0 auto"></div></td></tr></tbody>
         </table>
       </div>
@@ -1360,14 +1363,16 @@ async function loadDevOpts(ip){
     else if(o.verify_status==='KHONG PIVOT')vb='<span class="badge br">↩ No Pivot</span>';
     else if(o.verify_status==='YEU CAU DANG NHAP')vb='<span class="badge ba">🔑 Auth</span>';
     const ah=o.act_host?'<span class="text-t fw6">'+esc(o.act_host)+'</span>':'<span class="text-m">-</span>';
+    const vendorBadge = o.vendor === 'vertiv' ? '<span class="badge ba">VERTIV</span>' : '<span class="badge bt">CISCO</span>';
     return`<tr>
-      <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
-      <td>${esc(o.description)}</td>
-      <td><span class="mono text-t">${esc(o.ip)}</span></td>
-      <td><span class="mono">${o.port}</span></td>
-      <td><span class="badge ${pc}">${esc(o.protocol.toUpperCase())}</span></td>
-      <td>${vb}</td><td>${ah}</td></tr>`;
-  }).join('');
+        <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
+        <td>${esc(o.description)}</td>
+        <td>${vendorBadge}</td>
+        <td><span class="mono text-t">${esc(o.ip)}</span></td>
+        <td><span class="mono">${o.port}</span></td>
+        <td><span class="badge ${pc}">${esc(o.protocol.toUpperCase())}</span></td>
+        <td>${vb}</td><td>${ah}</td></tr>`;
+    }).join('');
 }
 
 async function runAction(action,ip){
