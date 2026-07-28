@@ -1,14 +1,65 @@
 """
-oob_web.py - Web Panel v2.0 cho OOB Network Manager
+oob_web.py - Web Panel v2.3 cho OOB Network Manager 
+(Dynamic UI + Tính năng Đổi Mật Khẩu Trực Tiếp)
 Chay: python oob_web.py   |   Mo trinh duyet: http://127.0.0.1:5000
 """
 
-import json, os, queue, sqlite3, threading, time, concurrent.futures
+import json, os, queue, sqlite3, threading, time, concurrent.futures, hashlib, urllib.request
 from datetime import datetime
-from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from functools import wraps
+from flask import Flask, Response, jsonify, render_template_string, request, send_file, session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
 import oob_monitor
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24))
+
+def _cfg(): return oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+
+# --- INIT DATABASE TÀI KHOẢN ---
+def _init_users_db():
+    db = _cfg().get("baseline_db", "baseline.db")
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS web_users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL
+                  )''')
+    cur.execute("SELECT COUNT(*) FROM web_users")
+    if cur.fetchone()[0] == 0:
+        # Tự động tạo tài khoản admin/admin ở lần chạy đầu tiên
+        cur.execute("INSERT INTO web_users (username, password_hash) VALUES (?, ?)", 
+                    ('admin', generate_password_hash('admin')))
+    conn.commit()
+    conn.close()
+
+_init_users_db()
+
+# --- KIỂM TRA MẬT KHẨU LỘ LỌT ---
+def check_pwned_password(password):
+    sha1_pwd = hashlib.sha1(password.encode('utf-8')).hexdigest().upper()
+    prefix, suffix = sha1_pwd[:5], sha1_pwd[5:]
+    try:
+        req = urllib.request.Request(f"https://api.pwnedpasswords.com/range/{prefix}", headers={'User-Agent': 'OOB-Web-Manager'})
+        with urllib.request.urlopen(req, timeout=5) as res:
+            hashes = (line.decode('utf-8').split(':') for line in res)
+            for h, count in hashes:
+                if h == suffix:
+                    return int(count)
+        return 0
+    except Exception:
+        return -1
+
+# --- AUTH DECORATOR ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session:
+            if request.path.startswith('/api/'):
+                return jsonify({"error": "Unauthorized"}), 401
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 # --- SSE ---
 _sse_clients = []
@@ -42,7 +93,6 @@ def _load_tasks():
     try:
         if os.path.exists(TASKS_FILE):
             with open(TASKS_FILE, "r") as f: _tasks = json.load(f)
-            # Reset any stuck running tasks to error
             for t in _tasks.values():
                 if t.get("status") == "running": t["status"] = "error"
     except: _tasks = {}
@@ -72,7 +122,6 @@ def _finish_task(tid, error=None):
     _save_tasks()
     _sse_broadcast({"type":"task_done","task":tid,"status":"error" if error else "done"})
 
-def _cfg(): return oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
 
 def _query_bl(q, args=(), all_rows=True):
     db = _cfg().get("baseline_db","baseline.db")
@@ -156,7 +205,136 @@ def _run_push(tid, target_ip=None):
         pfn("[OK] Hoan thanh PUSH!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
 
-# --- API ---
+# --- WEB & API ROUTES ---
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Đăng nhập - OOB Manager</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+body { background: #07070f; color: #f1f0ff; font-family: 'Inter', sans-serif; display: flex; height: 100vh; align-items: center; justify-content: center; margin: 0; }
+.login-box { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); padding: 35px 30px; border-radius: 12px; width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+.title { font-size: 20px; font-weight: 600; margin-bottom: 25px; text-align: center; }
+.fg { margin-bottom: 15px; }
+.fc { width: 100%; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 12px; border-radius: 6px; outline: none; box-sizing: border-box; font-family: inherit;}
+.fc:focus { border-color: #7c3aed; box-shadow: 0 0 0 3px rgba(124,58,237,.15); }
+.btn { width: 100%; background: #7c3aed; color: #fff; border: none; padding: 12px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; margin-top: 10px; font-size: 14px;}
+.btn:hover { background: #6d28d9; }
+.btn-g { background: rgba(255,255,255,0.1); margin-top: 10px; }
+.btn-g:hover { background: rgba(255,255,255,0.2); }
+.msg { font-size: 13px; margin-top: 15px; text-align: center; display: none; line-height: 1.4; padding: 10px; border-radius: 6px; font-weight: 500;}
+.msg.err { color: #ef4444; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); }
+.msg.warn { color: #fbbf24; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.2); }
+.msg.ok { color: #22c55e; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.2); }
+</style>
+</head>
+<body>
+<div class="login-box">
+    <div class="title">🔑 OOB Web Manager</div>
+    <div class="fg"><input type="text" id="usr" class="fc" placeholder="Tên đăng nhập"></div>
+    <div class="fg"><input type="password" id="pwd" class="fc" placeholder="Mật khẩu"></div>
+    <button class="btn" onclick="doLogin()">Đăng nhập Hệ thống</button>
+    <button class="btn btn-g" onclick="window.location.href='/'">Quay lại Tra cứu</button>
+    <div id="msg" class="msg"></div>
+</div>
+<script>
+async function doLogin() {
+    const u = document.getElementById('usr').value.trim(), p = document.getElementById('pwd').value;
+    if(!u || !p) return;
+    const m = document.getElementById('msg'); m.style.display = 'block'; m.className = 'msg'; m.textContent = 'Đang xác thực...';
+    
+    try {
+        const r = await fetch('/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:u, password:p}) });
+        const d = await r.json();
+        
+        if (d.status === 'error') { m.className = 'msg err'; m.textContent = d.msg; }
+        else if (d.status === 'warning') { m.className = 'msg warn'; m.textContent = d.msg; setTimeout(()=>window.location.href=d.redirect, 3500); }
+        else { m.className = 'msg ok'; m.textContent = d.msg; setTimeout(()=>window.location.href=d.redirect, 1000); }
+    } catch(e) { m.className = 'msg err'; m.textContent = 'Mất kết nối tới server.'; }
+}
+document.addEventListener('keydown', e => { if(e.key === 'Enter') doLogin(); });
+</script>
+</body>
+</html>"""
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        data = request.json
+        username = data.get('username', '').strip()
+        password = data.get('password', '')
+        
+        db = _cfg().get("baseline_db", "baseline.db")
+        conn = sqlite3.connect(db)
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM web_users WHERE username=?", (username,))
+        row = cur.fetchone()
+        conn.close()
+        
+        if row and check_password_hash(row[0], password):
+            session['logged_in'] = True
+            session['username'] = username
+            
+            leak_count = check_pwned_password(password)
+            if leak_count > 0:
+                return jsonify({
+                    "status": "warning", 
+                    "msg": f"Xác thực thành công. CẢNH BÁO: Mật khẩu này đã bị lộ {leak_count} lần trên mạng! Khuyến nghị đổi mật khẩu.", 
+                    "redirect": "/"
+                })
+            elif leak_count == -1:
+                return jsonify({"status": "ok", "msg": "Xác thực thành công. (Chưa thể kết nối API kiểm tra rò rỉ)", "redirect": "/"})
+                
+            return jsonify({"status": "ok", "msg": "Xác thực thành công! Mật khẩu an toàn.", "redirect": "/"})
+        
+        return jsonify({"status": "error", "msg": "Sai tài khoản hoặc mật khẩu."}), 401
+        
+    return render_template_string(LOGIN_HTML)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route("/api/change-password", methods=["POST"])
+@login_required
+def api_change_password():
+    data = request.json or {}
+    old_password = data.get("old_password", "")
+    new_password = data.get("new_password", "")
+    username = session.get("username")
+
+    if not old_password or not new_password:
+        return jsonify({"status": "error", "msg": "Vui lòng nhập đầy đủ thông tin mật khẩu!"}), 400
+
+    db = _cfg().get("baseline_db", "baseline.db")
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM web_users WHERE username=?", (username,))
+    row = cur.fetchone()
+
+    # Kiểm tra mật khẩu cũ
+    if not row or not check_password_hash(row[0], old_password):
+        conn.close()
+        return jsonify({"status": "error", "msg": "Mật khẩu cũ không chính xác!"})
+
+    # Cập nhật mật khẩu mới
+    new_hash = generate_password_hash(new_password)
+    cur.execute("UPDATE web_users SET password_hash=? WHERE username=?", (new_hash, username))
+    conn.commit()
+    conn.close()
+
+    # Kiểm tra lộ lọt cho mật khẩu mới
+    leak_count = check_pwned_password(new_password)
+    warn_msg = ""
+    if leak_count > 0:
+        warn_msg = f" (Lưu ý: Mật khẩu mới đã từng bị lộ {leak_count} lần trên mạng toàn cầu, hãy cẩn thận!)"
+
+    return jsonify({"status": "ok", "msg": f"Đổi mật khẩu thành công!{warn_msg}"})
+
+# CÁC API KHÔNG CẦN ĐĂNG NHẬP (Read-only / Tra cứu)
 @app.route("/api/events")
 def api_events():
     q = queue.Queue(maxsize=100)
@@ -223,56 +401,6 @@ def api_device_options(ip):
             "port":o.get("port",23),"protocol":o.get("protocol","telnet"),"vendor":o.get("vendor","cisco"),
             "verify_status":vr["status"] if vr else None,"act_host":vr.get("act_host") if vr else None})
     return jsonify({"device_name":dn,"menu_name":mn,"alias":alias,"options":opts})
-
-@app.route("/api/config", methods=["GET","POST"])
-def api_config():
-    if request.method == "GET":
-        return jsonify({k:v for k,v in oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT).items() if k!="credentials"})
-    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
-    allowed = ["username","password","enable_password","vertiv_connect_password",
-               "menu_name_override","ssh_port","telnet_port","interval","verify_interval",
-               "ip_list","baseline_db","snapshot_db","auto_verify","verify_schedule_mode",
-               "verify_schedule_time","verify_schedule_weekday","scan_schedule_mode",
-               "scan_schedule_time","scan_schedule_weekday","verify_wait_after_connect","max_verify_duration"]
-    for k in allowed:
-        if k in (request.json or {}): cfg[k] = request.json[k]
-    oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
-    return jsonify({"status":"ok"})
-
-@app.route("/api/credentials", methods=["GET","POST","DELETE"])
-def api_creds():
-    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT); creds = cfg.get("credentials",[])
-    if request.method == "GET":
-        return jsonify([{"username":c.get("username",""),"has_pass":bool(c.get("password")),"has_enable":bool(c.get("enable_password"))} for c in creds])
-    if request.method == "POST":
-        d = request.json or {}
-        creds.append({"username":d.get("username",""),"password":d.get("password",""),"enable_password":d.get("enable_password","")})
-        cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
-        return jsonify({"status":"ok"})
-    idx = (request.json or {}).get("index",-1)
-    if 0 <= idx < len(creds): creds.pop(idx)
-    cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
-    return jsonify({"status":"ok"})
-
-@app.route("/api/device", methods=["POST","DELETE"])
-def api_device():
-    cfg = _cfg()
-    if request.method == "POST":
-        d = request.json or {}; ip = d.get("ip","").strip(); alias = d.get("alias","").strip() or None
-        if not ip: return jsonify({"status":"error"}),400
-        oob_monitor.add_ip(cfg["ip_list"],ip,alias); return jsonify({"status":"ok"})
-    ip = (request.json or {}).get("ip","").strip()
-    oob_monitor.remove_ip(cfg["ip_list"],ip); return jsonify({"status":"ok"})
-
-@app.route("/api/action", methods=["POST"])
-def api_action():
-    d = request.json or {}; action = d.get("action"); tip = d.get("ip") or None
-    tid = action + "_" + (tip or "all") + "_" + str(int(time.time()))
-    _new_task(tid, action=action, ip=tip)
-    runners = {"scan":_run_scan,"verify":_run_verify,"push":_run_push}
-    if action not in runners: return jsonify({"status":"error"}),400
-    threading.Thread(target=runners[action], args=(tid,tip), daemon=True).start()
-    return jsonify({"status":"ok","task_id":tid,"msg":"Da dua lenh " + action.upper() + " vao hang doi!"})
 
 @app.route("/api/tasks")
 def api_tasks():
@@ -343,48 +471,6 @@ def api_push_logs():
              for f in sorted(os.listdir(d),reverse=True) if f.endswith(".log")]
     return jsonify(files[:50])
 
-@app.route("/api/revert", methods=["POST"])
-def api_revert():
-    fn = (request.json or {}).get("filename")
-    if not fn: return jsonify({"error":"Missing filename"}), 400
-    fp = os.path.join("push-logs", os.path.basename(fn))
-    if not os.path.exists(fp): return jsonify({"error":"Not found"}), 404
-    
-    import re
-    revert_cmds = []
-    oob_ip = None
-    try:
-        with open(fp, "r", encoding="utf-8") as f:
-            for line in f:
-                if "=== PUSH LOG TỰ ĐỘNG:" in line:
-                    m = re.search(r'\(([\d\.]+)\)', line)
-                    if m: oob_ip = m.group(1)
-                elif "REVERT CMD:" in line:
-                    m = re.search(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', line)
-                    if m: revert_cmds.append((m.group(1), m.group(2), m.group(3).strip()))
-    except Exception as e: return jsonify({"error":str(e)}), 500
-    
-    if not oob_ip or not revert_cmds: return jsonify({"error":"Khong the parse revert commands hoac OOB IP tu log"}), 400
-    
-    cfg = _cfg()
-    c = oob_monitor.get_all_credentials(cfg)[0] if oob_monitor.get_all_credentials(cfg) else {"username":"","password":"","enable_password":""}
-    
-    def _run_rev():
-        tid = "revert_" + str(int(time.time()))
-        _new_task(tid, "revert", oob_ip)
-        pfn = _make_print_fn(tid, oob_ip)
-        pfn(f"Bat dau REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
-        try:
-            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10)
-            pfn("[OK] Hoan thien Revert!")
-            _finish_task(tid)
-        except Exception as e:
-            pfn(f"[LOI] Revert that bai: {e}")
-            _finish_task(tid, e)
-            
-    threading.Thread(target=_run_rev, daemon=True).start()
-    return jsonify({"status":"ok","msg":f"Da bat dau revert {len(revert_cmds)} muc."})
-
 @app.route("/api/export/excel")
 def api_export_excel():
     try:
@@ -426,7 +512,106 @@ def api_export_excel():
     wb.save(fp)
     return send_file(fp,as_attachment=True,download_name=fn,mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# CÁC API KHÓA HÀNH ĐỘNG THAY ĐỔI DỮ LIỆU (Action / Quản trị)
+@app.route("/api/config", methods=["GET","POST"])
+@login_required
+def api_config():
+    if request.method == "GET":
+        return jsonify({k:v for k,v in oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT).items() if k!="credentials"})
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+    allowed = ["username","password","enable_password","vertiv_connect_password",
+               "menu_name_override","ssh_port","telnet_port","interval","verify_interval",
+               "ip_list","baseline_db","snapshot_db","auto_verify","verify_schedule_mode",
+               "verify_schedule_time","verify_schedule_weekday","scan_schedule_mode",
+               "scan_schedule_time","scan_schedule_weekday","verify_wait_after_connect","max_verify_duration"]
+    for k in allowed:
+        if k in (request.json or {}): cfg[k] = request.json[k]
+    oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+    return jsonify({"status":"ok"})
+
+@app.route("/api/credentials", methods=["GET","POST","DELETE"])
+@login_required
+def api_creds():
+    cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT); creds = cfg.get("credentials",[])
+    if request.method == "GET":
+        return jsonify([{"username":c.get("username",""),"has_pass":bool(c.get("password")),"has_enable":bool(c.get("enable_password"))} for c in creds])
+    if request.method == "POST":
+        d = request.json or {}
+        creds.append({"username":d.get("username",""),"password":d.get("password",""),"enable_password":d.get("enable_password","")})
+        cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+        return jsonify({"status":"ok"})
+    idx = (request.json or {}).get("index",-1)
+    if 0 <= idx < len(creds): creds.pop(idx)
+    cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
+    return jsonify({"status":"ok"})
+
+@app.route("/api/device", methods=["POST","DELETE"])
+@login_required
+def api_device():
+    cfg = _cfg()
+    if request.method == "POST":
+        d = request.json or {}; ip = d.get("ip","").strip(); alias = d.get("alias","").strip() or None
+        if not ip: return jsonify({"status":"error"}),400
+        oob_monitor.add_ip(cfg["ip_list"],ip,alias); return jsonify({"status":"ok"})
+    ip = (request.json or {}).get("ip","").strip()
+    oob_monitor.remove_ip(cfg["ip_list"],ip); return jsonify({"status":"ok"})
+
+@app.route("/api/action", methods=["POST"])
+@login_required
+def api_action():
+    d = request.json or {}; action = d.get("action"); tip = d.get("ip") or None
+    tid = action + "_" + (tip or "all") + "_" + str(int(time.time()))
+    _new_task(tid, action=action, ip=tip)
+    runners = {"scan":_run_scan,"verify":_run_verify,"push":_run_push}
+    if action not in runners: return jsonify({"status":"error"}),400
+    threading.Thread(target=runners[action], args=(tid,tip), daemon=True).start()
+    return jsonify({"status":"ok","task_id":tid,"msg":"Da dua lenh " + action.upper() + " vao hang doi!"})
+
+@app.route("/api/revert", methods=["POST"])
+@login_required
+def api_revert():
+    fn = (request.json or {}).get("filename")
+    if not fn: return jsonify({"error":"Missing filename"}), 400
+    fp = os.path.join("push-logs", os.path.basename(fn))
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}), 404
+    
+    import re
+    revert_cmds = []
+    oob_ip = None
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=== PUSH LOG TỰ ĐỘNG:" in line:
+                    m = re.search(r'\(([\d\.]+)\)', line)
+                    if m: oob_ip = m.group(1)
+                elif "REVERT CMD:" in line:
+                    m = re.search(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', line)
+                    if m: revert_cmds.append((m.group(1), m.group(2), m.group(3).strip()))
+    except Exception as e: return jsonify({"error":str(e)}), 500
+    
+    if not oob_ip or not revert_cmds: return jsonify({"error":"Khong the parse revert commands hoac OOB IP tu log"}), 400
+    
+    cfg = _cfg()
+    c = oob_monitor.get_all_credentials(cfg)[0] if oob_monitor.get_all_credentials(cfg) else {"username":"","password":"","enable_password":""}
+    
+    def _run_rev():
+        tid = "revert_" + str(int(time.time()))
+        _new_task(tid, "revert", oob_ip)
+        pfn = _make_print_fn(tid, oob_ip)
+        pfn(f"Bat dau REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
+        try:
+            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10)
+            pfn("[OK] Hoan thien Revert!")
+            _finish_task(tid)
+        except Exception as e:
+            pfn(f"[LOI] Revert that bai: {e}")
+            _finish_task(tid, e)
+            
+    threading.Thread(target=_run_rev, daemon=True).start()
+    return jsonify({"status":"ok","msg":f"Da bat dau revert {len(revert_cmds)} muc."})
+
 @app.route("/api/import", methods=["POST"])
+@login_required
 def api_import():
     import re; _IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
     cfg = _cfg(); lines = (request.json or {}).get("text","").splitlines()
@@ -611,7 +796,6 @@ select.fc option{background:#1a1a2e}
 /* TASK BAR */
 .tp{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px}
 #atb{display:none}.#atb.vis{display:block;margin-bottom:20px}
-#atb.vis{display:block;margin-bottom:20px}
 
 /* LOG FILE LIST */
 .lfl{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
@@ -657,6 +841,8 @@ select.fc option{background:#1a1a2e}
         <span class="nav-badge" id="sAlBadge" style="display:none">!</span>
       </button>
     </div>
+    
+    {% if is_admin %}
     <div class="sb-sec">
       <div class="sb-sec-lbl">Vận hành</div>
       <button class="nav-item" data-page="verify" onclick="sPage('verify',this)">
@@ -679,6 +865,19 @@ select.fc option{background:#1a1a2e}
         Cài đặt
       </button>
     </div>
+    {% else %}
+    <div class="sb-sec">
+      <div class="sb-sec-lbl">Lịch sử & Báo cáo</div>
+      <button class="nav-item" data-page="logs" onclick="sPage('logs',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+        Nhật ký Verify
+      </button>
+      <button class="nav-item" data-page="import" onclick="sPage('import',this)">
+        <svg class="nav-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Xuất Excel
+      </button>
+    </div>
+    {% endif %}
   </nav>
   <div class="sb-foot">
     <div class="flex aic" style="gap:6px"><div class="d-dot" id="dDot"></div><span id="dTxt">Đang kiểm tra...</span></div>
@@ -693,11 +892,20 @@ select.fc option{background:#1a1a2e}
       <svg class="si" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input type="text" id="gSearch" placeholder="Tìm IP, hostname, description..." onkeydown="if(event.key==='Enter')doSearch()">
     </div>
-    <button class="btn btn-p" onclick="doSearch()" style="padding:8px 14px">
+    <button class="btn btn-p" onclick="doSearch()" style="padding:8px 14px; margin-right:auto">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>Tìm
     </button>
+    
+    {% if is_admin %}
     <button class="btn btn-g btn-sm" onclick="oModal('addDev')">+ Thêm OOB</button>
+    <button class="btn btn-outline-info btn-sm me-2" onclick="sPage('settings')"><i class="bi bi-gear"></i> Cài đặt</button>
+    <button class="btn btn-a btn-sm" onclick="oModal('changePassMod')" style="margin-left:8px">🔑 Đổi Pass Web</button>
+    <button class="btn btn-d btn-sm" onclick="window.location.href='/logout'" style="margin-left:8px">Đăng xuất</button>
+    {% else %}
+    <button class="btn btn-p btn-sm" onclick="window.location.href='/login'" style="margin-left:8px">Đăng nhập Quản trị</button>
+    {% endif %}
   </div>
+  
   <div class="content">
     <div id="atb"></div>
 
@@ -732,9 +940,11 @@ select.fc option{background:#1a1a2e}
       <div class="sh">
         <div class="st"><span class="dot"></span>Thiết bị OOB</div>
         <div class="bg2">
+          {% if is_admin %}
           <button class="btn btn-t btn-sm" onclick="runAction('scan',null)">🔍 Scan All</button>
           <button class="btn btn-a btn-sm" onclick="runAction('verify',null)">⚡ Verify All</button>
           <button class="btn btn-pk btn-sm" onclick="runAction('push',null)">🚀 Push All</button>
+          {% endif %}
           <button class="btn btn-g btn-sm" onclick="loadDash()">↻ Làm mới</button>
         </div>
       </div>
@@ -758,9 +968,11 @@ select.fc option{background:#1a1a2e}
           </div>
         </div>
         <div class="bg2">
+          {% if is_admin %}
           <button class="btn btn-t btn-sm" onclick="runAction('scan',curIP)">🔍 Scan</button>
           <button class="btn btn-a btn-sm" onclick="runAction('verify',curIP)">⚡ Verify</button>
           <button class="btn btn-pk btn-sm" onclick="runAction('push',curIP)">🚀 Push</button>
+          {% endif %}
           <button class="btn btn-g btn-sm" onclick="sPage('dashboard')">← Quay lại</button>
         </div>
       </div>
@@ -772,7 +984,8 @@ select.fc option{background:#1a1a2e}
       </div>
     </div>
 
-    <!-- VERIFY & SCAN -->
+    {% if is_admin %}
+    <!-- VERIFY & SCAN (Chi Admin) -->
     <div class="page" id="page-verify">
       <div class="sh mb16"><div class="st"><span class="dot"></span>Vận hành Tức thì</div></div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px">
@@ -792,6 +1005,7 @@ select.fc option{background:#1a1a2e}
       <div class="sh"><div class="st"><span class="dot"></span>Live Console</div><button class="btn btn-g btn-sm" onclick="document.getElementById('liveCon').innerHTML='<span class=text-m>Console da xoa.</span>'">Xóa</button></div>
       <div class="lc" id="liveCon" style="min-height:260px;max-height:500px"><span class="text-m">Chờ lệnh...</span></div>
     </div>
+    {% endif %}
 
     <!-- LOGS -->
     <div class="page" id="page-logs">
@@ -804,16 +1018,19 @@ select.fc option{background:#1a1a2e}
         <div><div class="lfl" id="logList"><div class="text-m" style="padding:12px;font-size:13px">Đang tải...</div></div></div>
         <div>
           <div class="lc" id="logView" style="max-height:70vh;min-height:300px;font-size:11.5px;white-space:pre-wrap;word-break:break-all"><span class="text-m">← Chọn file log bên trái để xem.</span></div>
+          {% if is_admin %}
           <div id="revertAction" style="display:none;margin-top:10px;text-align:right">
             <button class="btn btn-d" id="btnRevert" onclick="doRevert()">↩ Revert Changes</button>
           </div>
+          {% endif %}
         </div>
       </div>
     </div>
 
     <!-- IMPORT / EXPORT -->
     <div class="page" id="page-import">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+      <div style="display:grid;grid-template-columns:{% if is_admin %}1fr 1fr{% else %}1fr{% endif %};gap:20px">
+        {% if is_admin %}
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:22px">
           <div class="st mb16"><span class="dot"></span>Import Danh sách IP</div>
           <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Mỗi dòng 1 thiết bị. Format: <code style="color:var(--teal)">IP [alias]</code></p>
@@ -821,6 +1038,7 @@ select.fc option{background:#1a1a2e}
           <div style="margin-top:14px"><button class="btn btn-p" onclick="doImport()">⬆ Import</button></div>
           <div id="importRes" style="margin-top:12px;font-size:13px;display:none"></div>
         </div>
+        {% endif %}
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:22px">
           <div class="st mb16"><span class="dot"></span>Xuất Báo cáo Excel</div>
           <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Xuất toàn bộ dữ liệu baseline và kết quả verify ra .xlsx</p>
@@ -832,6 +1050,7 @@ select.fc option{background:#1a1a2e}
       </div>
     </div>
 
+    {% if is_admin %}
     <!-- SETTINGS -->
     <div class="page" id="page-settings">
       <div class="tabs">
@@ -906,12 +1125,13 @@ select.fc option{background:#1a1a2e}
         </div>
       </div>
     </div>
+    {% endif %}
 
   </div>
 </div>
-</div>
 
-<!-- MODALS -->
+{% if is_admin %}
+<!-- MODALS ADMIN CHỈ CÓ NẾU ĐĂNG NHẬP -->
 <div class="mo" id="addDev">
   <div class="mb">
     <div class="mh"><div class="mt">➕ Thêm thiết bị OOB</div><button class="mc" onclick="cModal('addDev')">×</button></div>
@@ -935,6 +1155,21 @@ select.fc option{background:#1a1a2e}
   </div>
 </div>
 
+<!-- Modal Đổi Mật Khẩu Web -->
+<div class="mo" id="changePassMod">
+  <div class="mb">
+    <div class="mh"><div class="mt">🔑 Đổi Mật Khẩu Đăng Nhập Web</div><button class="mc" onclick="cModal('changePassMod')">×</button></div>
+    <div class="mbody">
+      <div class="fg"><label class="fl">Mật khẩu cũ *</label><input type="password" id="cp_old" class="fc"></div>
+      <div class="fg"><label class="fl">Mật khẩu mới *</label><input type="password" id="cp_new" class="fc"></div>
+      <div class="fg"><label class="fl">Xác nhận mật khẩu mới *</label><input type="password" id="cp_cfm" class="fc"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="cModal('changePassMod')">Hủy</button><button class="btn btn-p" onclick="doChangePass()">Lưu Thay Đổi</button></div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Modal Kết quả Tìm kiếm (Dùng chung cho Guest/Admin) -->
 <div class="mo" id="searchMod">
   <div class="mb xl">
     <div class="mh"><div class="mt">🔍 Kết quả: "<span id="skw"></span>"</div><button class="mc" onclick="cModal('searchMod')">×</button></div>
@@ -950,6 +1185,7 @@ select.fc option{background:#1a1a2e}
 <div class="tc" id="toastCnt"></div>
 
 <script>
+const isAdmin = {{ 'true' if is_admin else 'false' }};
 let curPage='dashboard', curIP=null, sse=null, actTasks={};
 
 function initSSE(){
@@ -967,6 +1203,7 @@ function initSSE(){
 
 function logMsg(d){
   const con=document.getElementById('liveCon');
+  if(!con) return;
   const msg=esc(d.msg||'');
   let cls='linf';
   if(/OK|thanh cong|khop/i.test(msg))cls='lok';
@@ -1007,7 +1244,7 @@ function sPage(page,btn){
   document.getElementById('tbTitle').textContent=ptitles[page]||page;
   if(page==='dashboard')loadDash();
   if(page==='logs')loadLogs();
-  if(page==='settings')loadSettings();
+  if(isAdmin && page==='settings')loadSettings();
 }
 
 function sTab(tabId,btn){
@@ -1035,12 +1272,24 @@ async function loadDash(){
   const ab=document.getElementById('sAlBadge');
   if(stats.alarms>0){ab.style.display='';ab.textContent=stats.alarms;}else ab.style.display='none';
   const tbody=document.getElementById('dashBody');
-  if(!devs.length){tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:50px;color:var(--text3)">Chưa có thiết bị. Nhấn <strong>+ Thêm OOB</strong> để bắt đầu.</td></tr>';return;}
+  if(!devs.length){tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:50px;color:var(--text3)">Chưa có thiết bị. Cần Đăng nhập Quản trị để thêm mới.</td></tr>';return;}
+  
   tbody.innerHTML=devs.map(d=>{
     const pb=d.ping===true?'<span class="badge bg">● Online</span>':d.ping===false?'<span class="badge br">● Offline</span>':'<span class="badge bm">- Chưa</span>';
     const mb=d.menu_state==='ok'?'<span class="badge bg">OK</span>':d.menu_state==='conn_failed'?'<span class="badge br">Lỗi</span>':d.menu_state==='no_menu'?'<span class="badge ba">No Menu</span>':'<span class="badge bm">'+(d.menu_state||'-')+'</span>';
     const ab2=d.alarm_count>0?'<span class="badge bp">'+(d.alarm_count)+' ⚠️</span>':d.ok_count>0?'<span class="badge bt">'+d.ok_count+' ✓</span>':'<span class="badge bm">-</span>';
     const upd=(d.updated_at||d.checked_at||'-').replace('T',' ').slice(0,16);
+    
+    let actHtml = `<button class="btn btn-g btn-sm btn-ic" onclick="openDev('${esc(d.ip)}','${esc(d.alias)}')" title="Chi tiết Line">👁</button>`;
+    if(isAdmin) {
+        actHtml += `
+          <button class="btn btn-t btn-sm btn-ic" onclick="runAction('scan','${esc(d.ip)}')" title="Scan">🔍</button>
+          <button class="btn btn-a btn-sm btn-ic" onclick="runAction('verify','${esc(d.ip)}')" title="Verify">⚡</button>
+          <button class="btn btn-pk btn-sm btn-ic" onclick="runAction('push','${esc(d.ip)}')" title="Push">🚀</button>
+          <button class="btn btn-d btn-sm btn-ic" onclick="delDev('${esc(d.ip)}')" title="Xóa">🗑</button>
+        `;
+    }
+
     return`<tr>
       <td><span class="fw6">${esc(d.alias)}</span></td>
       <td><span class="mono">${esc(d.ip)}</span></td>
@@ -1051,11 +1300,7 @@ async function loadDash(){
       <td style="font-size:11px;color:var(--text3)">${esc(upd)}</td>
       <td style="text-align:right">
         <div class="bg2" style="justify-content:flex-end">
-          <button class="btn btn-g btn-sm btn-ic" onclick="openDev('${esc(d.ip)}','${esc(d.alias)}')" title="Chi tiết">👁</button>
-          <button class="btn btn-t btn-sm btn-ic" onclick="runAction('scan','${esc(d.ip)}')" title="Scan">🔍</button>
-          <button class="btn btn-a btn-sm btn-ic" onclick="runAction('verify','${esc(d.ip)}')" title="Verify">⚡</button>
-          <button class="btn btn-pk btn-sm btn-ic" onclick="runAction('push','${esc(d.ip)}')" title="Push">🚀</button>
-          <button class="btn btn-d btn-sm btn-ic" onclick="delDev('${esc(d.ip)}')" title="Xóa">🗑</button>
+          ${actHtml}
         </div>
       </td></tr>`;
   }).join('');
@@ -1075,7 +1320,7 @@ async function loadDevOpts(ip){
   if(!d){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3)">Lỗi tải dữ liệu</td></tr>';return;}
   document.getElementById('devMenu').textContent=d.menu_name||'-';
   document.getElementById('devLines').textContent=d.options.length;
-  if(!d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Chạy Scan trước.</td></tr>';return;}
+  if(!d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Vui lòng liên hệ Admin quét cấu hình.</td></tr>';return;}
   document.getElementById('devOptsBody').innerHTML=d.options.map(o=>{
     const pc=o.protocol==='ssh'?'bt':o.protocol==='serial'?'bv':'ba';
     let vb='<span class="badge bm">-</span>';
@@ -1096,18 +1341,20 @@ async function loadDevOpts(ip){
 }
 
 async function runAction(action,ip){
+  if(!isAdmin) { toast('Bạn cần Đăng nhập Quản trị để thực hiện lệnh này!','error'); return; }
   const lbl=action.toUpperCase()+' '+(ip||'Tất cả');
-  if(!confirm('Xác nhận chạy '+lbl+'?'))return;
+  if(!confirm('Xác nhận chạy lệnh '+lbl+'?'))return;
   if(curPage!=='verify')sPage('verify');
   const con=document.getElementById('liveCon');
   con.innerHTML+='<div><span class="lts">['+nw()+']</span> <span class="linf">▶ Bắt đầu '+esc(lbl)+'...</span></div>';
   con.scrollTop=con.scrollHeight;
   const res=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,ip})}).then(r=>r.json()).catch(()=>null);
   if(res&&res.task_id){addTask(res.task_id,lbl);toast(res.msg||'Đã đưa vào hàng đợi!','info');}
-  else toast('Lỗi gửi lệnh!','error');
+  else toast('Lỗi gửi lệnh! Bạn có thể đã hết phiên đăng nhập.','error');
 }
 
 async function addDevice(){
+  if(!isAdmin) return;
   const ip=document.getElementById('nip').value.trim(),alias=document.getElementById('nal').value.trim();
   if(!ip){toast('Vui lòng nhập IP!','error');return;}
   await fetch('/api/device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,alias})});
@@ -1115,9 +1362,24 @@ async function addDevice(){
 }
 
 async function delDev(ip){
+  if(!isAdmin) return;
   if(!confirm('Xóa OOB '+ip+'?'))return;
   await fetch('/api/device',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
   toast('Đã xóa '+ip+'!','success');loadDash();
+}
+
+async function doChangePass(){
+  if(!isAdmin) return;
+  const op=g('cp_old').value, np=g('cp_new').value, cp=g('cp_cfm').value;
+  if(!op||!np||!cp){toast('Vui lòng điền đủ thông tin!','error');return;}
+  if(np!==cp){toast('Mật khẩu mới không khớp!','error');return;}
+  
+  const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:op,new_password:np})}).then(x=>x.json()).catch(()=>null);
+  if(r&&r.status==='ok'){
+    toast(r.msg,'success');
+    cModal('changePassMod');
+    g('cp_old').value='';g('cp_new').value='';g('cp_cfm').value='';
+  }else toast((r&&r.msg)||'Lỗi đổi mật khẩu!','error');
 }
 
 async function doSearch(){
@@ -1156,7 +1418,8 @@ async function loadLogs(){
   const el=document.getElementById('logList');
   if(!files.length){el.innerHTML='<div style="padding:16px;color:var(--text3);font-size:13px">Chưa có file log.</div>';return;}
   el.innerHTML=files.map(f=>`<div class="lfi" onclick="loadLogCnt('${encodeURIComponent(f.name)}')"><span style="font-size:16px">${isP?'🚀':'📄'}</span><div style="flex:1;overflow:hidden"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${esc(f.name)}</div><div style="font-size:10px;color:var(--text3)">${f.mtime}</div></div></div>`).join('');
-  document.getElementById('revertAction').style.display='none';
+  const rAction = document.getElementById('revertAction');
+  if(rAction) rAction.style.display='none';
   document.getElementById('logView').innerHTML='<span class="text-m">← Chọn file log bên trái để xem.</span>';
 }
 
@@ -1173,21 +1436,26 @@ async function loadLogCnt(fn){
            .replace(/REVERT CMD/g, '<span class="bpulse" style="color:var(--pink)">$&</span>');
   document.getElementById('logView').innerHTML=txt;
   
-  if(curLogTab === 'plogs' && d && d.content && txt.includes('REVERT CMD')) {
-    document.getElementById('revertAction').style.display='';
-  } else {
-    document.getElementById('revertAction').style.display='none';
+  const rAction = document.getElementById('revertAction');
+  if(isAdmin && rAction) {
+    if(curLogTab === 'plogs' && d && d.content && txt.includes('REVERT CMD')) {
+      rAction.style.display='';
+    } else {
+      rAction.style.display='none';
+    }
   }
 }
 
 async function doRevert(){
-  if(!confirm('Chắc chắn chạy lệnh REVERT dựa trên log này?')) return;
+  if(!isAdmin) return;
+  if(!confirm('Chắc chắn chạy lệnh REVERT phục hồi dựa trên log này?')) return;
   const r=await fetch('/api/revert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:curLogFile})}).then(x=>x.json()).catch(()=>null);
   if(r&&r.status==='ok') toast(r.msg, 'success');
-  else toast((r&&r.error)||'Lỗi!', 'error');
+  else toast((r&&r.error)||'Lỗi phục hồi!', 'error');
 }
 
 async function loadSettings(){
+  if(!isAdmin) return;
   const cfg=await fetch('/api/config').then(r=>r.json()).catch(()=>({}));
   const m={'username':'cu','password':'cp','enable_password':'ce','vertiv_connect_password':'cv',
            'ssh_port':'csp','telnet_port':'ctp','menu_name_override':'cmno',
@@ -1201,6 +1469,7 @@ async function loadSettings(){
 }
 
 function togSF(p){
+  if(!isAdmin) return;
   const mode=document.getElementById(p==='scan'?'csm':'cvm').value;
   const tf=document.getElementById(p[0]+'_tf'),wf=document.getElementById(p[0]+'_wf');
   if(tf)tf.style.display=mode!=='interval'?'':'none';
@@ -1208,6 +1477,7 @@ function togSF(p){
 }
 
 async function saveCfg(){
+  if(!isAdmin) return;
   const pay={username:g('cu').value,password:g('cp').value,enable_password:g('ce').value,
              vertiv_connect_password:g('cv').value,ssh_port:parseInt(g('csp').value)||22,
              telnet_port:parseInt(g('ctp').value)||23,menu_name_override:g('cmno').value,
@@ -1217,6 +1487,7 @@ async function saveCfg(){
 }
 
 async function saveSched(){
+  if(!isAdmin) return;
   const pay={scan_schedule_mode:g('csm').value,interval:parseInt(g('ci').value)||30,
              scan_schedule_time:g('cst').value,scan_schedule_weekday:g('csw').value,
              verify_schedule_mode:g('cvm').value,verify_interval:parseInt(g('cvi').value)||3600,
@@ -1227,12 +1498,14 @@ async function saveSched(){
 }
 
 async function saveFiles(){
+  if(!isAdmin) return;
   const pay={ip_list:g('cil').value,baseline_db:g('cbd').value,snapshot_db:g('csd').value};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
   if(r.ok)toast('Đã lưu!','success');else toast('Lỗi!','error');
 }
 
 async function loadCreds(){
+  if(!isAdmin) return;
   const creds=await fetch('/api/credentials').then(r=>r.json()).catch(()=>[]);
   const el=document.getElementById('credList');
   if(!creds.length){el.innerHTML='<div style="color:var(--text3);font-size:13px;padding:12px">(Chưa có tài khoản phụ)</div>';return;}
@@ -1240,6 +1513,7 @@ async function loadCreds(){
 }
 
 async function addCred(){
+  if(!isAdmin) return;
   const user=g('cru').value.trim();
   if(!user){toast('Cần nhập username!','error');return;}
   await fetch('/api/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:g('crp').value,enable_password:g('cre').value})});
@@ -1247,21 +1521,29 @@ async function addCred(){
 }
 
 async function delCred(idx){
+  if(!isAdmin) return;
   if(!confirm('Xóa tài khoản này?'))return;
   await fetch('/api/credentials',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx})});
   toast('Đã xóa!','success');loadCreds();
 }
 
 async function doImport(){
+  if(!isAdmin) return;
   const text=document.getElementById('importTxt').value.trim();
   if(!text){toast('Vui lòng nhập dữ liệu!','error');return;}
   const res=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}).then(r=>r.json()).catch(()=>null);
   const el=document.getElementById('importRes');el.style.display='';
-  if(res){el.innerHTML='<span class="text-t">✓ Thêm '+res.added+' thiết bị, bỏ qua '+res.skipped+'.</span>';toast('Import xong! +'+res.added,'success');}
+  if(res&&res.added!==undefined){el.innerHTML='<span class="text-t">✓ Thêm '+res.added+' thiết bị, bỏ qua '+res.skipped+'.</span>';toast('Import xong! +'+res.added,'success');}
   else{el.innerHTML='<span style="color:var(--red)">✗ Lỗi import!</span>';toast('Lỗi!','error');}
 }
 
-function oModal(id){document.getElementById(id).classList.add('open');}
+function oModal(id){
+    if (!isAdmin && (id === 'addDev' || id === 'addCred' || id === 'settingsModal' || id === 'changePassMod')) {
+        window.location.href='/login';
+        return;
+    }
+    document.getElementById(id).classList.add('open');
+}
 function cModal(id){document.getElementById(id).classList.remove('open');}
 document.addEventListener('click',e=>{if(e.target.classList.contains('mo'))e.target.classList.remove('open');});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.open').forEach(m=>m.classList.remove('open'));});
@@ -1298,15 +1580,18 @@ initSSE();loadDash();
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    is_admin = session.get('logged_in', False)
+    return render_template_string(HTML, is_admin=is_admin)
 
 @app.route("/device/<ip>")
 def device_redir(ip):
-    return render_template_string(HTML)
+    is_admin = session.get('logged_in', False)
+    return render_template_string(HTML, is_admin=is_admin)
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  OOB Network Manager - Web Panel v2.0")
-    print("  Truy cap: http://127.0.0.1:5000")
+    print("  OOB Network Manager - Web Panel v2.3")
+    print("  Dynamic UI: Phan quyen Guest (Read-only) / Admin (Action)")
+    print("  Truy cap ngay: http://127.0.0.1:5000")
     print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
