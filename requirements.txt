@@ -1,31 +1,12 @@
-# requirements.txt cho oob_lib.py / oob_monitor.py / oob_web.py
-#
-# Cac thu vien duoi day la nhung goi THUC SU duoc import trong cac file tren,
-# ngoai thu vien chuan cua Python (sqlite3, threading, socket, re, json, os,
-# sys, time, getpass, platform, subprocess, datetime, collections,
-# concurrent.futures, logging) von di kem san voi moi ban cai dat Python,
-# khong can khai bao o day.
+# --- Kết nối SSH & Telnet ---
+paramiko==3.5.1[cite: 4]
 
-# --- Bat buoc: dung de SSH (paramiko.SSHClient / invoke_shell) trong oob_lib.py,
-# fallback sang MiniTelnet (tu viet, khong can thu vien ngoai) neu SSH loi.
-# Chot dung phien ban 3.5.1 theo yeu cau.
-paramiko==3.5.1
+# --- Giao diện CLI (Bảng, Màu sắc, Live Console) ---
+rich>=13.7.0,<15.0.0[cite: 4]
 
-# --- Bat buoc: dung cho toan bo giao dien Console/Live/Layout/Table/Panel
-# trong oob_monitor.py (rich.console, rich.panel, rich.rule, rich.table,
-# rich.text, rich.layout, rich.live, rich.box).
-rich>=13.7.0,<15.0.0
-
-# --- Bat buoc: dung cho oob_web.py (Giao dien Web Dashboard - Flask app,
-# routing /, /device/<ip>, va cac API /api/config, /api/device, /api/action,
-# /api/search). Khong can neu chi dung CLI (oob_monitor.py) don thuan.
+# --- Giao diện Web Dashboard & Bảo mật ---
 flask>=3.0.0,<4.0.0
+werkzeug>=3.0.0
 
-# --- Tuy chon (nhung KHONG the thieu neu muon dung tinh nang Import/Export Excel
-# trong oob_monitor.py):
-# openpyxl duoc dung boi cac ham:
-#   import_from_excel()      - doc file .xlsx de import danh sach IP thiet bi
-#   export_menu_report()     - xuat bao cao menu OOB ra file .xlsx (nhieu sheet)
-#   _export_excel_template() - tao file mau huong dan dinh dang import
-# Neu chua cai, cac ham tren van chay duoc nhung se hien thong bao loi va thoat.
-openpyxl>=3.1.0
+# --- Xử lý file Excel (Import/Export) ---
+openpyxl>=3.1.0[cite: 4]

@@ -4,21 +4,34 @@ Công cụ **giám sát, xác minh vật lý và tự động phục hồi** men
 Console Server chạy Cisco IOS hoặc Vertiv ACS) qua SSH/Telnet. Phát hiện cấu hình
 menu bị thay đổi so với baseline, kiểm tra vật lý từng cổng console (Deep Verify —
 pivot vào từng cổng để xác nhận đúng thiết bị thật đang nối vào), tự động sửa lại
-mô tả (description) trên menu khi phát hiện sai lệch, và có thêm một **giao diện
-Web Dashboard** để thao tác từ trình duyệt thay vì chỉ dùng CLI.
+mô tả (description) trên menu khi phát hiện sai lệch.
 
 Gồm 3 file chính:
 - `oob_lib.py` — thư viện kết nối (SSH ưu tiên qua `paramiko`, fallback Telnet tự
   viết), đọc/parse cấu hình `menu`, ghi (push) lại đúng 1 dòng mô tả khi cần sửa,
   và kiểm tra ping tới thiết bị.
-- `oob_monitor.py` — chương trình chính (CLI): daemon giám sát, menu quản lý,
-  Deep Verify / auto push, lập lịch cho cả 2 luồng, Import/Export Excel. Hỗ trợ
-  song song 2 dòng thiết bị OOB: **Cisco IOS** (menu console) và **Vertiv ACS**
-  (serial console server).
-- `oob_web.py` — giao diện **Web Dashboard** (Flask) chạy song song/độc lập với
-  CLI, dùng lại toàn bộ logic của `oob_monitor.py`: xem danh sách thiết bị, trạng
-  thái ping/menu theo thời gian thực, tìm kiếm port/hostname, và bấm nút để chạy
-  Scan / Verify / Push ngay trên trình duyệt (không cần mở terminal).
+- `oob_monitor.py` — chương trình **CLI**: menu quản lý, daemon giám sát tự động
+  (2 luồng chạy nền có lịch riêng), Deep Verify / auto push, Import/Export Excel.
+  Hỗ trợ song song 2 dòng thiết bị OOB: **Cisco IOS** (menu console) và **Vertiv
+  ACS** (serial console server).
+- `oob_web.py` — giao diện **Web Dashboard** (Flask), có đăng nhập
+  (Admin/Guest), dùng lại các hàm trong `oob_monitor.py` nhưng **chạy như một
+  tiến trình hoàn toàn tách biệt, không tự động lặp lại gì cả** — mọi hành động
+  (Scan/Verify/Push) chỉ chạy khi có người bấm nút. Xem mục 8 để biết chi tiết
+  Web đang thiếu gì so với CLI.
+
+> ⚠️ **Trước khi đọc tiếp:** README này được viết lại dựa trên việc đọc lại toàn
+> bộ `oob_web.py` hiện có trong repo. Có 1 điểm cần bạn xác nhận lại: bạn nói là
+> **đã xóa tính năng "chạy cho tất cả thiết bị" trên bản Web**, nhưng trong code
+> `oob_web.py` hiện tại (trang **"Vận hành Tức thì"**, 3 thẻ SCAN CONFIG / DEEP
+> VERIFY / PUSH CONFIG, và ô "IP hoặc Alias — để trống = Tất cả") **vẫn còn** gọi
+> `runAction('scan', null)` / `runAction('verify', null)` / `runAction('push',
+> null)`, và backend (`_run_scan`/`_run_verify`/`_run_push` với `target_ip=None`)
+> vẫn xử lý toàn bộ danh sách thiết bị khi `ip` để trống. Tức là về mặt code, nút
+> "chạy cho tất cả" (thủ công, bấm 1 lần) **vẫn đang tồn tại** — thứ **thực sự
+> không có** là **lặp lại tự động theo lịch** (xem mục 8.1). README dưới đây mô
+> tả đúng theo code hiện tại; nếu bạn đã xóa ở 1 bản khác chưa upload lên đây thì
+> báo lại để mình cập nhật.
 
 ---
 
@@ -29,7 +42,9 @@ Gồm 3 file chính:
 - Quyền ghi thư mục chạy chương trình (để tạo file config, database SQLite, file
   trạng thái thiết bị, và các thư mục log).
 - Nếu muốn dùng Web Dashboard (`oob_web.py`): mở thêm 1 cổng TCP (mặc định `5000`)
-  để truy cập bằng trình duyệt.
+  để truy cập bằng trình duyệt, và máy chạy web cần ra được Internet tới
+  `api.pwnedpasswords.com` (dùng để cảnh báo mật khẩu bị lộ khi đăng nhập/đổi mật
+  khẩu — nếu không có mạng, tính năng này tự bỏ qua, không chặn đăng nhập).
 
 ## 2. Cài đặt thư viện
 
@@ -39,7 +54,8 @@ Thư viện ngoài cần cài đặt được liệt kê trong `requirements.txt
 paramiko==3.5.1
 rich>=13.7.0,<15.0.0
 flask>=3.0.0,<4.0.0
-openpyxl>=3.1.0          # cần cho Import/Export Excel
+werkzeug>=3.0.0
+openpyxl>=3.1.0
 ```
 
 Cài đặt bằng lệnh:
@@ -67,11 +83,10 @@ pip install -r requirements.txt
 >   Telnet (tự viết trong `oob_lib.py`, không cần gói nào thêm).
 > - `rich` — vẽ giao diện console (bảng, khung, layout chia đôi màn hình, tự
 >   refresh log theo thời gian thực) cho `oob_monitor.py`.
-> - `flask` — chạy Web Dashboard `oob_web.py` (routing trang chủ, trang chi tiết
->   thiết bị, và các API JSON). Không cần nếu bạn chỉ dùng CLI thuần tuý.
-> - `openpyxl` — đọc/ghi file Excel `.xlsx` cho tính năng Import và Export báo cáo
->   trong `oob_monitor.py`. Nếu chưa cài, 3 hàm Import/Export vẫn chạy nhưng sẽ
->   thông báo lỗi và thoát.
+> - `flask` + `werkzeug` — chạy Web Dashboard `oob_web.py` (routing, API JSON,
+>   session đăng nhập, hash mật khẩu). Không cần nếu bạn chỉ dùng CLI thuần túy.
+> - `openpyxl` — đọc/ghi file Excel `.xlsx`. Dùng cho Import/Export ở CLI, và cho
+>   nút "Tải về Excel" ở Web (chỉ Export, xem mục 8.3 về Import ở Web).
 
 ## 3. Cấu trúc file khi chạy
 
@@ -81,14 +96,15 @@ Lần chạy đầu tiên, chương trình tự tạo các file/thư mục sau (
 |------------------------------|----------------------------------------------------------------------|
 | `oob_config.json`            | Cấu hình chính (tài khoản, mật khẩu Vertiv, cổng, chu kỳ, lịch chạy, đường dẫn...) |
 | `oob_ips.txt`                | Danh sách IP + alias các thiết bị OOB cần giám sát                  |
-| `baseline.db`                | SQLite — cấu hình "chuẩn" dùng để so sánh                           |
+| `baseline.db`                | SQLite — cấu hình "chuẩn" dùng để so sánh. **Đồng thời cũng chứa bảng `web_users`** (tài khoản đăng nhập Web) — do `oob_web.py` tạo/dùng chung file này |
 | `snapshot.db`                | SQLite — cấu hình mới nhất vừa quét được                            |
-| `device_status.json`         | Trạng thái ping/kết nối mới nhất của từng thiết bị (dùng bởi Dashboard, cả CLI và Web đều đọc/ghi) |
+| `device_status.json`         | Trạng thái ping/kết nối mới nhất của từng thiết bị (dùng chung bởi CLI và Web) |
 | `verify-logs/`               | Log kết quả Deep Verify (mỗi lần quét 1 file `.log`)                |
 | `push-logs/`                 | Log các lần tự động sửa mô tả (push) lên thiết bị                  |
-| `reports/`                   | File báo cáo Excel xuất ra từ tính năng Export (option `[e]`)        |
-| `oob_import_template.xlsx`   | File mẫu Excel (tạo khi chọn xuất mẫu ở option `[i]`)              |
-| `daemon.pid`                 | File heartbeat — Menu Quản Lý dùng để hiển thị trạng thái Daemon (RUNNING/STALE) |
+| `reports/`                   | File báo cáo Excel xuất ra (CLI option `[e]` hoặc nút "Tải về Excel" trên Web) |
+| `oob_import_template.xlsx`   | File mẫu Excel (tạo khi chọn xuất mẫu ở CLI option `[i]`)          |
+| `daemon.pid`                 | File heartbeat — chỉ do `--daemon` (CLI) ghi; **Web không đọc/ghi file này** (xem mục 8.5) |
+| `task_history.json`          | Do `oob_web.py` tự tạo — lưu lịch sử tối đa 50 tác vụ Scan/Verify/Push gần nhất chạy trên Web |
 
 File `oob_ips.txt` — mỗi dòng 1 thiết bị, cách nhau bằng khoảng trắng, dòng bắt
 đầu bằng `#` bị bỏ qua:
@@ -100,7 +116,7 @@ File `oob_ips.txt` — mỗi dòng 1 thiết bị, cách nhau bằng khoảng tr
 
 > **Lưu ý:** Ngoài chỉnh tay `oob_ips.txt`, bạn có thể Import danh sách thiết bị
 > từ file Excel qua option `[i]` trong Menu Quản Lý CLI (xem mục 6), hoặc thêm/xoá
-> từng thiết bị trực tiếp trên Web Dashboard (nút "Thêm OOB" / "Xóa OOB", xem mục 7).
+> từng thiết bị trực tiếp trên Web Dashboard (xem mục 7).
 
 ## 4. Chạy chương trình (CLI)
 
@@ -135,9 +151,9 @@ Chương trình hỏi chọn 1 trong 3 chế độ:
   ```
 
 > **Lưu ý quan trọng:** dù bạn chọn 2 hay 3, tất cả tự động hoá (quét cấu hình,
-> Deep Verify, auto push) đều nằm trong đúng 1 tiến trình `--daemon`. Cửa sổ
-> `--menu` (nếu có) chỉ là công cụ thao tác tay, không tự chạy gì cả — không cần
-> mở nó nếu bạn chỉ cần daemon chạy nền.
+> Deep Verify, auto push) đều nằm trong đúng 1 tiến trình `--daemon`. **Đây cũng
+> là tiến trình DUY NHẤT trong toàn bộ hệ thống có khả năng tự lặp lại theo thời
+> gian** — `oob_web.py` không có tiến trình tương đương (xem mục 8.1).
 
 > 2 cửa sổ (khi chọn 3) là **2 tiến trình độc lập**, mỗi tiến trình tự đọc
 > `oob_config.json` một lần lúc khởi động. Đổi cấu hình ở cửa sổ Menu sẽ ghi xuống
@@ -181,8 +197,8 @@ Nếu khác → cảnh báo ngay.
 | Mục | Ý nghĩa |
 |-----|---------|
 | `[4]` Tên menu | Ép dùng đúng 1 tên menu; để trống = tự động dò tất cả menu trên thiết bị |
-| `[s]` **Lịch chạy Thu thập** *(mới)* | Chế độ lịch: `interval` (lặp theo chu kỳ) / `daily` (mỗi ngày 1 lần, đúng giờ cố định) / `weekly` (mỗi tuần 1 lần, đúng thứ + giờ cố định) |
-| `[7]` Chu kỳ interval (s) | Số giây giữa các lần quét cấu hình — **chỉ có hiệu lực khi `[s]` đang ở chế độ `interval`**; bị bỏ qua hoàn toàn khi dùng `daily`/`weekly` |
+| `[s]` Lịch chạy Thu thập | Chế độ lịch: `interval` (lặp theo chu kỳ) / `daily` (mỗi ngày 1 lần, đúng giờ cố định) / `weekly` (mỗi tuần 1 lần, đúng thứ + giờ cố định) |
+| `[7]` Chu kỳ interval (s) | Số giây giữa các lần quét cấu hình — chỉ có hiệu lực khi `[s]` đang ở chế độ `interval`; bị bỏ qua hoàn toàn khi dùng `daily`/`weekly` |
 
 Khi chọn `[s]`, chương trình hỏi lần lượt:
 
@@ -196,22 +212,27 @@ Khi chọn `[s]`, chương trình hỏi lần lượt:
 - Chọn `3` → nhập thứ (`mon`/`tue`/`wed`/`thu`/`fri`/`sat`/`sun`) + giờ, daemon
   chỉ quét đúng 1 lần/tuần.
 - Màn hình Cài đặt sẽ tự hiện dòng nhắc **"Không hiệu lực"** cạnh mục `[7]` khi
-  bạn đang dùng lịch cố định, để tránh nhầm lẫn tưởng đổi `[7]` sẽ có tác dụng.
+  bạn đang dùng lịch cố định.
 
 ### Nhóm LUỒNG 2 — VERIFY VẬT LÝ (Deep Verify — chạy theo lịch)
 Daemon pivot vào từng port console, lấy hostname thực để kiểm tra description có
 đúng không. Chạy độc lập theo lịch riêng, không phụ thuộc Luồng 1.
 
-> - `[v]`/`[d]` = tần suất **pivot vật lý** vào từng port console để lấy hostname thực.
-> - Đây là **2 luồng hoàn toàn độc lập**, chạy song song trên 2 thread khác nhau,
->   mỗi luồng có lịch chạy riêng (interval/daily/weekly), không ảnh hưởng lẫn nhau.
+- `[v]`/`[d]` = tần suất/lịch **pivot vật lý** vào từng port console để lấy hostname thực.
+- Đây là **2 luồng hoàn toàn độc lập**, chạy song song trên 2 thread khác nhau,
+  mỗi luồng có lịch chạy riêng (interval/daily/weekly), không ảnh hưởng lẫn nhau.
+
+> ⚠️ Cả `[s]` (lịch Luồng 1) và `[v]`/`[d]` (lịch Luồng 2) **chỉ có tác dụng khi
+> tiến trình `--daemon` đang chạy**. Ghi các giá trị này qua Web (xem mục 7, tab
+> "Lịch chạy") vẫn lưu được xuống `oob_config.json`, nhưng **không tự kích hoạt
+> bất kỳ vòng lặp nào ở phía Web** — xem mục 8.1.
 
 ## 6. Các chức năng chính (Menu Quản Lý CLI)
 
 ```
 [1] Them thiet bi OOB              - Them 1 IP + alias vao danh sach
 [2] Xoa thiet bi OOB               - Xoa 1 IP khoi danh sach
-[i] Import tu Excel                - Import nhieu thiet bi tu file .xlsx
+[i] Import tu Excel                - Import nhieu thiet bi tu file .xlsx that
                                      (hoac xuat file mau de tham khao)
 
 [3] Cau hinh                       - Sua username/password/port/lich...
@@ -226,19 +247,15 @@ Daemon pivot vào từng port console, lấy hostname thực để kiểm tra de
 [0] Thoat
 ```
 
-Ngoài ra, màn hình chính của Menu Quản Lý luôn hiển thị **trạng thái Daemon**
-(`RUNNING` — kèm số giây từ lần cập nhật cuối, `STALE` nếu daemon treo/chết, hoặc
-`KHONG RO` nếu chưa từng chạy `--daemon` lần nào), dựa trên file heartbeat
-`daemon.pid` được daemon tự ghi lại mỗi 30 giây.
+Màn hình chính của Menu Quản Lý luôn hiển thị **trạng thái Daemon** (`RUNNING` —
+kèm số giây từ lần cập nhật cuối, `STALE` nếu daemon treo/chết, hoặc `KHONG RO`
+nếu chưa từng chạy `--daemon` lần nào), dựa trên file heartbeat `daemon.pid`.
 
 ---
 
-### `[i]` Import danh sách thiết bị từ Excel
+### `[i]` Import danh sách thiết bị từ Excel (CLI)
 
-Thay vì nhập thủ công hoặc sửa file `oob_ips.txt`, bạn có thể import hàng loạt từ
-file Excel `.xlsx`.
-
-**Định dạng file Excel:**
+Import hàng loạt từ **file Excel `.xlsx` thật** (chọn đường dẫn file trên đĩa).
 
 | Cột A (IP)    | Cột B (Alias / Tên gọi) |
 |---------------|--------------------------|
@@ -247,216 +264,310 @@ file Excel `.xlsx`.
 
 - Hàng đầu tiên là header, dữ liệu bắt đầu từ hàng 2.
 - Nếu cột B để trống → dùng IP làm alias.
-- Tự động bỏ qua IP đã tồn tại trong danh sách (không trùng lặp).
-- Tự động bỏ qua các dòng có IP không hợp lệ (không phải định dạng `x.x.x.x`).
+- Tự động bỏ qua IP đã tồn tại (không trùng lặp) và IP không hợp lệ.
 - In tóm tắt: *Đã thêm X / Bỏ qua Y (trùng) / Bỏ qua Z (IP không hợp lệ)*.
+- Có thể xuất trước file mẫu `oob_import_template.xlsx` để điền theo đúng format.
 
-Chọn `[i]` → chương trình hỏi trước: **"Xuất file mẫu trước?"** — nếu chọn `y`, sẽ
-tạo file `oob_import_template.xlsx` với header đúng định dạng để điền vào.
+### `[e]` Xuất báo cáo menu OOB ra Excel (CLI)
 
-Yêu cầu: `pip install openpyxl`
+Xuất toàn bộ dữ liệu menu ra `reports/OOB_Menu_Report_YYYYMMDD_HHMMSS.xlsx`, gồm
+3 sheet **"Chi tiet"** / **"Tom tat"** / **"Canh bao"** (mỗi sheet có freeze
+header + auto-filter). Không cần kết nối thiết bị — đọc từ baseline DB + log
+verify sẵn có.
 
----
+### `[7]` Quét kiểm tra cấu hình / `[8]` Deep Verify vật lý (CLI)
 
-### `[e]` Xuất báo cáo menu OOB ra Excel
+Giống hệt logic mô tả ở mục 7 (Web) — cả 2 nơi dùng chung hàm trong
+`oob_monitor.py`/`oob_lib.py`. Khác biệt duy nhất: khi chạy tay ở CLI, bước xác
+nhận ghi baseline mới hoặc push sửa mô tả **luôn hỏi `y/n` ngay trên terminal**;
+khi chạy tự động trong `--daemon`, hành vi tuân theo cờ `auto_push_desc`.
 
-Xuất toàn bộ dữ liệu menu của tất cả OOB ra file
-`reports/OOB_Menu_Report_YYYYMMDD_HHMMSS.xlsx`.
-
-**Không cần kết nối thiết bị** — đọc từ baseline DB và file log verify đã có sẵn.
-
-File Excel gồm **3 sheet**:
-
-#### Sheet "Chi tiet"
-Mỗi dòng = 1 option trên menu OOB. Các cột:
-
-| Cột | Nội dung |
-|-----|----------|
-| OOB IP | IP của thiết bị OOB |
-| OOB Alias | Tên gọi |
-| OOB Hostname | Hostname thực tế (từ DB) |
-| Menu Name | Tên menu (VD: `OOB_MENU`) |
-| Option Key | Phím chọn (VD: `[1]`, `2`, `KTHT`) |
-| Description | Nội dung text hiển thị trên menu |
-| Target IP | IP đích kết nối |
-| Target Port | Port đích |
-| Protocol | `telnet` / `ssh` / `serial` (Vertiv) |
-| **Desc Status** | Kết quả kiểm tra mô tả (xem bảng màu bên dưới) |
-| Ghi chú | Chi tiết thêm về trạng thái |
-
-**Màu sắc cột Desc Status:**
-
-| Màu | Giá trị | Ý nghĩa |
-|-----|---------|---------|
-| 🟢 Xanh lá | `OK - Khop` | Hostname verify được khớp với description |
-| 🔴 Đỏ nhạt | `SAI - Sai desc` | Hostname thực tế không khớp description |
-| 🟡 Vàng | `Chua Verify` | Chưa có dữ liệu verify (chưa chạy Deep Verify lần nào) |
-| 🟠 Cam nhạt | `Khong ket noi duoc` | Verify đã chạy nhưng TIMEOUT hoặc không pivot được |
-| ⬜ Xám | `Khong co desc` | Ô description trống (không thể kiểm tra) |
-
-#### Sheet "Tom tat"
-Mỗi dòng = 1 OOB. Hiển thị tổng số option / số Khớp / số Sai / số Chưa verify,
-v.v. Tiện để nhìn tổng quan nhanh tình trạng toàn hệ thống.
-
-#### Sheet "Canh bao"
-Chỉ liệt kê các option đang ở trạng thái `SAI - Sai desc` hoặc
-`Khong ket noi duoc` trong lần quét gần nhất — giúp nhìn thẳng vào vấn đề cần xử
-lý mà không phải lọc qua toàn bộ sheet "Chi tiet".
-
-Cả 3 sheet đều có **header freeze** (hàng đầu cố định khi cuộn) và **auto-filter**
-để lọc/sắp xếp dễ dàng trong Excel.
-
-Yêu cầu: `pip install openpyxl`
-
----
-
-### `[7]` Quét kiểm tra cấu hình
-
-Kết nối vào thiết bị OOB, đọc lại toàn bộ `menu`, so sánh với baseline đã lưu. Nếu
-khác, hiển thị bảng so sánh và hỏi xác nhận trước khi ghi đè baseline. Nếu thiết bị
-chưa có baseline, hỏi xác nhận để lưu lần đầu.
-
-Có thể chỉ định 1/nhiều IP hoặc alias (cách nhau dấu phẩy), để trống để quét tất cả.
-
-> **Quan trọng:** dù chạy thủ công (option `[7]`) hay tự động trong Daemon (Luồng
-> 1), bước xác nhận ghi đè/tạo baseline **luôn luôn cần người dùng gõ `y`** trong
-> vòng 5 giây — không có cờ cấu hình nào khiến bước này tự động "y" giúp bạn. Đây
-> là khác biệt quan trọng so với Luồng 2 (Deep Verify), nơi việc push sửa lỗi có
-> thể diễn ra hoàn toàn tự động nếu bật `auto_push_desc`.
-
-### `[8]` Deep Verify vật lý
-
-Với từng option trong menu, kết nối pivot (telnet/ssh) từ chính OOB sang thiết bị
-đích, đọc hostname thật của thiết bị đó, và so sánh với mô tả đang khai báo trên menu.
-
-Kết quả mỗi option là một trong các trạng thái:
-
-| Trạng thái | Ý nghĩa |
-|---|---|
-| `OK` | Hostname thật khớp với mô tả trên menu |
-| `CANH BAO` | Sai lệch — hostname thật khác mô tả trên menu |
-| `KHONG PIVOT` | Chưa pivot sang được thiết bị đích (vẫn ở console của chính OOB) |
-| `TIMEOUT` | Không kết nối được / không có phản hồi |
-| `YEU CAU DANG NHAP` | Thiết bị đích yêu cầu đăng nhập, không xác minh được hostname |
-
-Khi chạy thủ công (option `[8]`), nếu phát hiện `CANH BAO`, chương trình hỏi có
-muốn tự động **PUSH** sửa lại mô tả trên menu OOB cho khớp hostname thật hay không.
-
-Khi chạy tự động theo chu kỳ/lịch trong Daemon (Luồng 2), việc push **tuân theo
-đúng 1 cờ duy nhất**: `auto_push_desc` (mục `[c]` trong Settings):
-- **Bật (mặc định)** → phát hiện `CANH BAO` là push sửa ngay, **không hỏi xác
-  nhận**, có ghi log vào `push-logs/` và tự Verify lại option vừa sửa.
-- **Tắt** → daemon vẫn chạy Deep Verify và ghi log cảnh báo bình thường, nhưng sẽ
-  **không** tự sửa gì trên thiết bị — bạn cần vào option `[8]` chạy tay rồi tự
-  xác nhận push.
-
-**Nguyên tắc an toàn của tính năng push:**
+**Nguyên tắc an toàn của tính năng push (áp dụng cho cả CLI và Web):**
 - Chỉ sửa đúng 1 dòng `menu <tên> text <key> <mô tả mới>` của option đang sai lệch.
-- Không sửa nếu nghi ngờ trùng IP đích giữa nhiều OOB.
-- Không bao giờ tự chạy `write memory` — chỉ sửa running-config, người dùng tự quyết
-  định khi nào lưu vĩnh viễn.
+- Không bao giờ tự chạy `write memory` — chỉ sửa running-config.
 - Luôn ghi log vào `push-logs/` và verify lại sau khi sửa.
 - **Thiết bị Vertiv ACS chưa được hỗ trợ Push** — Deep Verify vẫn chạy và báo cáo
-  bình thường trên Vertiv, nhưng nếu phát hiện sai lệch, chương trình chỉ cảnh báo
-  chứ không tự sửa description (xem mục 9).
+  bình thường trên Vertiv, nhưng chương trình chỉ cảnh báo chứ không tự sửa.
 
-## 7. Web Dashboard (`oob_web.py`)
-
-Ngoài CLI, có thể chạy một giao diện web (Flask) để xem trạng thái và thao tác
-nhanh từ trình duyệt — không cần mở terminal, không cần cài `rich`.
+## 7. Web Dashboard (`oob_web.py`) — những gì ĐANG CÓ
 
 ```bash
 python oob_web.py
 ```
 
-Mặc định chạy tại `http://127.0.0.1:5000` (lắng nghe trên `0.0.0.0:5000`, có thể
-truy cập từ máy khác trong mạng qua IP của máy chạy chương trình).
+Mặc định chạy tại `http://127.0.0.1:5000` (lắng nghe `0.0.0.0:5000`, truy cập
+được từ máy khác trong mạng qua IP máy chạy). `oob_web.py` **dùng lại trực tiếp**
+các hàm trong `oob_monitor.py` (đọc cùng `oob_config.json`, `oob_ips.txt`,
+`baseline.db`, `snapshot.db`, `device_status.json`) — **không cần** bật
+`--daemon` trước, các nút Scan/Verify/Push trên web tự kết nối thiết bị và chạy
+nền (background thread) ngay khi bấm.
 
-`oob_web.py` **dùng lại trực tiếp** các hàm trong `oob_monitor.py` (đọc cùng
-`oob_config.json`, `oob_ips.txt`, `baseline.db`, `snapshot.db`,
-`device_status.json`) — không cần phải bật daemon `--daemon` trước, các nút Scan/
-Verify/Push trên web sẽ tự kết nối thiết bị và chạy nền (background thread) ngay
-khi bấm.
+### Đăng nhập & phân quyền
 
-### Trang chủ (Dashboard)
+- Tài khoản mặc định lần đầu: **`admin` / `admin`** (tự tạo trong bảng
+  `web_users` bên trong `baseline.db`) — **đổi ngay** qua "Đổi mật khẩu" sau khi
+  cài đặt xong.
+- **Guest (chưa đăng nhập):** chỉ xem — Dashboard, danh sách thiết bị, chi tiết 1
+  thiết bị, tìm kiếm, tải báo cáo Excel.
+- **Admin (đã đăng nhập):** thêm tất cả các thao tác thay đổi dữ liệu — Scan/
+  Verify/Push, thêm/xóa thiết bị, sửa cấu hình, quản lý tài khoản phụ, Import,
+  Revert.
+- Khi đăng nhập hoặc đổi mật khẩu, hệ thống tự kiểm tra mật khẩu có từng bị lộ
+  qua API "Have I Been Pwned" (`api.pwnedpasswords.com`) và cảnh báo nếu có.
 
-- Bảng danh sách toàn bộ thiết bị OOB: Alias, IP, trạng thái Ping (Online/Offline),
-  trạng thái Menu (OK / Lỗi Connect / khác), tổng số dòng (option) đang có trong
-  baseline, thời điểm cập nhật gần nhất.
-- 3 nút thao tác hàng loạt: **Scan All** (thu thập lại data), **Verify All** (kiểm
-  tra dây cắm vật lý), **Push Config All** (tự sửa mô tả sai — bỏ qua thiết bị
-  Vertiv vì chưa hỗ trợ).
-- Mỗi dòng thiết bị có nút thao tác riêng: xem chi tiết, Scan, Verify, Push, Xóa.
-- Nút **"Thêm OOB"** — thêm nhanh 1 thiết bị (IP + alias) vào `oob_ips.txt` mà
-  không cần sửa file tay hay vào CLI.
-- Nút **"Cài đặt"** — sửa nhanh username/password/enable password/Vertiv Connect
-  Password và bật/tắt `auto_verify` ngay trên web, ghi thẳng vào `oob_config.json`.
-- Ô tìm kiếm ở góc trên — tra cứu theo hostname thật, alias, IP, hoặc mô tả
-  description; kết quả xếp hạng theo độ khớp và hiện trong 1 modal, có nút "Đi tới"
-  để nhảy thẳng đến trang chi tiết OOB tương ứng.
+### Trang Dashboard
+
+- Bảng thống kê nhanh: tổng số thiết bị, số Online/Offline, số đã có baseline, số
+  đang có cảnh báo (`CANH BAO`) trong 7 ngày gần nhất.
+- Bảng danh sách toàn bộ thiết bị: Alias, IP, trạng thái Ping, trạng thái Menu,
+  số option baseline, số lần OK/cảnh báo verify, thời điểm cập nhật.
+- Nút thao tác riêng từng dòng: xem chi tiết, Scan, Verify, Push, Xóa (chỉ Admin
+  thấy nút hành động).
+- Nút **"Thêm OOB"** — thêm 1 thiết bị (IP + alias) ngay trên web.
+- Ô tìm kiếm — tra theo hostname thật/alias/IP/description, kết quả xếp hạng độ
+  khớp, có nút "Đi tới" nhảy sang trang chi tiết.
+- Live Console (SSE) — xem log realtime của các tác vụ Scan/Verify/Push đang chạy,
+  không cần refresh trang.
 
 ### Trang chi tiết 1 thiết bị (`/device/<ip>`)
 
-- Hiển thị hostname OOB, hãng sản xuất (Cisco/Vertiv), và toàn bộ danh sách
-  option/port đang lưu trong baseline: phím menu/cổng, description, IP đích, port
-  đích, giao thức (`telnet`/`ssh`/`serial`).
-- 3 nút thao tác riêng cho thiết bị này: Quét Lại Data, K.Tra Dây Cắm (Verify),
-  Sửa Lỗi Desc (Push).
-- Nếu thiết bị chưa có baseline (chưa từng Scan), hiển thị cảnh báo thay vì bảng
-  trống.
+Hostname, hãng sản xuất (Cisco/Vertiv), toàn bộ option/port trong baseline (phím
+menu, description, IP đích, port đích, giao thức), trạng thái verify từng dòng, và
+3 nút Scan/Verify/Push riêng cho thiết bị này.
 
-### API (dùng nội bộ bởi giao diện web, có thể gọi trực tiếp nếu cần tích hợp)
+### Trang "Vận hành Tức thì" (chỉ Admin)
 
-| Endpoint | Method | Chức năng |
+- 3 thẻ chạy ngay cho **toàn bộ danh sách thiết bị**: SCAN CONFIG / DEEP VERIFY /
+  PUSH CONFIG (bấm 1 lần, chạy 1 lần — **không lặp lại**, xem cảnh báo đầu file).
+- Ô "Chạy cho thiết bị cụ thể": nhập IP/alias hoặc để trống (= tất cả), có 3 nút
+  Scan/Verify/Push Device riêng.
+- Khu vực Live Console.
+
+### Trang Logs (chỉ Admin)
+
+- Danh sách `verify-logs/` và `push-logs/` (tối đa 50 file mới nhất mỗi loại),
+  xem nội dung log ngay trên web.
+- Nút **Revert**: nếu 1 file push-log chứa dòng `REVERT CMD`, cho phép chạy lại
+  đúng các lệnh đó để phục hồi mô tả cũ (dùng credential đầu tiên trong danh sách
+  tài khoản).
+
+### Trang Import / Export
+
+- **Export:** tải file Excel `.xlsx` báo cáo toàn bộ baseline + trạng thái ping +
+  kết quả verify (route `/api/export/excel`) — ai cũng xem/tải được, kể cả Guest.
+- **Import:** dán danh sách IP dạng text (`IP alias`, mỗi dòng 1 thiết bị) vào ô
+  textarea rồi bấm Import — **không phải upload file `.xlsx` thật** như CLI (xem
+  khác biệt ở mục 8.3).
+
+### Trang Settings (chỉ Admin) — 4 tab
+
+- **Kết nối:** username/password/enable password/Vertiv Connect Password, SSH/
+  Telnet port, tên menu ép dùng, toggle "Tự động Verify ngầm".
+- **Multi-Account:** thêm/xóa tài khoản phụ (dùng lần lượt khi tài khoản chính
+  thất bại) — dùng chung với CLI.
+- **Lịch chạy:** chỉnh `interval`/`daily`/`weekly` và giờ/thứ cho cả 2 luồng Scan
+  & Verify — **các giá trị này ghi xuống `oob_config.json` nhưng bản thân web
+  không có gì đọc/thực thi lịch đó** (xem mục 8.1).
+- **Files:** đường dẫn `oob_ips.txt`, `baseline.db`, `snapshot.db`.
+
+### API nội bộ (có thể gọi trực tiếp nếu cần tích hợp)
+
+| Endpoint | Method | Quyền | Chức năng |
+|---|---|---|---|
+| `/api/stats` | GET | Guest | Số liệu tổng quan |
+| `/api/devices` | GET | Guest | Danh sách thiết bị + trạng thái |
+| `/api/device/<ip>/options` | GET | Guest | Chi tiết option của 1 thiết bị |
+| `/api/search` | GET (`?q=`) | Guest | Tìm kiếm, trả JSON xếp hạng |
+| `/api/logs`, `/api/logs/<fn>` | GET | Guest | Danh sách + nội dung verify-logs |
+| `/api/push-logs`, `/api/push-logs/<fn>` | GET | Guest | Danh sách + nội dung push-logs |
+| `/api/export/excel` | GET | Guest | Tải báo cáo Excel |
+| `/api/events` | GET (SSE) | Guest | Stream log realtime |
+| `/api/tasks` | GET | Guest | Lịch sử/trạng thái task |
+| `/api/config` | GET / POST | Admin | Đọc / cập nhật `oob_config.json` |
+| `/api/credentials` | GET/POST/DELETE | Admin | Quản lý tài khoản phụ |
+| `/api/device` | POST / DELETE | Admin | Thêm / xoá thiết bị |
+| `/api/action` | POST | Admin | Chạy `scan`/`verify`/`push` nền (1 IP hoặc để trống = tất cả) |
+| `/api/revert` | POST | Admin | Chạy lại lệnh REVERT từ 1 push-log |
+| `/api/import` | POST | Admin | Import danh sách IP dạng text |
+| `/api/change-password` | POST | Admin | Đổi mật khẩu tài khoản đang đăng nhập |
+
+> **Lưu ý bảo mật:** mật khẩu thiết bị (Enable password, Vertiv Connect Password…)
+> hiển thị **nguyên văn** trong form Settings khi Admin mở trang (không mask lại
+> khi load). `SECRET_KEY` của Flask session mặc định là `os.urandom(24)` — nghĩa
+> là **mỗi lần restart `oob_web.py`, mọi session đang đăng nhập bị đăng xuất**,
+> trừ khi bạn tự set biến môi trường `FLASK_SECRET_KEY` cố định. Chỉ nên chạy
+> trong mạng nội bộ tin cậy, không nên expose ra Internet mà không tự thêm lớp
+> bảo vệ (reverse proxy + HTTPS, VPN, firewall...).
+
+## 8. Web Dashboard đang THIẾU gì so với CLI
+
+Đây là phần liệt kê rõ ràng để tránh hiểu nhầm "chạy web là đủ thay cho daemon".
+
+### 8.1. ❌ Không có vòng lặp tự động / lập lịch chạy nền (quan trọng nhất)
+
+`oob_web.py` **không khởi động `run_daemon()` hay bất kỳ thread lặp `while True`
+theo thời gian nào**. Mọi Scan/Verify/Push trên web đều là **on-demand**: chỉ
+chạy đúng 1 lần tại thời điểm người dùng bấm nút, rồi dừng hẳn.
+
+Hệ quả:
+- Tab Settings → "Lịch chạy" cho phép chỉnh `interval`/`daily`/`weekly` và lưu
+  xuống `oob_config.json` — **nhưng các giá trị này chỉ có ý nghĩa nếu có một
+  tiến trình `python oob_monitor.py --daemon` chạy song song và đọc cùng file
+  config đó.** Nếu bạn chỉ chạy `oob_web.py` một mình (không có `--daemon` nào
+  chạy nền), thì dù có set lịch "mỗi ngày 1:00 sáng" trên web, **sẽ không có gì
+  tự chạy lúc 1:00 sáng cả** — đây chính là điều bạn nhắc tới: "không có chức
+  năng lặp lịch tự động đi thu thập thông tin".
+- Muốn có giám sát tự động thật sự (tự quét/tự verify theo lịch, kể cả khi không
+  ai mở trình duyệt), **bắt buộc phải chạy thêm** `python oob_monitor.py
+  --daemon` như một tiến trình nền riêng (systemd service, Task Scheduler, tmux,
+  Docker container, v.v.) — Web chỉ là lớp giao diện thao tác/xem, không thay
+  thế được daemon.
+
+### 8.2. ❌ Toggle "Tự động Verify ngầm" (`auto_verify`) không có tác dụng thật
+
+Cờ này hiện diện cả ở CLI (`[b]`) và Web (tab Kết nối), lưu được xuống config,
+nhưng **logic chạy Luồng 2 trong `run_daemon()` hiện chưa kiểm tra giá trị của
+nó** — Deep Verify tự động (khi daemon chạy) vẫn luôn chạy theo lịch dù bạn tắt
+mục này. Đây là hạn chế có sẵn từ CLI, không phải riêng của Web, nhưng dễ gây
+hiểu lầm hơn khi thao tác qua giao diện web vì trông giống 1 công tắc bật/tắt
+thật.
+
+### 8.3. ⚠️ Import chỉ nhận danh sách IP dạng text, không upload file Excel thật
+
+CLI (`[i]`) đọc trực tiếp 1 file `.xlsx` thật trên đĩa (cột A = IP, cột B =
+alias) và có sẵn nút xuất file mẫu `oob_import_template.xlsx`.
+
+Web (`/api/import`) **chỉ nhận text dán vào ô textarea**, không có input
+`type="file"` để tải lên `.xlsx`. Muốn import từ Excel qua web, bạn phải tự mở
+file Excel, copy dữ liệu ra rồi dán vào ô — không tự động đọc file `.xlsx`.
+
+### 8.4. ❌ Không có trạng thái Daemon thật (`daemon.pid`) trên giao diện Web
+
+- CLI: Menu Quản Lý đọc file `daemon.pid` (do `--daemon` ghi heartbeat mỗi 30s)
+  để hiển thị chính xác `RUNNING`/`STALE`/`KHONG RO`.
+- Web: chấm tròn "Web server hoạt động" / "N task đang chạy" ở góc trên chỉ đếm
+  số task **do chính web tạo ra** (`task_history.json`), **không đọc
+  `daemon.pid`**. Nghĩa là dù `--daemon` CLI có đang chạy nền thật hay không, Web
+  không hề biết và không hiển thị đúng trạng thái đó.
+
+### 8.5. ❌ Không tự mở 2 cửa sổ / không có chế độ "CA HAI" như CLI option 3
+
+Web chỉ là 1 tiến trình `python oob_web.py` duy nhất — không có khái niệm mở
+song song 2 cửa sổ Menu + Daemon như CLI.
+
+### 8.6. ❌ Không có sửa (edit) thiết bị đã thêm, chỉ có Thêm / Xóa
+
+`/api/device` chỉ hỗ trợ `POST` (thêm) và `DELETE` (xóa). Muốn đổi alias của 1
+IP đã có, phải xóa rồi thêm lại (hoặc sửa tay `oob_ips.txt` / dùng CLI).
+
+### 8.7. Bảng tổng hợp nhanh
+
+| Tính năng | CLI (`oob_monitor.py`) | Web (`oob_web.py`) |
 |---|---|---|
-| `/api/config` | GET / POST | Đọc / cập nhật `oob_config.json` |
-| `/api/device` | POST / DELETE | Thêm / xoá thiết bị trong `oob_ips.txt` |
-| `/api/action` | POST | Chạy `scan` / `verify` / `push` (nền, có thể chỉ định 1 IP hoặc để trống = tất cả) |
-| `/api/search` | GET (`?q=`) | Tìm kiếm port/hostname theo từ khoá, trả JSON đã xếp hạng |
+| Scan cấu hình (1 lần, thủ công) | ✅ `[7]`, 1 hoặc nhiều IP | ✅ nút Scan, 1 IP hoặc để trống = tất cả |
+| Deep Verify (1 lần, thủ công) | ✅ `[8]` | ✅ nút Verify |
+| Push sửa mô tả (1 lần, thủ công) | ✅ theo sau `[8]`, hỏi xác nhận | ✅ nút Push, không hỏi xác nhận trên web |
+| **Tự động lặp lại theo chu kỳ/lịch (không cần người bấm)** | ✅ `--daemon`, 2 luồng độc lập | ❌ **không có** |
+| Trạng thái Daemon thật (`daemon.pid`) | ✅ | ❌ không đọc file này |
+| Toggle "Tự động Verify ngầm" có tác dụng | ❌ (bug có sẵn, chưa được daemon dùng) | ❌ (kế thừa cùng bug) |
+| Import Excel — đọc file `.xlsx` thật | ✅ | ❌ chỉ nhận text dán tay |
+| Export Excel | ✅ `[e]`, 3 sheet (Chi tiết/Tóm tắt/Cảnh báo) | ✅ 1 sheet "Chi tiet OOB" |
+| Xem lịch sử log Verify/Push | ✅ `[9]` (Verify gần nhất) | ✅ xem được nhiều file, cả 2 loại log |
+| Revert theo log Push | ❌ không có sẵn trong menu CLI | ✅ có nút Revert |
+| Sửa alias thiết bị đã thêm | có thể xóa/thêm lại | ❌ chỉ Thêm/Xóa |
+| Đăng nhập / phân quyền Guest-Admin | không áp dụng (CLI chạy local) | ✅ có |
+| Multi-account (tài khoản dự phòng) | ✅ | ✅ |
+| Push cho thiết bị Vertiv | ❌ chưa hỗ trợ | ❌ chưa hỗ trợ (giống CLI) |
 
-> **Lưu ý:** `oob_web.py` không có xác thực đăng nhập (không có login/password
-> bảo vệ trang web) và mật khẩu thiết bị hiển thị nguyên văn trong modal Cài đặt —
-> chỉ nên chạy trong mạng nội bộ tin cậy, không nên expose ra Internet mà không tự
-> thêm lớp bảo vệ (reverse proxy + auth, VPN, firewall...).
-
-## 8. Log
+## 9. Log
 
 | File | Nội dung |
 |------|----------|
 | `verify-logs/Verify_<alias>_<timestamp>.log` | Báo cáo Deep Verify dạng bảng, nhóm theo mức độ nghiêm trọng (CANH BAO lên đầu) |
 | `push-logs/Push_<alias>_<timestamp>.log` | Lịch sử các lần tự động sửa mô tả (cũ → mới, kèm lệnh revert nếu cần sửa tay lại) |
-| `reports/OOB_Menu_Report_<timestamp>.xlsx` | Báo cáo Excel xuất từ option `[e]`, dùng dữ liệu tổng hợp từ log verify gần nhất |
+| `reports/*.xlsx` | Báo cáo Excel xuất từ CLI `[e]` hoặc nút "Tải về Excel" trên Web |
 
-Xem nhanh log Verify gần nhất ngay trong menu CLI qua mục **[9]**.
+Xem nhanh log Verify gần nhất ngay trong menu CLI qua mục **[9]**, hoặc xem đầy
+đủ danh sách log (cả Verify và Push) trong trang **Logs** của Web.
 
-## 9. Dừng chương trình
+## 10. Dừng chương trình
 
 - CLI, chế độ Menu: chọn **[0] Thoát**.
 - CLI, chế độ Daemon: `Ctrl+C`.
 - Web Dashboard: `Ctrl+C` trong terminal đang chạy `oob_web.py`.
 
-## 10. Lưu ý & giới hạn hiện tại
+## 11. Luồng hoạt động chuẩn (khuyến nghị)
 
-- **Thiết bị Vertiv ACS chưa hỗ trợ tính năng Push Config.** Deep Verify vẫn chạy
-  và báo cáo `CANH BAO` bình thường trên Vertiv, nhưng cả CLI (`[8]`) lẫn Web
-  Dashboard (nút Push) đều bỏ qua/không tự sửa description cho thiết bị loại này.
-- **`[b]` Tự động Verify ngầm — hiện chưa có tác dụng thực tế.** Cờ này đang chỉ
-  được hiển thị/toggle trong màn hình Settings, nhưng logic chạy Daemon (Luồng 2)
-  hiện chưa kiểm tra giá trị của nó — Deep Verify vẫn luôn tự chạy theo lịch dù
-  bạn tắt mục này. Nếu muốn Deep Verify dừng hẳn, cách duy nhất hiện tại là tắt
-  hẳn Daemon (không chạy `--daemon`), hoặc yêu cầu vá lại logic để `[b]` gate
-  đúng việc khởi động luồng Verify.
-- Lịch `daily`/`weekly` (cả `[s]` và `[d]`) hiện chỉ hỗ trợ mốc **giờ cố định
-  trong ngày, hoặc thứ + giờ cố định trong tuần**. Chưa hỗ trợ lịch theo ngày cụ
-  thể trong tháng (VD "ngày 15 hàng tháng") hay một mốc ngày/tháng/năm duy nhất
-  (chạy 1 lần rồi thôi).
+### 11.1. Thiết lập lần đầu (làm 1 lần)
+
+1. Cài thư viện (`pip install -r requirements.txt`).
+2. Chạy `python oob_monitor.py --menu` → `[3] Cấu hình` → nhập username/password/
+   enable password/port SSH-Telnet. Nếu có thiết bị Vertiv, nhập thêm Vertiv
+   Connect Password.
+3. Thêm danh sách thiết bị: gõ tay từng cái bằng `[1]`, hoặc import hàng loạt
+   bằng `[i]` (file Excel thật), hoặc sửa trực tiếp `oob_ips.txt`.
+4. Đặt lịch chạy cho 2 luồng (mục `[s]` và `[v]`/`[d]` trong Cấu hình) theo nhu
+   cầu thực tế — ví dụ Luồng 1 (Scan cấu hình) `interval` mỗi 30–60s để bắt lỗi
+   cấu hình sớm, Luồng 2 (Deep Verify vật lý) `daily` lúc 1:00 sáng vì đây là
+   thao tác pivot nặng hơn, không cần chạy dày.
+5. Chạy `[7]` (Scan) 1 lần thủ công để tạo **baseline lần đầu** cho tất cả thiết
+   bị — xác nhận `y` khi được hỏi "lưu làm baseline".
+6. (Tuỳ chọn) Chạy `[8]` (Deep Verify) 1 lần để có dữ liệu verify ban đầu, phục
+   vụ cho báo cáo/trang Web ngay từ đầu thay vì phải chờ tới lịch chạy đầu tiên.
+
+### 11.2. Vận hành hàng ngày — tự động hoá thật sự
+
+7. Khởi động và **giữ chạy liên tục** `python oob_monitor.py --daemon` (nên chạy
+   dưới dạng service/systemd/Task Scheduler/tmux để không bị tắt khi đóng
+   terminal hoặc mất kết nối SSH tới máy chủ). Đây là tiến trình duy nhất tự lặp
+   lại theo lịch đã đặt ở bước 4 — nếu không có tiến trình này chạy nền, sẽ
+   **không có gì tự động xảy ra**, bất kể bạn có mở Web hay không.
+8. (Tuỳ chọn, không bắt buộc) Chạy thêm `python oob_web.py` song song **chỉ để
+   xem** dashboard/log/báo cáo qua trình duyệt, hoặc để thao tác thủ công khi cần
+   gấp (ví dụ vừa thay dây console, muốn Verify ngay 1 thiết bị mà không chờ tới
+   lịch tiếp theo của daemon).
+9. Khi `--daemon` phát hiện `CANH BAO` (Deep Verify sai lệch) và `auto_push_desc`
+   đang bật → daemon tự sửa mô tả, ghi log vào `push-logs/`, tự verify lại. Nếu
+   tắt `auto_push_desc`, daemon chỉ cảnh báo — bạn cần vào CLI `[8]` hoặc bấm nút
+   Push trên Web để tự xác nhận sửa.
+10. Định kỳ (tuần/tháng) vào CLI `[e]` hoặc Web → Import/Export → "Tải về Excel"
+    để lưu báo cáo tổng hợp, đối chiếu với đội vận hành.
+
+### 11.3. Nếu chỉ muốn dùng Web (không chạy `--daemon`)
+
+Vẫn hoạt động được, nhưng cần hiểu rõ giới hạn: **không có gì tự chạy nền**. Quy
+trình sẽ là thao tác thủ công định kỳ do con người thực hiện:
+
+11. Người trực chủ động mở Web, bấm **Scan CONFIG** (toàn bộ) hoặc Scan từng
+    thiết bị theo lịch làm việc thực tế của mình (ví dụ đầu giờ mỗi ca trực).
+12. Bấm **DEEP VERIFY** khi cần xác minh vật lý (sau khi đấu lại dây, sau bảo trì
+    phòng máy, hoặc theo lịch kiểm tra định kỳ tự quy định bằng tay).
+13. Khi thấy `CANH BAO`, bấm **PUSH CONFIG** cho thiết bị đó (hoặc cho tất cả)
+    để tự sửa mô tả sai lệch — nút Push trên Web **không hỏi xác nhận lại**, sửa
+    ngay khi bấm.
+14. Nếu sửa nhầm hoặc cần khôi phục mô tả cũ, vào trang **Logs → push-logs**, mở
+    log lần Push liên quan, bấm **Revert**.
+
+> Cách dùng này phù hợp cho môi trường có người trực theo dõi thường xuyên; nếu
+> cần giám sát 24/7 không phụ thuộc con người, bắt buộc quay lại mục 11.2 (chạy
+> `--daemon`).
+
+## 12. Giới hạn hiện tại (áp dụng chung, ngoài mục 8)
+
+- **Thiết bị Vertiv ACS chưa hỗ trợ tính năng Push Config** ở cả CLI lẫn Web.
+  Deep Verify vẫn chạy và báo cáo `CANH BAO` bình thường trên Vertiv, nhưng
+  không tự sửa description cho thiết bị loại này.
+- Lịch `daily`/`weekly` (cả `[s]` và `[d]`, dù đặt qua CLI hay Web) hiện chỉ hỗ
+  trợ mốc **giờ cố định trong ngày, hoặc thứ + giờ cố định trong tuần**. Chưa hỗ
+  trợ lịch theo ngày cụ thể trong tháng (VD "ngày 15 hàng tháng") hay một mốc
+  ngày/tháng/năm duy nhất (chạy 1 lần rồi thôi).
 - 2 tiến trình `--menu` và `--daemon` (khi chạy chế độ 3) không chia sẻ bộ nhớ —
   đổi cấu hình ở cửa sổ Menu chỉ có hiệu lực ngay với 2 mục lịch chạy (`[s]`,
-  `[d]`), các mục còn lại (username/password/port/interval số giây...) cần khởi
-  động lại `--daemon` mới nhận.
+  `[d]`), các mục còn lại cần khởi động lại `--daemon` mới nhận.
 - `oob_web.py` là 1 tiến trình hoàn toàn riêng biệt với `--daemon`/`--menu` —
   cũng không chia sẻ bộ nhớ, chỉ chia sẻ file config/DB trên đĩa. Đổi cấu hình
-  trên Web sẽ ghi xuống `oob_config.json` như CLI, nhưng nếu đang có `--daemon`
-  chạy song song thì áp dụng đúng quy tắc ở trên (chỉ 2 mục lịch chạy tự nhận
-  ngay, còn lại cần khởi động lại daemon).
-- `oob_web.py` không có xác thực đăng nhập — xem lưu ý bảo mật ở mục 7.
+  trên Web ghi xuống `oob_config.json` như CLI, áp dụng đúng quy tắc trên nếu có
+  `--daemon` đang chạy song song.
+- `oob_web.py` mặc định tự sinh `SECRET_KEY` ngẫu nhiên mỗi lần khởi động (mất
+  session khi restart) và hiển thị mật khẩu thiết bị dạng chữ thường trong form
+  Settings — xem lưu ý bảo mật ở mục 7.

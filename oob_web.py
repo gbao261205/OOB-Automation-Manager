@@ -940,11 +940,6 @@ select.fc option{background:#1a1a2e}
       <div class="sh">
         <div class="st"><span class="dot"></span>Thiết bị OOB</div>
         <div class="bg2">
-          {% if is_admin %}
-          <button class="btn btn-t btn-sm" onclick="runAction('scan',null)">🔍 Scan All</button>
-          <button class="btn btn-a btn-sm" onclick="runAction('verify',null)">⚡ Verify All</button>
-          <button class="btn btn-pk btn-sm" onclick="runAction('push',null)">🚀 Push All</button>
-          {% endif %}
           <button class="btn btn-g btn-sm" onclick="loadDash()">↻ Làm mới</button>
         </div>
       </div>
