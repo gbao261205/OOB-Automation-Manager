@@ -812,6 +812,14 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             # Buoc 3: Session da mo -> Nghi 1s de on dinh, roi go Enter de trigger prompt neu vao thang
             time.sleep(1.0)
             s.write("") 
+            
+            # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm
+            out_tmp_buf = s.read_until(["Data Buffering Suspended"], timeout=1.5)
+            out += out_tmp_buf
+            if "Data Buffering Suspended" in out_tmp_buf:
+                time.sleep(0.5)
+                s.write("")
+                
             time.sleep(0.5)
             s.write("") 
             
@@ -873,8 +881,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         lines = [l.strip() for l in output_clean.splitlines() if l.strip()]
         
         for line in reversed(lines):
-            # Bo qua cac dong lenh hoac thong bao ket noi cua Vertiv/Network
-            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->"]) or _CONN_ERR_RE.search(line): 
+            # Bo qua cac dong lenh hoac thong bao ket noi cua Vertiv/Network/OS
+            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->", "Data Buffering Suspended", "{master"]): 
                 continue
             
             # 1. Kiem tra Prompt truc tiep (VD: HCM-ROUTER-01> hoac HCM-ROUTER-01#)
