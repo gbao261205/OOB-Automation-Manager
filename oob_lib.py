@@ -170,6 +170,17 @@ class MiniTelnet:
     def write(self, text: str):
         self.sock.sendall((text + "\r\n").encode())
 
+    def write_cr(self, text: str):
+        """Giong write() nhung CHI gui '\\r' (khong co '\\n' theo sau).
+
+        Dung rieng cho o nhap MAT KHAU tren mot so serial console/ACS: gui
+        'text\\r\\n' (ca hai) co the bi thiet bi hieu them ky tu '\\n' nhu MOT
+        LAN NHAN ENTER RONG NUA ngay sau khi mat khau (dung) vua duoc xac nhan
+        - dan den bi tinh la "nhap mat khau rong" va bi tu choi, khien thiet
+        bi hoi lai Password: mac du mat khau ban dau la CHINH XAC. Go tay chi
+        gui 1 Enter (\\r) nen khong gap loi nay."""
+        self.sock.sendall((text + "\r").encode())
+
     def write_no_drain(self, text: str):
         """Giong write(), nhung ten ham nay khang dinh RO RANG la KHONG duoc
         xoa buffer dang cho truoc khi gui (xem MiniSSH.write_no_drain() de biet
@@ -307,6 +318,13 @@ class MiniSSH:
         # Drain buffer truoc khi gui lenh moi — tranh stale data lam hong read_until ke tiep
         self._drain_pending()
         self._shell.send((text + "\r\n").encode())
+
+    def write_cr(self, text: str):
+        """Giong write() nhung CHI gui '\\n' (khong co '\\r'). Xem giai thich
+        chi tiet o MiniTelnet.write_cr() - dung cho o nhap MAT KHAU de tranh
+        ky tu thua bi hieu nham thanh 1 lan Enter rong ke tiep."""
+        self._drain_pending()
+        self._shell.send((text + "\n").encode())
 
     def write_no_drain(self, text: str):
         """Giong write() nhung KHONG goi _drain_pending() truoc khi gui.
