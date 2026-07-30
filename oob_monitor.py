@@ -30,6 +30,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape as rich_escape
 
 # Import tu oob_lib
 from oob_lib import (
@@ -63,6 +64,7 @@ DEFAULT_CONFIG = {
     "scan_schedule_weekday": "mon",     
     "verify_wait_after_connect": 1.5,
     "max_verify_duration": 300,
+    "debug_verify": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,31 @@ def log_verify(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     verify_logs.append(f"[dim]\\[{ts}][/] {msg}")
     update_ui()
+
+DEBUG_VERIFY_LOG = os.path.join("debug-logs", "deep_verify_debug.log")
+
+def debug_dump(cfg, alias, key, label, text, extra=""):
+    """Ghi RAW output (repr, khong bi mat ky tu an \\r \\n \\x1a...) cua tung buoc
+    doc trong Deep Verify ra file, va in 1 dong preview NGAN gon (da escape,
+    khong vo Rich markup) len panel Deep Verify - de xem TAI SAO 1 buoc doc bi
+    thieu/mat du lieu (vd banner FreeBSD bi drain mat, hay bi cat som do timeout).
+    Chi hoat dong khi cfg["debug_verify"] = True. An toan (khong bao gio raise)."""
+    if not cfg.get("debug_verify"):
+        return
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    try:
+        os.makedirs("debug-logs", exist_ok=True)
+        with file_lock:
+            with open(DEBUG_VERIFY_LOG, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {alias} (Opt {key}) - {label} {extra}\n")
+                f.write(f"    len={len(text)} repr={text!r}\n")
+    except OSError:
+        pass
+    try:
+        preview = rich_escape(text.replace("\r", "").replace("\n", "\\n"))[:140]
+        log_verify(f"[dim]\\[{ts}][/][dim white] DEBUG[/] {alias} (Opt {key}) {label} {extra} [dim](len={len(text)})[/] -> {preview}")
+    except Exception:
+        pass
 
 def log_baseline_change(alias, ip, action):
     os.makedirs("baseline-logs", exist_ok=True)
@@ -391,6 +418,8 @@ def settings_menu(cfg, config_path):
         g.add_row("\\[v]", f"Chu ky interval (s)   : [bold cyan]{cfg.get('verify_interval', 3600)}[/]  {v_note}")
         g.add_row("\\[w]", f"Cho sau connect (s)   : [bold cyan]{cfg.get('verify_wait_after_connect', 1.5)}[/]")
         g.add_row("\\[m]", f"Timeout Verify (s)    : [bold cyan]{cfg.get('max_verify_duration', 300)}[/]")
+        dbg_on = "[green bold]BAT[/]" if cfg.get("debug_verify") else "[red bold]TAT[/]"
+        g.add_row("\\[u]", f"Debug Verify (raw log): {dbg_on}  [dim]-> debug-logs/{os.path.basename(DEBUG_VERIFY_LOG)}[/]")
         g.add_row("", "")
         g.add_row("\\[t]",  "[bold yellow]Thu ket noi nhanh (test credential)[/]")
         g.add_row("[0]",   "[bold red]Quay lai menu chinh[/]")
@@ -410,6 +439,10 @@ def settings_menu(cfg, config_path):
         elif choice == "v": val = input("  Chu ky Verify vat ly (giay): ").strip(); cfg["verify_interval"] = int(val) if val.isdigit() else cfg["verify_interval"]
         elif choice == "w": val = input("  Cho sau connect (giay): ").strip(); cfg["verify_wait_after_connect"] = round(float(val), 2) if val else cfg["verify_wait_after_connect"]
         elif choice == "m": val = input("  Timeout tong Verify (giay): ").strip(); cfg["max_verify_duration"] = int(val) if val.isdigit() and int(val)>=30 else cfg["max_verify_duration"]
+        elif choice == "u":
+            cfg["debug_verify"] = not cfg.get("debug_verify", False)
+            state = "BAT" if cfg["debug_verify"] else "TAT"
+            _con.print(f"  [green](OK)[/] Debug Verify: {state}. Log raw se ghi vao [bold]{DEBUG_VERIFY_LOG}[/] (repr() day du \\\\r \\\\n va ky tu an) moi khi chay Deep Verify tren thiet bi Vertiv/Cisco.")
         elif choice == "8": val = input("  File danh sach IP moi: ").strip(); cfg["ip_list"] = val if val else cfg["ip_list"]
         elif choice == "9": val = input("  File baseline DB moi: ").strip(); cfg["baseline_db"] = val if val else cfg["baseline_db"]
         elif choice == "a": val = input("  File snapshot DB moi: ").strip(); cfg["snapshot_db"] = val if val else cfg["snapshot_db"]
@@ -773,6 +806,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         nonlocal session
         if session is None:
             session = connect_auto(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], working_cred["username"], working_cred["password"], working_cred["enable_password"], timeout=8)
+            if cfg.get("debug_verify"):
+                debug_dump(cfg, alias, "-", "SESSION-TYPE", type(session).__name__)
             if vendor == "vertiv":
                 session.write("cd access/")
                 session.read_until("cli->", timeout=3)
@@ -786,7 +821,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         if session: session.close()
         session = None
 
-    def check_port_via_oob(t_ip, t_port, proto, vendor, t_desc):
+    def check_port_via_oob(t_ip, t_port, proto, vendor, t_desc, key="?"):
         try: s = get_session(vendor)
         except Exception: raise RuntimeError("Khong the ket noi toi OOB")
         
@@ -794,20 +829,26 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         if vendor == "vertiv": 
             cmd = f"connect {t_desc}"
             s.write(cmd)
+            debug_dump(cfg, alias, key, "B0-CMD-SENT", cmd)
             
             # Buoc 1: Cho xem thiet bi hoi Pass hay vao thang/xuat hien Prompt/Hot key
             out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->"], timeout=5)
             out += out_tmp
+            debug_dump(cfg, alias, key, "B1-after-connect", out_tmp)
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
                 s.write(v_pass)
                 # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
-                out += s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=12)
+                chunk = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=12)
+                out += chunk
+                debug_dump(cfg, alias, key, "B2-after-vpass", chunk, extra=f"(v_pass_set={'yes' if v_pass else 'EMPTY!'})")
                 
             # Đọc nốt dòng chứa Hot key để bỏ qua ký tự '>' trong <CTRL>Z
             if "Type the hot key" in out:
-                out += s.read_until(["\n"], timeout=2)
+                chunk = s.read_until(["\n"], timeout=2)
+                out += chunk
+                debug_dump(cfg, alias, key, "B2b-hotkey-tail", chunk)
 
             # Buoc 3: DOC NGAY truoc, KHONG go Enter voi. Ngay sau dong "Type
             # the hot key...", thiet bi dich thuong da gui san banner dang
@@ -823,15 +864,20 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             #     FreeBSD in LAI banner + "login:" lan nua (chinh la hien
             #     tuong "login:" bi lap 2 lan ban thay), ma khong dang nhap
             #     duoc gi them.
-            out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+            chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+            out += chunk
+            debug_dump(cfg, alias, key, "B3-banner-read", chunk)
 
             # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm
             out_tmp_buf = s.read_until(["Data Buffering Suspended"], timeout=1.0)
             out += out_tmp_buf
+            debug_dump(cfg, alias, key, "B3b-buffering-check", out_tmp_buf)
             if "Data Buffering Suspended" in out_tmp_buf:
                 time.sleep(0.5)
                 s.write_no_drain("")
-                out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                out += chunk
+                debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
 
             # Buoc 4: CHI go Enter "danh thuc" (va CHI 1 LAN) neu sau Buoc 3
             # van CHUA thay bat ky dau hieu prompt/dang nhap nao - tuc la
@@ -841,7 +887,11 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             if not re.search(r'login:|Username:|Password:|[>#]\s*$|cli->|%', out, re.IGNORECASE):
                 time.sleep(0.8)
                 s.write_no_drain("")
-                out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                out += chunk
+                debug_dump(cfg, alias, key, "B4-wake-enter", chunk)
+            else:
+                debug_dump(cfg, alias, key, "B4-SKIPPED", "(da thay prompt/login o Buoc 3, khong go Enter)")
             
         else: 
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
@@ -851,6 +901,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             s.write("") 
             out += s.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
         
+        debug_dump(cfg, alias, key, "B5-FULL-OUT-before-trim", out)
+
         # Buoc 4: Thoat phien ket noi ve lai Vertiv CLI
         try:
             if vendor == "vertiv":
@@ -875,7 +927,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 else:
                     idx_nl = out.find("\n", idx)
                     out = out[idx_nl:] if idx_nl != -1 else out[idx:]
-                    
+
+        debug_dump(cfg, alias, key, "B6-FINAL-OUT-after-trim", out)
         return out
 
     def clear_line_via_oob(t_port, v_vendor):
@@ -936,7 +989,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         target_ip, port, proto, vendor = opt.get("ip"), opt.get("port", 23), opt.get("protocol", "telnet"), opt.get("vendor", "cisco")
         act_host, note_parts = None, []
 
-        try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor, desc))
+        try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor, desc, key=key))
         except Exception: pass
             
         if not act_host:
@@ -945,7 +998,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 note_parts.append(f"Da thu clear line {port - 2000}")
                 if clear_line_via_oob(port, vendor):
                     time.sleep(2) 
-                    try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor, desc))
+                    try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor, desc, key=key))
                     except Exception: pass
                 else: note_parts.append("Khong clear duoc line")
             else: note_parts.append("Port la Direct/Vertiv, bo qua clear line")
