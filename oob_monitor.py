@@ -175,12 +175,91 @@ def save_config(path, cfg):
 
 def mask(value): return "******" if value else "(chua dat)"
 
-def get_all_credentials(cfg):
+import base64
+try:
+    from cryptography.fernet import Fernet
+    _FERNET_AVAIL = True
+except ImportError:
+    _FERNET_AVAIL = False
+
+def _get_cipher():
+    key_file = ".oob_secret.key"
+    if _FERNET_AVAIL:
+        if not os.path.exists(key_file):
+            with open(key_file, "wb") as f:
+                f.write(Fernet.generate_key())
+        with open(key_file, "rb") as f:
+            return Fernet(f.read())
+    return None
+
+def _encrypt_cred(text):
+    if not text: return text
+    c = _get_cipher()
+    if c:
+        return "ENC:" + c.encrypt(text.encode("utf-8")).decode("utf-8")
+    return "B64:" + base64.b64encode(text.encode("utf-8")).decode("utf-8")
+
+def _decrypt_cred(text):
+    if not text: return text
+    if text.startswith("ENC:"):
+        c = _get_cipher()
+        if c:
+            try: return c.decrypt(text[4:].encode("utf-8")).decode("utf-8")
+            except Exception: pass
+        return text
+    elif text.startswith("B64:"):
+        try: return base64.b64decode(text[4:].encode("utf-8")).decode("utf-8")
+        except Exception: pass
+    return text
+
+def _encrypt_dict(d):
+    return {k: _encrypt_cred(v) if k in ["password", "enable_password"] else v for k, v in d.items()}
+
+def _decrypt_dict(d):
+    return {k: _decrypt_cred(v) if k in ["password", "enable_password"] else v for k, v in d.items()}
+
+def save_working_credential(ip, cred):
+    if not ip or not cred: return
+    cache = {}
+    try:
+        if os.path.exists("working_creds.json"):
+            with open("working_creds.json", "r", encoding="utf-8") as f:
+                cache = json.load(f)
+    except Exception: pass
+    
+    enc_cred = _encrypt_dict(cred)
+    old_cred = cache.get(ip)
+    if old_cred:
+        old_dec = _decrypt_dict(old_cred)
+        if old_dec == cred: return
+
+    cache[ip] = enc_cred
+    try:
+        with open("working_creds.json", "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception: pass
+
+def get_all_credentials(cfg, oob_ip=None):
     creds = []
+    working_cred = None
+    if oob_ip:
+        try:
+            if os.path.exists("working_creds.json"):
+                with open("working_creds.json", "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                    if oob_ip in cache:
+                        working_cred = _decrypt_dict(cache[oob_ip])
+        except Exception: pass
+    
+    if working_cred: creds.append(working_cred)
+
     if cfg.get("username") or cfg.get("password"):
-        creds.append({"username": cfg.get("username", ""), "password": cfg.get("password", ""), "enable_password": cfg.get("enable_password", "")})
+        default_cred = {"username": cfg.get("username", ""), "password": cfg.get("password", ""), "enable_password": cfg.get("enable_password", "")}
+        if default_cred not in creds: creds.append(default_cred)
+        
     for c in cfg.get("credentials", []):
         if c not in creds: creds.append(c)
+        
     if not creds: creds.append({"username": "", "password": "", "enable_password": ""})
     return creds
 
@@ -364,7 +443,7 @@ def settings_menu(cfg, config_path):
         elif choice == "t":
             test_ip = _con.input("  [cyan]Nhap IP OOB can thu ket noi[/]: ").strip()
             if test_ip:
-                creds = get_all_credentials(cfg)
+                creds = get_all_credentials(cfg, test_ip)
                 _con.print(f"  [cyan][*][/] Dang thu ket noi toi [bold]{test_ip}[/] ...")
                 last_exc = None
                 for idx, c in enumerate(creds):
@@ -372,6 +451,7 @@ def settings_menu(cfg, config_path):
                         session = connect_auto(test_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), c["username"], c["password"], c["enable_password"], timeout=8)
                         hn = fetch_hostname(session)
                         session.close()
+                        save_working_credential(test_ip, c)
                         _con.print(f"  [green](OK)[/] Ket noi thanh cong ({c['username']})! Hostname: [bold cyan]{hn or '?'}[/]")
                         break
                     except Exception as e: last_exc = e
@@ -516,7 +596,7 @@ CMD_SSH_RE    = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+ssh\s+(?:-l\s+
 
 def poll_host_multi(ip, cfg, timeout=10):
     menu_name_override = cfg.get("menu_name_override") or None
-    creds = get_all_credentials(cfg)
+    creds = get_all_credentials(cfg, ip)
     last_exc = None
     for c in creds:
         try:
@@ -524,6 +604,7 @@ def poll_host_multi(ip, cfg, timeout=10):
             try:
                 tn.write("\r\n")
                 initial_prompt = tn.read_until(["#", ">", "cli->"], timeout=5)
+                save_working_credential(ip, c)
 
                 if "cli->" in initial_prompt:
                     tn.write("cd access/")
@@ -668,13 +749,14 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
     _verify_deadline = time.time() + max_duration
     print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
 
-    creds = get_all_credentials(cfg)
+    creds = get_all_credentials(cfg, oob_ip)
     own_hostname, working_cred = None, creds[0]
     for c in creds:
         try:
             tn = connect_auto(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], timeout=6)
             tn.write("\r\n")
             prmpt = tn.read_until(["#", ">", "cli->"], timeout=3)
+            save_working_credential(oob_ip, c)
             if "cli->" in prmpt:
                 m_h = re.search(r'Welcome to [^<]+<([^>]+)>', prmpt)
                 own_hostname = m_h.group(1) if m_h else None
@@ -713,23 +795,24 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             cmd = f"connect {t_desc}"
             s.write(cmd)
             
-            # Buoc 1: Cho xem no hoi Pass khong
-            out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->"], timeout=5)
+            # Buoc 1: Cho xem thiet bi hoi Pass hay vao thang/xuat hien Prompt/Hot key
+            out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->", ">", "#"], timeout=5)
             out += out_tmp
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
                 s.write(v_pass)
-                # Buoc 2: BAT BUOC cho xac thuc xong, phai thay dong "Type the hot key"
-                out += s.read_until(["Type the hot key", "cli->"], timeout=12)
+                # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
+                out += s.read_until(["Type the hot key", "cli->", ">", "#"], timeout=12)
                 
-            # Buoc 3: session da mo -> Nghi 1s de on dinh, roi go 2 lan Enter
+            # Buoc 3: Session da mo -> Nghi 1s de on dinh, roi go Enter de trigger prompt neu vao thang
             time.sleep(1.0)
             s.write("") 
             time.sleep(0.5)
             s.write("") 
             
-            out += s.read_until(["login:", "Username:", "Password:", ">", "#"], timeout=6)
+            # Đã bổ sung đầy đủ các trường hợp Prompt >, # cho thiết bị vào thẳng root
+            out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->"], timeout=6)
             
         else: 
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
@@ -739,9 +822,10 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             s.write("") 
             out += s.read_until([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
         
+        # Buoc 4: Thoat phien ket noi ve lai Vertiv CLI
         try:
             if vendor == "vertiv":
-                s.write_raw(b"\x1a") # Gui Ctrl+Z thoat
+                s.write_raw(b"\x1a") # Gui Ctrl+Z de thoat phien console
                 time.sleep(0.5)
                 reset_session()
             else:
@@ -752,28 +836,30 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 else: reset_session()
         except Exception: reset_session()
         
-        # Buoc 4: Xoa sach "Bong ma Password" cua Vertiv de tranh Regex nhan nham
+        # Buoc 5: Xoa "Bong ma Password" va chuoi noi dung Vertiv thua truoc do
         if vendor == "vertiv":
             idx = out.rfind("Type the hot key")
             if idx != -1:
                 idx_nl = out.find("\n", idx)
-                if idx_nl != -1:
-                    out = out[idx_nl:]
-                else:
-                    out = out[idx:]
+                out = out[idx_nl:] if idx_nl != -1 else out[idx:]
                     
         return out
 
-    def clear_line_via_oob(t_port, vendor):
-        if vendor == "vertiv": return False
-        line_num = t_port - 2000
-        if line_num <= 0: return False
+    def clear_line_via_oob(t_port, v_vendor):
+        if v_vendor == "vertiv": return False
         try:
-            s = get_session(vendor)
+            s = get_session(v_vendor)
+            line_num = t_port - 2000
+            if line_num <= 0: return False
             s.write(f"clear line {line_num}")
-            if "[confirm]" in s.read_until(["[confirm]", "#"], timeout=3): s.write(""); s.read_until("#", timeout=3)
+            out = s.read_until(["[confirm]", "#"], timeout=3)
+            if "[confirm]" in out:
+                s.write("")
+                s.read_until("#", timeout=2)
             return True
-        except Exception: reset_session(); return False
+        except Exception:
+            reset_session()
+            return False
 
     def extract_hostname(output: str) -> str:
         output_clean = _ANSI_STRIP_RE.sub('', output)
@@ -783,23 +869,28 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         lines = [l.strip() for l in output_clean.splitlines() if l.strip()]
         
         for line in reversed(lines):
+            # Bo qua cac dong lenh hoac thong bao ket noi cua Vertiv/Network
             if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->"]) or _CONN_ERR_RE.search(line): 
                 continue
             
+            # 1. Kiem tra Prompt truc tiep (VD: HCM-ROUTER-01> hoac HCM-ROUTER-01#)
+            m_prompt = _HOSTNAME_PROMPT_RE.search(line)
+            if m_prompt: 
+                h = m_prompt.group(1)
+                # Loai tru prompt noi bo cua Vertiv
+                if h.lower() not in ["cli", "cli-", "access", "admin", "root"]: 
+                    return h
+
+            # 2. Kiem tra dang nhap kieu Unix/Linux (hostname login:)
             m_login = _HOSTNAME_LOGIN_RE.search(line)
             if m_login: return m_login.group(1)
             
+            # 3. Kiem tra đi kèm he dieu hanh FreeBSD / Linux
             m_bsd = _HOSTNAME_BSD_RE.search(line)
             if m_bsd: return m_bsd.group(1)
                 
             m_bsd_new = re.search(r'(?:FreeBSD|Linux|NetBSD|OpenBSD).*?\(([A-Za-z0-9_\-\.]+)\)', line, re.IGNORECASE)
             if m_bsd_new: return m_bsd_new.group(1)
-            
-            m_prompt = _HOSTNAME_PROMPT_RE.search(line)
-            if m_prompt: 
-                h = m_prompt.group(1)
-                if h.lower() not in ["cli", "cli-", "access"]: 
-                    return h
                     
             if re.search(r'Username:|Password:|login:', line, re.IGNORECASE): 
                 auth_seen = True
@@ -807,7 +898,6 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         return "AUTH_REQUIRED" if auth_seen else None
 
     for key, opt in options.items():
-        if time.time() > _verify_deadline: print_fn(f"[yellow][!][/] {alias}: Vuot timeout. Bo qua phan con lai."); break
         desc = opt.get("description", "")
         if not desc: continue
         target_ip, port, proto, vendor = opt.get("ip"), opt.get("port", 23), opt.get("protocol", "telnet"), opt.get("vendor", "cisco")
@@ -910,9 +1000,11 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
     print_fn(f"[*] Dang PUSH thuc thi sua loi {len(updates_list)} option cho {alias}...")
     
     success = False
-    for c in get_all_credentials(cfg):
+    for c in get_all_credentials(cfg, oob_ip):
         success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], updates_list, timeout=10)
-        if success: break
+        if success:
+            save_working_credential(oob_ip, c)
+            break
 
     if not success:
         print_fn(f"[red][LOI][/] {alias}: Push cau hinh that bai (Cisco tu choi hoac sai authen).")
@@ -975,7 +1067,8 @@ def manual_push_devices(cfg):
 # ---------------------------------------------------------------------------
 # Daemon Thread
 # ---------------------------------------------------------------------------
-def run_verify_daemon(cfg):
+def run_verify_daemon(config_path):
+    cfg = load_config(config_path)
     log_verify(f"[green][START][/] Khoi dong Verify vat ly - lich: {_describe_verify_schedule(cfg)}.")
     time.sleep(15)
     while True:

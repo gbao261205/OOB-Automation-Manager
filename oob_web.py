@@ -495,6 +495,8 @@ def api_export_excel():
         if not bl:
             for ci,v in enumerate([ip,alias,"","",pg,st.get("menu_state","-"),"(chua co baseline)","","","","","",""],1): ws.cell(ri,ci,v).border=mk_bdr()
             ri+=1; continue
+        
+        start_row = ri
         for ok_key in sorted(bl):
           o = bl[ok_key]; vr = vst.get((alias,ok_key))
           if vr:
@@ -504,10 +506,12 @@ def api_export_excel():
           
           # THÊM o.get("vendor","cisco") vào mảng dữ liệu
           for ci,v in enumerate([ip,alias,dn or "",mn or "",pg,st.get("menu_state","-"),ok_key,o.get("description",""),o.get("ip",""),o.get("port",""),o.get("protocol",""),o.get("vendor","cisco").upper(),vs,ah],1):
-              c = ws.cell(ri,ci,v); c.border=mk_bdr()
-              # Đổi ci==12 thành ci==13 vì "Verify" đã bị đẩy sang cột 13
+              c = ws.cell(ri,ci,v); c.border=mk_bdr(); c.alignment=Alignment(vertical="center")
               if ci==13: c.fill=mk_fill(sc); c.font=Font(bold=True)
           ri+=1
+        
+        if ri > start_row + 1:
+            for ci in range(1, 7): ws.merge_cells(start_row=start_row, start_column=ci, end_row=ri-1, end_column=ci)
     for i,w in enumerate([16,16,18,18,10,14,12,36,16,8,10,12,14,18],1): ws.column_dimensions[get_column_letter(i)].width=w
     os.makedirs("reports",exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
