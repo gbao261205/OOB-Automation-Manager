@@ -958,11 +958,29 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         except Exception: pass
     return results
 
-def _thread_verify_only(cfg, alias, ip, snapshot, pfx=""):
+def _thread_verify_only(cfg, alias, ip, snapshot, pfx="", prog_state=None):
+    if prog_state:
+        with prog_state["lock"]:
+            prog_state["started"] += 1
+            idx = prog_state["started"]
+            tot = prog_state["total"]
+            pct = (idx / tot) * 100 if tot else 0
+            pfx = f"[{idx}/{tot} {pct:.0f}%]"
+            
     log_verify(f"{pfx} [*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
     def _print_fn(msg): log_verify(f"{pfx} {msg}")
     run_deep_verify(cfg, alias, ip, snapshot, print_fn=_print_fn)
-    log_verify(f"{pfx} [green](OK)[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
+    
+    if prog_state:
+        with prog_state["lock"]:
+            prog_state["completed"] += 1
+            c_idx = prog_state["completed"]
+            tot = prog_state["total"]
+            c_pct = (c_idx / tot) * 100 if tot else 0
+            pfx_done = f"[{c_idx}/{tot} {c_pct:.0f}%]"
+    else:
+        pfx_done = pfx
+    log_verify(f"{pfx_done} [green](OK)[/] Hoan thanh Verify cho OOB: [bold]{alias}[/]\n")
 
 # ---------------------------------------------------------------------------
 # Manual Push
@@ -1077,21 +1095,17 @@ def run_verify_daemon(config_path):
         if cfg.get("auto_verify", True):
             hosts = load_ip_list(cfg["ip_list"])
             if hosts:
-                total_hosts = len(hosts)
-                started_hosts = 0
-                prog_lock = threading.Lock()
-
-                with action_lock: 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        for ip, alias in hosts:
-                            _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-                            if baseline:
-                                with prog_lock:
-                                    started_hosts += 1
-                                    idx = started_hosts
-                                    pct = (idx / total_hosts) * 100
-                                pfx = f"[{idx}/{total_hosts} {pct:.0f}%]"
-                                executor.submit(_thread_verify_only, cfg, alias, ip, baseline, pfx)
+                valid_hosts = []
+                for ip, alias in hosts:
+                    _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+                    if baseline: valid_hosts.append((ip, alias, baseline))
+                    
+                if valid_hosts:
+                    prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(valid_hosts)}
+                    with action_lock: 
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                            for ip, alias, baseline in valid_hosts:
+                                executor.submit(_thread_verify_only, cfg, alias, ip, baseline, "", prog_state)
         else:
             log_verify("[dim][zzz] Tinh nang Verify ngam dang bi TAT trong cau hinh. Dang cho...[/]")
 
@@ -1211,9 +1225,10 @@ def run_daemon(cfg, config_path=None):
                         concurrent.futures.wait(futures)
 
                     if cfg.get("auto_verify", True) and pending_verifies:
+                        prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(pending_verifies)}
                         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                            for alias, ip, snap, pfx in pending_verifies:
-                                executor.submit(_thread_verify_only, cfg, alias, ip, snap, pfx)
+                            for alias, ip, snap, _ in pending_verifies:
+                                executor.submit(_thread_verify_only, cfg, alias, ip, snap, "", prog_state)
 
                 _scan_wait(cfg)
         except KeyboardInterrupt: pass
@@ -1298,9 +1313,10 @@ def scan_specific_devices(cfg):
         concurrent.futures.wait(futures)
 
     if cfg.get("auto_verify", True) and pending_verifies:
+        prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(pending_verifies)}
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            for alias, ip, snap, pfx in pending_verifies:
-                executor.submit(_thread_verify_only, cfg, alias, ip, snap, pfx)
+            for alias, ip, snap, _ in pending_verifies:
+                executor.submit(_thread_verify_only, cfg, alias, ip, snap, "", prog_state)
 
 def verify_specific_devices(cfg):
     targets_input = _con.input("  [cyan]Nhap IP/Alias can Verify (cach nhau dau phay, de trong quet TAT CA)[/]: ").strip()
@@ -1317,27 +1333,46 @@ def verify_specific_devices(cfg):
     if not hosts_to_scan: return
     _con.print(f"\n  [green][*] Bat dau Verify vat ly tuc thi {len(hosts_to_scan)} thiet bi...[/]")
     
-    total_hosts = len(hosts_to_scan)
-    started_hosts = 0
-    prog_lock = threading.Lock()
-
-    def cli_print(msg):
-        with ui_print_lock: _con.print(f"    {msg}")
+    valid_hosts = []
+    for ip, alias in hosts_to_scan:
+        _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        if not baseline:
+            _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh truoc (Option 7)!")
+        else:
+            valid_hosts.append((ip, alias, baseline))
+            
+    if not valid_hosts: return
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        for ip, alias in hosts_to_scan:
-            with prog_lock:
-                started_hosts += 1
-                idx = started_hosts
-                pct = (idx / total_hosts) * 100
-            pfx = f"[{idx}/{total_hosts} {pct:.0f}%]"
+    prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(valid_hosts)}
 
-            _con.print(f"\n  [cyan]{pfx} [VERIFY][/] [bold]{alias}[/] ({ip}) ...")
-            _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-            if not baseline:
-                _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh truoc (Option 7)!")
-                continue
-            executor.submit(run_deep_verify, cfg, alias, ip, baseline, cli_print)
+    def _worker(alias, ip, baseline):
+        with prog_state["lock"]:
+            prog_state["started"] += 1
+            idx = prog_state["started"]
+            tot = prog_state["total"]
+            pct = (idx / tot) * 100 if tot else 0
+            pfx = f"[{idx}/{tot} {pct:.0f}%]"
+            
+        with ui_print_lock:
+            _con.print(f"\n  [cyan]{pfx} [VERIFY][/] Dang Verify: [bold]{alias}[/] ({ip}) ...")
+            
+        def cli_print(msg):
+            with ui_print_lock: _con.print(f"    {pfx} {msg}")
+            
+        run_deep_verify(cfg, alias, ip, baseline, cli_print)
+        
+        with prog_state["lock"]:
+            prog_state["completed"] += 1
+            c_idx = prog_state["completed"]
+            tot = prog_state["total"]
+            c_pct = (c_idx / tot) * 100 if tot else 0
+            pfx_done = f"[{c_idx}/{tot} {c_pct:.0f}%]"
+        with ui_print_lock:
+            _con.print(f"  [green]{pfx_done} [OK][/] Da hoan thanh Verify: [bold]{alias}[/]")
+            
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for ip, alias, baseline in valid_hosts:
+            executor.submit(_worker, alias, ip, baseline)
 
 # ---------------------------------------------------------------------------
 # Import / Export / TIM KIEM
