@@ -826,6 +826,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         except Exception: raise RuntimeError("Khong the ket noi toi OOB")
         
         out = ""
+        password_rejected = False
         if vendor == "vertiv": 
             cmd = f"connect {t_desc}"
             s.write(cmd)
@@ -843,6 +844,28 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 chunk = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=12)
                 out += chunk
                 debug_dump(cfg, alias, key, "B2-after-vpass", chunk, extra=f"(v_pass_set={'yes' if v_pass else 'EMPTY!'})")
+
+                # Neu thiet bi HOI LAI "Password:" (khong tien den Hot key/login/cli->)
+                # nghia la mat khau "Vertiv Connect Pass" da gui bi TU CHOI. Thu gui
+                # lai DUNG 1 LAN NUA (mot so ACS hoi Password 2 lan lien tiep ngay ca
+                # khi dung), sau do neu van bi hoi lai thi bao CANH BAO ro rang ngay,
+                # thay vi de code roi vao AUTH_REQUIRED mo ho sau khi cho het timeout.
+                if ("assword:" in chunk or "Password:" in chunk) and not any(
+                    x in chunk for x in ("Type the hot key", "cli->", "login:", "Username:")
+                ):
+                    log_verify(f"[yellow][!][/] {alias} (Opt {key}): OOB Vertiv hoi lai Password: sau lan 1 - thu lai 1 lan nua...")
+                    s.write(v_pass)
+                    chunk2 = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
+                    out += chunk2
+                    debug_dump(cfg, alias, key, "B2b-retry-vpass", chunk2)
+                    if ("assword:" in chunk2 or "Password:" in chunk2) and not any(
+                        x in chunk2 for x in ("Type the hot key", "cli->", "login:", "Username:")
+                    ):
+                        msg = (f"[bold red][!!!][/] {alias} (Opt {key}): 'Vertiv Connect Pass' bi TU CHOI 2 lan lien tiep "
+                               f"khi connect toi '{t_desc}' - kiem tra lai muc [y] trong Cai dat!")
+                        log_verify(msg)
+                        debug_dump(cfg, alias, key, "B2c-PASSWORD-REJECTED", out, extra="(v_pass sai hoac thiet bi tu choi)")
+                        password_rejected = True
                 
             # Đọc nốt dòng chứa Hot key để bỏ qua ký tự '>' trong <CTRL>Z
             if "Type the hot key" in out:
@@ -850,45 +873,49 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 out += chunk
                 debug_dump(cfg, alias, key, "B2b-hotkey-tail", chunk)
 
-            # Buoc 3: DOC NGAY truoc, KHONG go Enter voi. Ngay sau dong "Type
-            # the hot key...", thiet bi dich thuong da gui san banner dang
-            # nhap that su (vd "FreeBSD/amd64 (HOSTNAME) (ttyu0)\r\nlogin:")
-            # - du lieu nay co the da nam san trong buffer/socket, chi la
-            # chua doc toi. extract_hostname() co the lay hostname NGAY TU
-            # dong banner nay ma KHONG can dang nhap that su vao may dich.
-            #
-            # Truoc day code go Enter rong ("") ngay tai day truoc khi doc:
-            #   - Tren duong SSH, write() se drain (xoa sach) buffer dang
-            #     cho truoc khi gui -> XOA MAT dong banner/hostname chua doc.
-            #   - Enter rong tai prompt "login:" == gui username rong, khien
-            #     FreeBSD in LAI banner + "login:" lan nua (chinh la hien
-            #     tuong "login:" bi lap 2 lan ban thay), ma khong dang nhap
-            #     duoc gi them.
-            chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
-            out += chunk
-            debug_dump(cfg, alias, key, "B3-banner-read", chunk)
-
-            # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm
-            out_tmp_buf = s.read_until(["Data Buffering Suspended"], timeout=1.0)
-            out += out_tmp_buf
-            debug_dump(cfg, alias, key, "B3b-buffering-check", out_tmp_buf)
-            if "Data Buffering Suspended" in out_tmp_buf:
-                time.sleep(0.5)
-                s.write_no_drain("")
+            # Neu da xac nhan mat khau bi tu choi 2 lan o tren, bo qua toan bo
+            # cac buoc cho/doc them ben duoi (khong con gi de doc nua, chi ton
+            # thoi gian timeout) - nhay thang xuong buoc thoat phien.
+            if not password_rejected:
+                # Buoc 3: DOC NGAY truoc, KHONG go Enter voi. Ngay sau dong "Type
+                # the hot key...", thiet bi dich thuong da gui san banner dang
+                # nhap that su (vd "FreeBSD/amd64 (HOSTNAME) (ttyu0)\r\nlogin:")
+                # - du lieu nay co the da nam san trong buffer/socket, chi la
+                # chua doc toi. extract_hostname() co the lay hostname NGAY TU
+                # dong banner nay ma KHONG can dang nhap that su vao may dich.
+                #
+                # Truoc day code go Enter rong ("") ngay tai day truoc khi doc:
+                #   - Tren duong SSH, write() se drain (xoa sach) buffer dang
+                #     cho truoc khi gui -> XOA MAT dong banner/hostname chua doc.
+                #   - Enter rong tai prompt "login:" == gui username rong, khien
+                #     FreeBSD in LAI banner + "login:" lan nua (chinh la hien
+                #     tuong "login:" bi lap 2 lan ban thay), ma khong dang nhap
+                #     duoc gi them.
                 chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
                 out += chunk
-                debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
+                debug_dump(cfg, alias, key, "B3-banner-read", chunk)
 
-            # Buoc 4: CHI go Enter "danh thuc" (va CHI 1 LAN) neu sau Buoc 3
-            # van CHUA thay bat ky dau hieu prompt/dang nhap nao - tuc la
-            # truong hop thiet bi vao thang shell nhung chua tu in prompt.
-            # Dung write_no_drain() de KHONG xoa mat du lieu da nhan nhung
-            # chua kip doc.
-            if not re.search(r'login:|Username:|Password:|[>#]\s*$|cli->|%', out, re.IGNORECASE):
-                time.sleep(0.8)
-                s.write_no_drain("")
-                chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
-                out += chunk
+                # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm
+                out_tmp_buf = s.read_until(["Data Buffering Suspended"], timeout=1.0)
+                out += out_tmp_buf
+                debug_dump(cfg, alias, key, "B3b-buffering-check", out_tmp_buf)
+                if "Data Buffering Suspended" in out_tmp_buf:
+                    time.sleep(0.5)
+                    s.write_no_drain("")
+                    chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                    out += chunk
+                    debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
+
+                # Buoc 4: CHI go Enter "danh thuc" (va CHI 1 LAN) neu sau Buoc 3
+                # van CHUA thay bat ky dau hieu prompt/dang nhap nao - tuc la
+                # truong hop thiet bi vao thang shell nhung chua tu in prompt.
+                # Dung write_no_drain() de KHONG xoa mat du lieu da nhan nhung
+                # chua kip doc.
+                if not re.search(r'login:|Username:|Password:|[>#]\s*$|cli->|%', out, re.IGNORECASE):
+                    time.sleep(0.8)
+                    s.write_no_drain("")
+                    chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                    out += chunk
                 debug_dump(cfg, alias, key, "B4-wake-enter", chunk)
             else:
                 debug_dump(cfg, alias, key, "B4-SKIPPED", "(da thay prompt/login o Buoc 3, khong go Enter)")
