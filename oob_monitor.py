@@ -808,23 +808,40 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             # Đọc nốt dòng chứa Hot key để bỏ qua ký tự '>' trong <CTRL>Z
             if "Type the hot key" in out:
                 out += s.read_until(["\n"], timeout=2)
-                
-            # Buoc 3: Session da mo -> Nghi 1s de on dinh, roi go Enter de trigger prompt neu vao thang
-            time.sleep(1.0)
-            s.write("") 
-            
+
+            # Buoc 3: DOC NGAY truoc, KHONG go Enter voi. Ngay sau dong "Type
+            # the hot key...", thiet bi dich thuong da gui san banner dang
+            # nhap that su (vd "FreeBSD/amd64 (HOSTNAME) (ttyu0)\r\nlogin:")
+            # - du lieu nay co the da nam san trong buffer/socket, chi la
+            # chua doc toi. extract_hostname() co the lay hostname NGAY TU
+            # dong banner nay ma KHONG can dang nhap that su vao may dich.
+            #
+            # Truoc day code go Enter rong ("") ngay tai day truoc khi doc:
+            #   - Tren duong SSH, write() se drain (xoa sach) buffer dang
+            #     cho truoc khi gui -> XOA MAT dong banner/hostname chua doc.
+            #   - Enter rong tai prompt "login:" == gui username rong, khien
+            #     FreeBSD in LAI banner + "login:" lan nua (chinh la hien
+            #     tuong "login:" bi lap 2 lan ban thay), ma khong dang nhap
+            #     duoc gi them.
+            out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+
             # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm
-            out_tmp_buf = s.read_until(["Data Buffering Suspended"], timeout=1.5)
+            out_tmp_buf = s.read_until(["Data Buffering Suspended"], timeout=1.0)
             out += out_tmp_buf
             if "Data Buffering Suspended" in out_tmp_buf:
                 time.sleep(0.5)
-                s.write("")
-                
-            time.sleep(0.5)
-            s.write("") 
-            
-            # Đã bổ sung đầy đủ các trường hợp Prompt >, # cho thiết bị vào thẳng root
-            out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=6)
+                s.write_no_drain("")
+                out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+
+            # Buoc 4: CHI go Enter "danh thuc" (va CHI 1 LAN) neu sau Buoc 3
+            # van CHUA thay bat ky dau hieu prompt/dang nhap nao - tuc la
+            # truong hop thiet bi vao thang shell nhung chua tu in prompt.
+            # Dung write_no_drain() de KHONG xoa mat du lieu da nhan nhung
+            # chua kip doc.
+            if not re.search(r'login:|Username:|Password:|[>#]\s*$|cli->|%', out, re.IGNORECASE):
+                time.sleep(0.8)
+                s.write_no_drain("")
+                out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
             
         else: 
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"

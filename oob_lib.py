@@ -170,6 +170,14 @@ class MiniTelnet:
     def write(self, text: str):
         self.sock.sendall((text + "\r\n").encode())
 
+    def write_no_drain(self, text: str):
+        """Giong write(), nhung ten ham nay khang dinh RO RANG la KHONG duoc
+        xoa buffer dang cho truoc khi gui (xem MiniSSH.write_no_drain() de biet
+        ly do). Voi MiniTelnet thi write() von da khong drain nen day chi la alias,
+        nhung dung ham nay o noi can "go phim danh thuc ma khong mat du lieu cu"
+        de code chay dung ca tren duong SSH lan Telnet."""
+        self.write(text)
+
     def write_raw(self, data: bytes):
         self.sock.sendall(data)
 
@@ -298,6 +306,19 @@ class MiniSSH:
     def write(self, text: str):
         # Drain buffer truoc khi gui lenh moi — tranh stale data lam hong read_until ke tiep
         self._drain_pending()
+        self._shell.send((text + "\r\n").encode())
+
+    def write_no_drain(self, text: str):
+        """Giong write() nhung KHONG goi _drain_pending() truoc khi gui.
+
+        Dung khi go mot phim "danh thuc" (vd Enter rong) ma TRUOC DO thiet bi
+        co the da gui san du lieu quan trong nhung minh chua kip doc het (vd
+        banner "FreeBSD/amd64 (HOSTNAME) (ttyu0)\\nlogin:" cua thiet bi pivot
+        qua Vertiv). write() thuong se drain (xoa sach buffer + rut can du
+        lieu dang cho tren socket trong 0.15s) truoc khi gui — dieu nay AN
+        TOAN cho luong lenh binh thuong (prompt cu da doc xong), nhung se LAM
+        MAT du lieu neu con noi dung chua doc dang cho trong buffer/socket.
+        """
         self._shell.send((text + "\r\n").encode())
 
     def write_raw(self, data: bytes):
