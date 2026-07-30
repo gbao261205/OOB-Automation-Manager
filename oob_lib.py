@@ -317,7 +317,7 @@ class MiniSSH:
     def write(self, text: str):
         # Drain buffer truoc khi gui lenh moi — tranh stale data lam hong read_until ke tiep
         self._drain_pending()
-        self._shell.send((text + "\r\n").encode())
+        self._shell.send((text + "\n").encode())
 
     def write_cr(self, text: str):
         """Giong write() nhung CHI gui '\\n' (khong co '\\r'). Xem giai thich
@@ -337,7 +337,7 @@ class MiniSSH:
         TOAN cho luong lenh binh thuong (prompt cu da doc xong), nhung se LAM
         MAT du lieu neu con noi dung chua doc dang cho trong buffer/socket.
         """
-        self._shell.send((text + "\r\n").encode())
+        self._shell.send((text + "\n").encode())
 
     def write_raw(self, data: bytes):
         self._drain_pending()

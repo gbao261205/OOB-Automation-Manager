@@ -838,12 +838,24 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             debug_dump(cfg, alias, key, "B1-after-connect", out_tmp)
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
-                v_pass = cfg.get("vertiv_connect_password", "")
-                s.write(v_pass)
+                v_pass = cfg.get("vertiv_connect_password", "").strip()
+                time.sleep(0.3)
+                s.write_cr(v_pass)
                 # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
-                chunk = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=12)
+                chunk = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:", "Enter your option:"], timeout=12)
                 out += chunk
                 debug_dump(cfg, alias, key, "B2-after-vpass", chunk, extra=f"(v_pass_set={'yes' if v_pass else 'EMPTY!'})")
+
+                # Xu ly dac biet neu Vertiv ra Multi Session Menu (khi co nhieu session)
+                if "Enter your option:" in chunk:
+                    log_verify(f"[cyan][i][/] {alias} (Opt {key}): Vertiv hien Multi Session Menu, tu dong chon '1'...")
+                    time.sleep(0.3)
+                    s.write_cr("1")
+                    chunk_menu = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
+                    out += chunk_menu
+                    debug_dump(cfg, alias, key, "B2m-after-menu", chunk_menu)
+                    chunk = chunk_menu  # Ghi de chunk de xu ly logic ben duoi y nhu binh thuong
+
 
                 # Neu thiet bi HOI LAI "Password:" (khong tien den Hot key/login/cli->)
                 # nghia la mat khau "Vertiv Connect Pass" da gui bi TU CHOI. Thu gui
@@ -854,7 +866,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                     x in chunk for x in ("Type the hot key", "cli->", "login:", "Username:")
                 ):
                     log_verify(f"[yellow][!][/] {alias} (Opt {key}): OOB Vertiv hoi lai Password: sau lan 1 - thu lai 1 lan nua...")
-                    s.write(v_pass)
+                    time.sleep(0.3)
+                    s.write_cr(v_pass)
                     chunk2 = s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
                     out += chunk2
                     debug_dump(cfg, alias, key, "B2b-retry-vpass", chunk2)
