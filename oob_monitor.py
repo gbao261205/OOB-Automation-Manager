@@ -80,7 +80,7 @@ _DESC_PREFIX_RE    = re.compile(r'^[-=>\s]+')
 _HOSTNAME_PROMPT_RE = re.compile(r'([A-Za-z0-9_\-\.]+)(?:[~:\s]*)[>#]')
 _HOSTNAME_LOGIN_RE  = re.compile(r'([A-Za-z0-9_\-\.]+)\s+login:', re.IGNORECASE)
 _HOSTNAME_BSD_RE    = re.compile(r'(?:\()?([A-Za-z0-9_\-\.]+)(?:\))?\s*\(tty', re.IGNORECASE)
-_ANSI_STRIP_RE      = re.compile(r'\x1b\[.*?m')
+_ANSI_STRIP_RE      = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 _CONN_ERR_RE        = re.compile(r'refused|time(d)?[\s-]?out|unreachable|no route to host|unknown host|% ', re.IGNORECASE)
 _IP_RE              = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 
@@ -852,8 +852,12 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
         if vendor == "vertiv":
             idx = out.rfind("Type the hot key")
             if idx != -1:
-                idx_nl = out.find("\n", idx)
-                out = out[idx_nl:] if idx_nl != -1 else out[idx:]
+                idx_z = out.find("<CTRL>Z", idx)
+                if idx_z != -1:
+                    out = out[idx_z + 7:]
+                else:
+                    idx_nl = out.find("\n", idx)
+                    out = out[idx_nl:] if idx_nl != -1 else out[idx:]
                     
         return out
 
@@ -1364,7 +1368,7 @@ def verify_specific_devices(cfg):
 
     if not hosts_to_scan: return
     
-    filter_input = _con.input("  [cyan]Chi Verify cac Option co trang thai cu (vd: TIMEOUT, YEU CAU DANG NHAP). De trong = TAT CA[/]: ").strip().upper()
+    filter_input = _con.input("  [cyan]Chi Verify cac Option co trang thai cu (vd: TIMEOUT, YEU CAU DANG NHAP, CHUA VERIFY). De trong = TAT CA[/]: ").strip().upper()
     filter_list = [f.strip() for f in filter_input.split(",") if f.strip()]
     
     _con.print(f"\n  [green][*] Bat dau Verify vat ly tuc thi {len(hosts_to_scan)} thiet bi...[/]")
@@ -1380,7 +1384,8 @@ def verify_specific_devices(cfg):
             filtered_baseline = {}
             for k, v in baseline.items():
                 if filter_list:
-                    prev_status = verify_st.get((alias, k), {}).get("status", "")
+                    vr = verify_st.get((alias, k))
+                    prev_status = vr.get("status", "").upper() if vr else "CHUA VERIFY"
                     if not any(f in prev_status for f in filter_list):
                         continue
                 filtered_baseline[k] = v
