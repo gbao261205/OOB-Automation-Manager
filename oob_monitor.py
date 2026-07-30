@@ -796,14 +796,18 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             s.write(cmd)
             
             # Buoc 1: Cho xem thiet bi hoi Pass hay vao thang/xuat hien Prompt/Hot key
-            out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->", ">", "#"], timeout=5)
+            out_tmp = s.read_until(["assword:", "Password:", "Type the hot key", "cli->"], timeout=5)
             out += out_tmp
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
                 s.write(v_pass)
                 # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
-                out += s.read_until(["Type the hot key", "cli->", ">", "#"], timeout=12)
+                out += s.read_until(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=12)
+                
+            # Đọc nốt dòng chứa Hot key để bỏ qua ký tự '>' trong <CTRL>Z
+            if "Type the hot key" in out:
+                out += s.read_until(["\n"], timeout=2)
                 
             # Buoc 3: Session da mo -> Nghi 1s de on dinh, roi go Enter de trigger prompt neu vao thang
             time.sleep(1.0)
@@ -812,7 +816,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
             s.write("") 
             
             # Đã bổ sung đầy đủ các trường hợp Prompt >, # cho thiết bị vào thẳng root
-            out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->"], timeout=6)
+            out += s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=6)
             
         else: 
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
@@ -1592,6 +1596,7 @@ def export_menu_report(cfg):
 
         hn = device_name or ""
         cnt = dict(match=0, wrong=0, unverif=0, no_conn=0, no_desc=0)
+        start_ri = ri
         for opt_key in sorted(baseline):
             opt = baseline[opt_key]
             desc, t_ip, t_port, proto = opt.get("description", ""), opt.get("ip", ""), opt.get("port", ""), opt.get("protocol", "telnet")
@@ -1621,6 +1626,11 @@ def export_menu_report(cfg):
                 c = ws1.cell(ri, ci, val); c.border = mk_bdr(); c.alignment = Alignment(vertical="center")
                 if ci == 13: c.fill = mk_fill(scolor); c.font = Font(bold=True) 
             ri += 1
+            
+        if ri > start_ri + 1:
+            for ci in range(1, 7):
+                ws1.merge_cells(start_row=start_ri, start_column=ci, end_row=ri-1, end_column=ci)
+                
         summary.append({"alias": alias, "ip": ip, "ping": ping_lbl, "menu_state": menu_state_lbl, "hn": hn, "mn": mn or "", "total": len(baseline), **cnt})
     for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 16, 12, 10, 12, 22, 44], 1): ws1.column_dimensions[get_column_letter(i)].width = w
 
