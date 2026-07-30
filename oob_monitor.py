@@ -960,6 +960,26 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
 
     if session: session.close()
     
+    # Ke thua cac ket qua verify cu cho cac option bi bo qua (do dung filter hoac push)
+    try:
+        log_dir = "verify-logs"
+        if os.path.exists(log_dir):
+            latest_file = None
+            latest_time = 0
+            for fname in os.listdir(log_dir):
+                if fname.startswith(f"Verify_{alias}_") and fname.endswith(".json"):
+                    fpath = os.path.join(log_dir, fname)
+                    mtime = os.path.getmtime(fpath)
+                    if mtime > latest_time:
+                        latest_time, latest_file = mtime, fpath
+            if latest_file:
+                with open(latest_file, "r", encoding="utf-8") as f: prev_results = json.load(f)
+                current_keys = {r.get("key") for r in results if "key" in r}
+                for pr in prev_results:
+                    if pr.get("key") and pr["key"] not in current_keys:
+                        results.append(pr)
+    except Exception: pass
+    
     os.makedirs("verify-logs", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
