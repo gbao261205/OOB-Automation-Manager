@@ -1343,15 +1343,32 @@ def verify_specific_devices(cfg):
             if ip.lower() in target_list or alias.lower() in target_list: hosts_to_scan.append((ip, alias))
 
     if not hosts_to_scan: return
+    
+    filter_input = _con.input("  [cyan]Chi Verify cac Option co trang thai cu (vd: TIMEOUT, YEU CAU DANG NHAP). De trong = TAT CA[/]: ").strip().upper()
+    filter_list = [f.strip() for f in filter_input.split(",") if f.strip()]
+    
     _con.print(f"\n  [green][*] Bat dau Verify vat ly tuc thi {len(hosts_to_scan)} thiet bi...[/]")
+    
+    verify_st = _parse_verify_logs_for_status(max_age_hours=24.0 * 30) if filter_list else {}
     
     valid_hosts = []
     for ip, alias in hosts_to_scan:
         _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if not baseline:
-            _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh truoc (Option 7)!")
+            _con.print(f"  [yellow][!][/] OOB {alias} chua co Baseline. Vui long quet cau hinh truoc (Option 7)!")
         else:
-            valid_hosts.append((ip, alias, baseline))
+            filtered_baseline = {}
+            for k, v in baseline.items():
+                if filter_list:
+                    prev_status = verify_st.get((alias, k), {}).get("status", "")
+                    if not any(f in prev_status for f in filter_list):
+                        continue
+                filtered_baseline[k] = v
+                
+            if filtered_baseline:
+                valid_hosts.append((ip, alias, filtered_baseline))
+            else:
+                _con.print(f"  [dim]OOB {alias} khong co option nao khop bo loc ({filter_input}).[/]")
             
     if not valid_hosts: return
     
