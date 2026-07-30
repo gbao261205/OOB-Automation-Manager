@@ -913,8 +913,11 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 out += out_tmp_buf
                 debug_dump(cfg, alias, key, "B3b-buffering-check", out_tmp_buf)
                 if "Data Buffering Suspended" in out_tmp_buf:
+                    log_verify(f"[yellow][!][/] {alias} (Opt {key}): Vertiv OOB chua hien prompt thiet bi, thu gui 2 phim Enter de danh thuc...")
                     time.sleep(0.5)
-                    s.write_no_drain("")
+                    s.write_no_drain("") # Gui phím Enter thứ nhất
+                    time.sleep(0.3)
+                    s.write_no_drain("") # Gui phím Enter thứ hai
                     chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
                     out += chunk
                     debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
@@ -926,6 +929,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None):
                 # chua kip doc.
                 if not re.search(r'login:|Username:|Password:|[>#]\s*$|cli->|%', out, re.IGNORECASE):
                     time.sleep(0.8)
+                    s.write_no_drain("")
+                    time.sleep(0.3)
                     s.write_no_drain("")
                     chunk = s.read_until(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
                     out += chunk
