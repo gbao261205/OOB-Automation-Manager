@@ -77,7 +77,7 @@ ui_print_lock = threading.Lock()
 # Regex
 # ---------------------------------------------------------------------------
 _DESC_PREFIX_RE    = re.compile(r'^[-=>\s]+')
-_HOSTNAME_PROMPT_RE = re.compile(r'([A-Za-z0-9_\-\.]+)[>#]')
+_HOSTNAME_PROMPT_RE = re.compile(r'([A-Za-z0-9_\-\.]+)(?:[~:\s]*)[>#]')
 _HOSTNAME_LOGIN_RE  = re.compile(r'([A-Za-z0-9_\-\.]+)\s+login:', re.IGNORECASE)
 _HOSTNAME_BSD_RE    = re.compile(r'(?:\()?([A-Za-z0-9_\-\.]+)(?:\))?\s*\(tty', re.IGNORECASE)
 _ANSI_STRIP_RE      = re.compile(r'\x1b\[.*?m')
