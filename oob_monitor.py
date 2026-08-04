@@ -400,6 +400,8 @@ def settings_menu(cfg, config_path):
         g.add_row("[2]",  f"Password (chinh)      : {mask(cfg['password'])}")
         g.add_row("[3]",  f"Enable pass (chinh)   : {mask(cfg['enable_password'])}")
         g.add_row("\\[y]", f"Vertiv Connect Pass   : {mask(cfg.get('vertiv_connect_password', ''))}")
+        g.add_row("\\[va]", f"Vertiv Admin Username : {cfg.get('vertiv_admin_username', '') or '[dim](chua cau hinh)[/]'}")
+        g.add_row("\\[vp]", f"Vertiv Admin Password : {mask(cfg.get('vertiv_admin_password', ''))}")
         g.add_row("\\[k]", f"Tai khoan phu (multi) : [bold]{len(cfg.get('credentials', []))} tai khoan[/]")
         g.add_row("[5]",  f"SSH port (uu tien)    : {cfg.get('ssh_port', 22)}")
         g.add_row("[6]",  f"Telnet port (du phong): {cfg.get('telnet_port', 23)}")
@@ -434,6 +436,8 @@ def settings_menu(cfg, config_path):
         elif choice == "2": cfg["password"] = getpass.getpass("  Password moi: ").strip()
         elif choice == "3": cfg["enable_password"] = getpass.getpass("  Enable password moi: ").strip()
         elif choice == "y": cfg["vertiv_connect_password"] = getpass.getpass("  Vertiv Connect Pass: ").strip()
+        elif choice == "va": cfg["vertiv_admin_username"] = input("  Vertiv Admin Username: ").strip()
+        elif choice == "vp": cfg["vertiv_admin_password"] = getpass.getpass("  Vertiv Admin Password: ").strip()
         elif choice == "4": cfg["menu_name_override"] = input(f"  Ten menu ep dung: ").strip()
         elif choice == "5": val = input("  SSH port moi: ").strip(); cfg["ssh_port"] = int(val) if val.isdigit() else cfg["ssh_port"]
         elif choice == "6": val = input("  Telnet port moi: ").strip(); cfg["telnet_port"] = int(val) if val.isdigit() else cfg["telnet_port"]
