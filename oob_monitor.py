@@ -1222,6 +1222,9 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
     mn, dn, _ = get_options_by_host(cfg["baseline_db"], "baseline_menu", oob_ip)
     if not mn: return
 
+    vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
+    is_vertiv = str(vendor).lower() == "vertiv"
+
     for w in warnings:
         key, act_host, opt = w["key"], w["act_host"], baseline.get(w["key"], {})
         target_ip = opt.get("ip")
@@ -1236,7 +1239,7 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
             print_fn(f"[yellow][!][/] {alias} (Opt {key}): Nghi ngo trung IP tren nhieu OOB. Bo qua tu dong sua.")
             continue
             
-        new_desc = f"----> {act_host}"
+        new_desc = act_host if is_vertiv else f"----> {act_host}"
         real_menu_name, real_key = opt.get("_menu_name"), opt.get("_raw_key")
         if not real_menu_name or not real_key: continue
         updates_list.append((real_menu_name, real_key, new_desc))
