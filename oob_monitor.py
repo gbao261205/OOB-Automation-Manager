@@ -955,17 +955,14 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 out += chunk
                 debug_dump(cfg, alias, key, "B3-banner-read", chunk)
 
-                # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm
-                out_tmp_buf = _read(["Data Buffering Suspended"], timeout=1.0)
-                out += out_tmp_buf
-                debug_dump(cfg, alias, key, "B3b-buffering-check", out_tmp_buf)
-                if "Data Buffering Suspended" in out_tmp_buf:
-                    if not live_print: log_verify(f"[yellow][!][/] {alias} (Opt {key}): Vertiv OOB chua hien prompt thiet bi, thu gui 2 phim Enter de danh thuc...")
+                # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm để hiện prompt
+                if "Data Buffering Suspended" in out and not any(x in out for x in (">", "#", "login:", "Username:")):
+                    if not live_print: log_verify(f"[yellow][!][/] {alias} (Opt {key}): Vertiv OOB hien Data Buffering Suspended, tu dong gui Enter de danh thuc prompt...")
                     time.sleep(0.5)
                     _write_no_drain("") # Gui phím Enter thứ nhất
                     time.sleep(0.3)
                     _write_no_drain("") # Gui phím Enter thứ hai
-                    chunk = _read(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                    chunk = _read(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=5)
                     out += chunk
                     debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
 
