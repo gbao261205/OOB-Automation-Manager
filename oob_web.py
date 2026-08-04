@@ -355,41 +355,45 @@ def api_events():
 def api_stats():
     cfg = _cfg(); ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     ds = oob_monitor.load_device_status()
-    stats = {"total":len(ips),"online":0,"offline":0,"has_baseline":0,"alarms":0}
-    for ip,_ in ips:
-        st = ds.get(ip,{})
+    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
+    
+    stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "alarms": 0}
+    for ip, alias in ips:
+        st = ds.get(ip, {})
         if st.get("ping") is True: stats["online"] += 1
         elif st.get("ping") is False: stats["offline"] += 1
-        r = _query_bl("SELECT COUNT(*) as c FROM baseline_menu WHERE host=?",(ip,),all_rows=False)
-        if r and r["c"] > 0: stats["has_baseline"] += 1
-    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0)
-    for v in vst.values():
-        if v.get("status") == "CANH BAO": stats["alarms"] += 1
+        
+        mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        if bl and len(bl) > 0:
+            stats["has_baseline"] += 1
+            
+        alarm_c = sum(1 for (a, k), v in vst.items() if a == alias and v.get("status") == "CANH BAO")
+        stats["alarms"] += alarm_c
+        
     return jsonify(stats)
 
 @app.route("/api/devices")
 def api_devices():
     cfg = _cfg(); ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     ds = oob_monitor.load_device_status()
-    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*7)
+    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
     devs = []
     for ip, alias in ips:
-        st = ds.get(ip,{})
-        r = _query_bl("SELECT COUNT(*) as c FROM baseline_menu WHERE host=?",(ip,),all_rows=False)
-        opt_count = r["c"] if r else 0
-        alarm_c = sum(1 for (a,k),v in vst.items() if a==alias and v.get("status")=="CANH BAO")
-        ok_c = sum(1 for (a,k),v in vst.items() if a==alias and v.get("status")=="OK")
-        mn, dn, _ = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
-        upd = oob_monitor.get_updated_at_by_host(cfg["baseline_db"],"baseline_menu",ip)
-        devs.append({"ip":ip,"alias":alias,"ping":st.get("ping"),"menu_state":st.get("menu_state"),
-            "checked_at":st.get("checked_at","-"),"opt_count":opt_count,
-            "device_name":dn or "","menu_name":mn or "","updated_at":upd or "",
-            "alarm_count":alarm_c,"ok_count":ok_c})
+        st = ds.get(ip, {})
+        mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        opt_count = len(bl) if bl else 0
+        alarm_c = sum(1 for (a, k), v in vst.items() if a == alias and v.get("status") == "CANH BAO")
+        ok_c = sum(1 for (a, k), v in vst.items() if a == alias and v.get("status") == "OK")
+        upd = oob_monitor.get_updated_at_by_host(cfg["baseline_db"], "baseline_menu", ip)
+        devs.append({"ip": ip, "alias": alias, "ping": st.get("ping"), "menu_state": st.get("menu_state"),
+            "checked_at": st.get("checked_at", "-"), "opt_count": opt_count,
+            "device_name": dn or "", "menu_name": mn or "", "updated_at": upd or "",
+            "alarm_count": alarm_c, "ok_count": ok_c})
     return jsonify(devs)
 
 @app.route("/api/device/<ip>/options")
 def api_device_options(ip):
-    cfg = _cfg(); vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*7)
+    cfg = _cfg(); vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
     mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
     if not bl: return jsonify({"device_name":dn,"menu_name":mn,"options":[]})
     all_ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
@@ -540,16 +544,16 @@ def api_export_excel():
     def mk_bdr():
         s = Side(style="thin",color="BFBFBF"); return Border(left=s,right=s,top=s,bottom=s)
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Chi tiet OOB"
-    hdrs = ["OOB IP","OOB Alias","Hostname","Menu","Ping","Menu State","Option Key","Description","Target IP","Port","Protocol","Vendor","Verify","Act Host"]
+    hdrs = ["OOB IP","OOB Alias","Menu","Ping","Menu State","Option Key","Description","Target IP","Port","Vendor","Verify","Act Host"]
     for ci,h in enumerate(hdrs,1):
         c = ws.cell(1,ci,h); c.font=Font(bold=True,color="FFFFFF"); c.fill=mk_fill("1F4E79"); c.alignment=Alignment(horizontal="center"); c.border=mk_bdr()
     ws.freeze_panes = "A2"; ri = 2
     for ip,alias in hosts:
         st = ds.get(ip,{})
-        pg = "Online" if st.get("ping") is True else ("Offline" if st.get("ping") is False else "-")
+        pg = "UP" if st.get("ping") is True else ("DOWN" if st.get("ping") is False else "Chua kiem tra")
         mn,dn,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
         if not bl:
-            for ci,v in enumerate([ip,alias,"","",pg,st.get("menu_state","-"),"(chua co baseline)","","","","","",""],1): ws.cell(ri,ci,v).border=mk_bdr()
+            for ci,v in enumerate([ip,alias,"",pg,st.get("menu_state","-"),"(chua co baseline)","","","","","",""],1): ws.cell(ri,ci,v).border=mk_bdr()
             ri+=1; continue
         
         start_row = ri
@@ -561,14 +565,14 @@ def api_export_excel():
           else: vs,ah,sc = "Chua Verify","","FFEB9C"
           
           # THÊM o.get("vendor","cisco") vào mảng dữ liệu
-          for ci,v in enumerate([ip,alias,dn or "",mn or "",pg,st.get("menu_state","-"),ok_key,o.get("description",""),o.get("ip",""),o.get("port",""),o.get("protocol",""),o.get("vendor","cisco").upper(),vs,ah],1):
+          for ci,v in enumerate([ip,alias,mn or "",pg,st.get("menu_state","-"),ok_key,o.get("description",""),o.get("ip",""),o.get("port",""),o.get("vendor","cisco").upper(),vs,ah],1):
               c = ws.cell(ri,ci,v); c.border=mk_bdr(); c.alignment=Alignment(vertical="center")
-              if ci==13: c.fill=mk_fill(sc); c.font=Font(bold=True)
+              if ci==11: c.fill=mk_fill(sc); c.font=Font(bold=True)
           ri+=1
         
         if ri > start_row + 1:
-            for ci in range(1, 7): ws.merge_cells(start_row=start_row, start_column=ci, end_row=ri-1, end_column=ci)
-    for i,w in enumerate([16,16,18,18,10,14,12,36,16,8,10,12,14,18],1): ws.column_dimensions[get_column_letter(i)].width=w
+            for ci in range(1, 6): ws.merge_cells(start_row=start_row, start_column=ci, end_row=ri-1, end_column=ci)
+    for i,w in enumerate([16,16,18,10,14,12,36,16,8,12,14,18],1): ws.column_dimensions[get_column_letter(i)].width=w
     os.makedirs("reports",exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fn = "OOB_Report_" + ts + ".xlsx"; fp = os.path.join("reports",fn)

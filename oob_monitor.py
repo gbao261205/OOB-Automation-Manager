@@ -1813,8 +1813,8 @@ def export_menu_report(cfg):
 
     def _ping_label(ip):
         p = dev_status.get(ip, {}).get("ping")
-        if p is True: return "Song (OK)"
-        if p is False: return "Down (khong ping duoc)"
+        if p is True: return "UP"
+        if p is False: return "DOWN"
         return "Chua kiem tra"
 
     def _menu_state_label(ip):
@@ -1835,7 +1835,7 @@ def export_menu_report(cfg):
     wb = openpyxl.Workbook()
     ws1 = wb.active
     ws1.title = "Chi tiet"
-    h1 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "OOB Hostname", "Menu Name", "Option Key", "Description", "Hostname thuc te", "Target IP", "Target Port", "Protocol", "Vendor", "Desc Status", "Ghi chu"]
+    h1 = ["OOB IP", "OOB Alias", "Ping", "Trang thai Menu", "Menu Name", "Option Key", "Description", "Hostname thuc te", "Target IP", "Target Port", "Vendor", "Desc Status", "Ghi chu"]
     for ci, h in enumerate(h1, 1):
         c = ws1.cell(1, ci, h); c.font = Font(bold=True, color="FFFFFF"); c.fill = mk_fill(C_HDR); c.alignment = Alignment(horizontal="center"); c.border = mk_bdr()
     ws1.freeze_panes = "A2"
@@ -1846,7 +1846,7 @@ def export_menu_report(cfg):
         ping_lbl, menu_state_lbl = _ping_label(ip), _menu_state_label(ip)
         mn, device_name, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if baseline is None:
-            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, "(chua co baseline)", "", "", "", "", "", "", "", "", "", ""], 1): ws1.cell(ri, ci, val)
+            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, "(chua co baseline)", "", "", "", "", "", "", "", ""], 1): ws1.cell(ri, ci, val)
             ri += 1
             summary.append({"alias": alias, "ip": ip, "ping": ping_lbl, "menu_state": menu_state_lbl, "hn": "", "mn": "", "total": 0, "match": 0, "wrong": 0, "unverif": 0, "no_conn": 0, "no_desc": 0})
             continue
@@ -1885,17 +1885,17 @@ def export_menu_report(cfg):
                     cnt["unverif"] += 1
                     act_host_val = vr.get('act_host', '') or ""
 
-            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, hn, mn or "", opt_key, desc, act_host_val, t_ip, t_port, proto, vendor, slabel, note], 1):
+            for ci, val in enumerate([ip, alias, ping_lbl, menu_state_lbl, mn or "", opt_key, desc, act_host_val, t_ip, t_port, vendor, slabel, note], 1):
                 c = ws1.cell(ri, ci, val); c.border = mk_bdr(); c.alignment = Alignment(vertical="center")
-                if ci == 14: c.fill = mk_fill(scolor); c.font = Font(bold=True) 
+                if ci == 12: c.fill = mk_fill(scolor); c.font = Font(bold=True) 
             ri += 1
             
         if ri > start_ri + 1:
-            for ci in range(1, 7):
+            for ci in range(1, 6):
                 ws1.merge_cells(start_row=start_ri, start_column=ci, end_row=ri-1, end_column=ci)
                 
         summary.append({"alias": alias, "ip": ip, "ping": ping_lbl, "menu_state": menu_state_lbl, "hn": hn, "mn": mn or "", "total": len(baseline), **cnt})
-    for i, w in enumerate([16, 16, 12, 20, 18, 20, 12, 38, 25, 16, 12, 10, 12, 22, 44], 1): ws1.column_dimensions[get_column_letter(i)].width = w
+    for i, w in enumerate([16, 16, 12, 20, 20, 12, 38, 25, 16, 12, 12, 22, 44], 1): ws1.column_dimensions[get_column_letter(i)].width = w
 
     ws2 = wb.create_sheet("Tom tat")
     h2 = ["OOB Alias", "OOB IP", "Ping", "Trang thai Menu", "Hostname OOB", "Menu", "Tong Option", "OK Khop", "SAI", "Chua Verify", "Khong KN", "Khong Desc"]
