@@ -471,6 +471,62 @@ def api_push_logs():
              for f in sorted(os.listdir(d),reverse=True) if f.endswith(".log")]
     return jsonify(files[:50])
 
+@app.route("/api/debug-logs")
+def api_debug_logs():
+    d = "debug-logs"
+    if not os.path.exists(d): return jsonify([])
+    files = [{"name":f,"size":os.path.getsize(os.path.join(d,f)),
+              "mtime":datetime.fromtimestamp(os.path.getmtime(os.path.join(d,f))).strftime("%Y-%m-%d %H:%M:%S")}
+             for f in sorted(os.listdir(d),reverse=True) if f.endswith(".log") or f.endswith(".txt")]
+    return jsonify(files[:50])
+
+@app.route("/api/debug-logs/<path:fn>")
+def api_debug_log_content(fn):
+    fp = os.path.join("debug-logs", os.path.basename(fn))
+    if not os.path.exists(fp): return jsonify({"error":"Not found"}),404
+    try:
+        with open(fp,"r",encoding="utf-8") as f: return jsonify({"content":f.read()})
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+@app.route("/api/live-debug", methods=["POST"])
+@login_required
+def api_live_debug():
+    import re
+    d = request.json or {}
+    ip = d.get("ip","").strip()
+    opt_key = str(d.get("opt_key","")).strip()
+    if not ip or not opt_key:
+        return jsonify({"status":"error","msg":"Thieu IP hoac Option Key!"}),400
+
+    cfg = _cfg()
+    all_hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
+    alias = next((a for i,a in all_hosts if i==ip), ip)
+
+    mn, dn, baseline = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+    if not baseline or opt_key not in baseline:
+        return jsonify({"status":"error","msg":f"Option '{opt_key}' khong ton tai trong baseline!"}),404
+
+    opt_data = {opt_key: baseline[opt_key]}
+    task_id = f"debug_{ip}_{opt_key}_{int(time.time())}"
+
+    _sse_broadcast({"type":"log","task":task_id,"ip":ip,"msg":f"=== BAT DAU LIVE DEBUG {alias} - OPTION {opt_key} ===","ts":datetime.now().strftime("%H:%M:%S")})
+
+    def _stream_print(msg):
+        clean = re.sub(r"\[/?[^\[\]]*\]", "", str(msg))
+        _sse_broadcast({"type":"log","task":task_id,"ip":ip,"msg":clean,"ts":datetime.now().strftime("%H:%M:%S")})
+
+    def _bg_debug():
+        try:
+            results = oob_monitor.run_deep_verify(cfg, alias, ip, opt_data, print_fn=_stream_print, live_debug_opt=opt_key)
+            _sse_broadcast({"type":"log","task":task_id,"ip":ip,"msg":f"=== KET THUC LIVE DEBUG {alias} - OPTION {opt_key} ===","ts":datetime.now().strftime("%H:%M:%S")})
+            _sse_broadcast({"type":"task_done","task":task_id,"status":"done","results":results})
+        except Exception as exc:
+            _sse_broadcast({"type":"log","task":task_id,"ip":ip,"msg":f"[LOI] {exc}","ts":datetime.now().strftime("%H:%M:%S")})
+            _sse_broadcast({"type":"task_done","task":task_id,"status":"error","error":str(exc)})
+
+    threading.Thread(target=_bg_debug, daemon=True).start()
+    return jsonify({"status":"ok","task_id":task_id,"alias":alias,"opt_key":opt_key})
+
 @app.route("/api/export/excel")
 def api_export_excel():
     try:
@@ -1018,8 +1074,8 @@ select.fc option{background:#1a1a2e}
       </div>
       <div class="tw">
         <table>
-          <thead><tr><th>Option Key</th><th>Description</th><th>Hãng (Vendor)</th><th>Target IP</th><th>Port</th><th>Protocol</th><th>Verify</th><th>Hostname Thực tế</th></tr></thead>
-          <tbody id="devOptsBody"><tr class="lr"><td colspan="7"><div class="sp" style="margin:0 auto"></div></td></tr></tbody>
+          <thead><tr><th>Option Key</th><th>Description</th><th>Hãng (Vendor)</th><th>Target IP</th><th>Port</th><th>Protocol</th><th>Verify</th><th>Hostname Thực tế</th><th style="text-align:right">Thao tác</th></tr></thead>
+          <tbody id="devOptsBody"><tr class="lr"><td colspan="9"><div class="sp" style="margin:0 auto"></div></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1047,6 +1103,7 @@ select.fc option{background:#1a1a2e}
       <div class="tabs mb16">
         <button class="tab-btn active" id="btn-vlogs" onclick="sTabLogs('vlogs',this)">📋 Nhật ký Verify</button>
         <button class="tab-btn" id="btn-plogs" onclick="sTabLogs('plogs',this)">🚀 Lịch sử Push & Revert</button>
+        <button class="tab-btn" id="btn-dlogs" onclick="sTabLogs('dlogs',this)">🐛 Nhật ký Live Debug</button>
         <button class="btn btn-g btn-sm ml-a" onclick="loadLogs()">↻ Làm mới</button>
       </div>
       <div style="display:grid;grid-template-columns:300px 1fr;gap:16px">
@@ -1219,6 +1276,19 @@ select.fc option{background:#1a1a2e}
   </div>
 </div>
 
+<!-- Modal Live Debug Console -->
+<div class="mo" id="debugMod">
+  <div class="mb xl">
+    <div class="mh"><div class="mt" id="debugTitle">🐛 Live Debug Console</div><button class="mc" onclick="cModal('debugMod')">×</button></div>
+    <div class="mbody" style="padding:16px">
+      <div id="debugCon" class="lc" style="height:380px;background:#05050a;border:1px solid var(--border);border-radius:var(--rs);padding:12px;font-family:'JetBrains Mono',monospace;font-size:12px;overflow-y:auto;color:#a09db8">
+        <span class="text-m">Sẵn sàng chạy Live Debug...</span>
+      </div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="cModal('debugMod')">Đóng</button></div>
+  </div>
+</div>
+
 <div class="tc" id="toastCnt"></div>
 
 <script>
@@ -1240,14 +1310,17 @@ function initSSE(){
 
 function logMsg(d){
   const con=document.getElementById('liveCon');
-  if(!con) return;
+  const dcon=document.getElementById('debugCon');
   const msg=esc(d.msg||'');
   let cls='linf';
   if(/OK|thanh cong|khop/i.test(msg))cls='lok';
   else if(/LOI|that bai|error/i.test(msg))cls='lerr';
   else if(/CANH BAO|warn/i.test(msg))cls='lwarn';
-  con.innerHTML+=`<div><span class="lts">[${d.ts||''}]</span> <span class="${cls}">${msg}</span></div>`;
-  con.scrollTop=con.scrollHeight;
+  else if(/>>> SENDING/i.test(msg))cls='lok';
+  
+  const line = `<div><span class="lts">[${d.ts||''}]</span> <span class="${cls}">${msg}</span></div>`;
+  if(con){con.innerHTML+=line;con.scrollTop=con.scrollHeight;}
+  if(dcon && d.task && d.task.startsWith('debug_')){dcon.innerHTML+=line;dcon.scrollTop=dcon.scrollHeight;}
 }
 
 function taskDone(d){
@@ -1352,12 +1425,12 @@ function openDev(ip,alias){
 }
 
 async function loadDevOpts(ip){
-  document.getElementById('devOptsBody').innerHTML='<tr class="lr"><td colspan="7"><div class="sp" style="margin:0 auto"></div></td></tr>';
+  document.getElementById('devOptsBody').innerHTML='<tr class="lr"><td colspan="9"><div class="sp" style="margin:0 auto"></div></td></tr>';
   const d=await fetch('/api/device/'+encodeURIComponent(ip)+'/options').then(r=>r.json()).catch(()=>null);
-  if(!d){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3)">Lỗi tải dữ liệu</td></tr>';return;}
+  if(!d){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--text3)">Lỗi tải dữ liệu</td></tr>';return;}
   document.getElementById('devMenu').textContent=d.menu_name||'-';
   document.getElementById('devLines').textContent=d.options.length;
-  if(!d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Vui lòng liên hệ Admin quét cấu hình.</td></tr>';return;}
+  if(!d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Vui lòng liên hệ Admin quét cấu hình.</td></tr>';return;}
   document.getElementById('devOptsBody').innerHTML=d.options.map(o=>{
     const pc=o.protocol==='ssh'?'bt':o.protocol==='serial'?'bv':'ba';
     let vb='<span class="badge bm">-</span>';
@@ -1368,6 +1441,7 @@ async function loadDevOpts(ip){
     else if(o.verify_status==='YEU CAU DANG NHAP')vb='<span class="badge ba">🔑 Auth</span>';
     const ah=o.act_host?'<span class="text-t fw6">'+esc(o.act_host)+'</span>':'<span class="text-m">-</span>';
     const vendorBadge = o.vendor === 'vertiv' ? '<span class="badge ba">VERTIV</span>' : '<span class="badge bt">CISCO</span>';
+    const debugBtn = isAdmin ? `<button class="btn btn-a btn-sm" onclick="runLiveDebug('${esc(ip)}','${esc(o.key)}')" title="Live Debug Real-time">🐛 Debug</button>` : '';
     return`<tr>
         <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
         <td>${esc(o.description)}</td>
@@ -1375,8 +1449,30 @@ async function loadDevOpts(ip){
         <td><span class="mono text-t">${esc(o.ip)}</span></td>
         <td><span class="mono">${o.port}</span></td>
         <td><span class="badge ${pc}">${esc(o.protocol.toUpperCase())}</span></td>
-        <td>${vb}</td><td>${ah}</td></tr>`;
+        <td>${vb}</td><td>${ah}</td>
+        <td style="text-align:right">${debugBtn}</td></tr>`;
     }).join('');
+}
+
+async function runLiveDebug(ip, optKey) {
+  if (!isAdmin) { toast('Bạn cần Đăng nhập Quản trị để thực hiện Live Debug!', 'error'); return; }
+  oModal('debugMod');
+  document.getElementById('debugTitle').textContent = `🐛 Live Debug ${ip} (Option ${optKey})`;
+  const con = document.getElementById('debugCon');
+  con.innerHTML = '<div><span class="lts">[' + nw() + ']</span> <span class="linf">▶ Đang kết nối và khởi tạo Live Debug...</span></div>';
+  con.scrollTop = con.scrollHeight;
+
+  const res = await fetch('/api/live-debug', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ip, opt_key: optKey})
+  }).then(r => r.json()).catch(() => null);
+
+  if (res && res.status === 'ok') {
+    toast(`Đã khởi tạo Live Debug cho Option ${optKey}`, 'info');
+  } else {
+    toast((res && res.msg) || 'Lỗi khởi tạo Live Debug!', 'error');
+  }
 }
 
 async function runAction(action,ip){
@@ -1452,11 +1548,12 @@ function sTabLogs(tab,btn){
 
 async function loadLogs(){
   const isP = curLogTab === 'plogs';
-  const api = isP ? '/api/push-logs' : '/api/logs';
+  const isD = curLogTab === 'dlogs';
+  const api = isP ? '/api/push-logs' : (isD ? '/api/debug-logs' : '/api/logs');
   const files=await fetch(api).then(r=>r.json()).catch(()=>[]);
   const el=document.getElementById('logList');
   if(!files.length){el.innerHTML='<div style="padding:16px;color:var(--text3);font-size:13px">Chưa có file log.</div>';return;}
-  el.innerHTML=files.map(f=>`<div class="lfi" onclick="loadLogCnt('${encodeURIComponent(f.name)}')"><span style="font-size:16px">${isP?'🚀':'📄'}</span><div style="flex:1;overflow:hidden"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${esc(f.name)}</div><div style="font-size:10px;color:var(--text3)">${f.mtime}</div></div></div>`).join('');
+  el.innerHTML=files.map(f=>`<div class="lfi" onclick="loadLogCnt('${encodeURIComponent(f.name)}')"><span style="font-size:16px">${isP?'🚀':(isD?'🐛':'📄')}</span><div style="flex:1;overflow:hidden"><div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${esc(f.name)}</div><div style="font-size:10px;color:var(--text3)">${f.mtime}</div></div></div>`).join('');
   const rAction = document.getElementById('revertAction');
   if(rAction) rAction.style.display='none';
   document.getElementById('logView').innerHTML='<span class="text-m">← Chọn file log bên trái để xem.</span>';
@@ -1465,7 +1562,7 @@ async function loadLogs(){
 async function loadLogCnt(fn){
   curLogFile = fn;
   document.getElementById('logView').textContent='Đang tải...';
-  const api = (curLogTab === 'plogs' ? '/api/push-logs/' : '/api/logs/') + fn;
+  const api = (curLogTab === 'plogs' ? '/api/push-logs/' : (curLogTab === 'dlogs' ? '/api/debug-logs/' : '/api/logs/')) + fn;
   const d=await fetch(api).then(r=>r.json()).catch(()=>null);
   let txt = d&&d.content?d.content:'Lỗi tải file.';
   txt = esc(txt);
