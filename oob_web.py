@@ -1054,22 +1054,24 @@ select.fc option{background:#1a1a2e}
 
     <!-- DEVICES -->
     <div class="page" id="page-devices">
-      <div class="dh" id="devHdr" style="display:none">
-        <div>
-          <div class="dt" id="devTitle">-</div>
-          <div class="dm">
-            <span>📡 IP: <strong id="devIP">-</strong></span>
-            <span>🖧 Menu: <strong id="devMenu">-</strong></span>
-            <span>📦 Lines: <strong id="devLines">-</strong></span>
-          </div>
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:16px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:300px">
+          <label class="fl" style="margin:0;white-space:nowrap;font-weight:600">📡 Chọn OOB Device:</label>
+          <select id="devSelect" class="fc" onchange="onDevSelectChange(this.value)" style="margin:0;max-width:360px">
+            <option value="">Đang tải danh sách thiết bị...</option>
+          </select>
+        </div>
+        <div class="dm" style="margin:0">
+          <span>🖧 Menu: <strong id="devMenu">-</strong></span>
+          <span>📦 Lines: <strong id="devLines">-</strong></span>
         </div>
         <div class="bg2">
           {% if is_admin %}
-          <button class="btn btn-t btn-sm" onclick="runAction('scan',curIP)">🔍 Scan</button>
-          <button class="btn btn-a btn-sm" onclick="runAction('verify',curIP)">⚡ Verify</button>
-          <button class="btn btn-pk btn-sm" onclick="runAction('push',curIP)">🚀 Push</button>
+          <button class="btn btn-t btn-sm" onclick="if(curIP)runAction('scan',curIP)">🔍 Scan</button>
+          <button class="btn btn-a btn-sm" onclick="if(curIP)runAction('verify',curIP)">⚡ Verify</button>
+          <button class="btn btn-pk btn-sm" onclick="if(curIP)runAction('push',curIP)">🚀 Push</button>
           {% endif %}
-          <button class="btn btn-g btn-sm" onclick="sPage('dashboard')">← Quay lại</button>
+          <button class="btn btn-g btn-sm" onclick="sPage('dashboard')">← Dashboard</button>
         </div>
       </div>
       <div class="tw">
@@ -1353,6 +1355,7 @@ function sPage(page,btn){
   curPage=page;
   document.getElementById('tbTitle').textContent=ptitles[page]||page;
   if(page==='dashboard')loadDash();
+  if(page==='devices')loadDevicesPage();
   if(page==='logs')loadLogs();
   if(isAdmin && page==='settings')loadSettings();
 }
@@ -1418,19 +1421,69 @@ async function loadDash(){
 
 function openDev(ip,alias){
   curIP=ip; sPage('devices');
-  document.getElementById('devHdr').style.display='';
-  document.getElementById('devTitle').textContent=alias||ip;
-  document.getElementById('devIP').textContent=ip;
+  const select = document.getElementById('devSelect');
+  if (select) select.value = ip;
   loadDevOpts(ip);
 }
 
+async function loadDevicesPage() {
+  const select = document.getElementById('devSelect');
+  if (!select) return;
+  
+  const devs = await fetch('/api/devices').then(r => r.json()).catch(() => []);
+  if (!devs.length) {
+    select.innerHTML = '<option value="">(Chưa có thiết bị OOB)</option>';
+    document.getElementById('devOptsBody').innerHTML = '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text3)">Chưa có thiết bị. Cần Đăng nhập Quản trị để thêm mới.</td></tr>';
+    return;
+  }
+
+  select.innerHTML = devs.map(d => `<option value="${esc(d.ip)}">${esc(d.alias || d.ip)} (${esc(d.ip)})</option>`).join('');
+
+  if (curIP && devs.some(d => d.ip === curIP)) {
+    select.value = curIP;
+  } else {
+    curIP = devs[0].ip;
+    select.value = curIP;
+  }
+  
+  loadDevOpts(curIP);
+}
+
+function onDevSelectChange(ip) {
+  if (!ip) return;
+  curIP = ip;
+  loadDevOpts(ip);
+}
+
+function copyConnCmd(vendor, desc, targetIp, targetPort, protocol) {
+  let cmd = '';
+  if (vendor && vendor.toLowerCase() === 'vertiv') {
+    cmd = `connect ${desc}`;
+  } else if (protocol && protocol.toLowerCase() === 'ssh') {
+    cmd = `ssh -p ${targetPort} ${targetIp}`;
+  } else {
+    cmd = `telnet ${targetIp} ${targetPort}`;
+  }
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(cmd).then(() => {
+      toast(`Đã sao chép lệnh: ${cmd}`, 'success');
+    }).catch(() => {
+      prompt('Copy lệnh kết nối:', cmd);
+    });
+  } else {
+    prompt('Copy lệnh kết nối:', cmd);
+  }
+}
+
 async function loadDevOpts(ip){
+  if (!ip) return;
   document.getElementById('devOptsBody').innerHTML='<tr class="lr"><td colspan="9"><div class="sp" style="margin:0 auto"></div></td></tr>';
   const d=await fetch('/api/device/'+encodeURIComponent(ip)+'/options').then(r=>r.json()).catch(()=>null);
   if(!d){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--text3)">Lỗi tải dữ liệu</td></tr>';return;}
   document.getElementById('devMenu').textContent=d.menu_name||'-';
-  document.getElementById('devLines').textContent=d.options.length;
-  if(!d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Vui lòng liên hệ Admin quét cấu hình.</td></tr>';return;}
+  document.getElementById('devLines').textContent=d.options?d.options.length:0;
+  if(!d.options || !d.options.length){document.getElementById('devOptsBody').innerHTML='<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text3)">Chưa có baseline. Vui lòng liên hệ Admin quét cấu hình.</td></tr>';return;}
   document.getElementById('devOptsBody').innerHTML=d.options.map(o=>{
     const pc=o.protocol==='ssh'?'bt':o.protocol==='serial'?'bv':'ba';
     let vb='<span class="badge bm">-</span>';
@@ -1442,6 +1495,7 @@ async function loadDevOpts(ip){
     const ah=o.act_host?'<span class="text-t fw6">'+esc(o.act_host)+'</span>':'<span class="text-m">-</span>';
     const vendorBadge = o.vendor === 'vertiv' ? '<span class="badge ba">VERTIV</span>' : '<span class="badge bt">CISCO</span>';
     const debugBtn = isAdmin ? `<button class="btn btn-a btn-sm" onclick="runLiveDebug('${esc(ip)}','${esc(o.key)}')" title="Live Debug Real-time">🐛 Debug</button>` : '';
+    const copyBtn = `<button class="btn btn-g btn-sm" onclick="copyConnCmd('${esc(o.vendor)}','${esc(o.description)}','${esc(o.ip)}',${o.port},'${esc(o.protocol)}')" title="Sao chép lệnh kết nối">📋 Copy</button>`;
     return`<tr>
         <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
         <td>${esc(o.description)}</td>
@@ -1450,7 +1504,12 @@ async function loadDevOpts(ip){
         <td><span class="mono">${o.port}</span></td>
         <td><span class="badge ${pc}">${esc(o.protocol.toUpperCase())}</span></td>
         <td>${vb}</td><td>${ah}</td>
-        <td style="text-align:right">${debugBtn}</td></tr>`;
+        <td style="text-align:right">
+          <div style="display:flex;gap:6px;justify-content:flex-end">
+            ${copyBtn}
+            ${debugBtn}
+          </div>
+        </td></tr>`;
     }).join('');
 }
 
