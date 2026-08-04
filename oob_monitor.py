@@ -874,9 +874,9 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
-                if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Da thay prompt Password, cho 3.0s de buffer Vertiv on dinh...")
-                time.sleep(3.0) # Tang delay len han 3s cho an toan tuyet doi
-                _write_cr(v_pass)
+                if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Da thay prompt Password, gui mat khau Vertiv...")
+                time.sleep(0.3)
+                _write(v_pass)
                 # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
                 chunk = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:", "Enter your option:"], timeout=12)
                 out += chunk
@@ -886,7 +886,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 if "Enter your option:" in chunk:
                     if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Vertiv hien Multi Session Menu, tu dong chon '1'...")
                     time.sleep(0.3)
-                    _write_cr("1")
+                    _write("1")
                     chunk_menu = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
                     out += chunk_menu
                     debug_dump(cfg, alias, key, "B2m-after-menu", chunk_menu)
@@ -901,9 +901,18 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 if ("assword:" in chunk or "Password:" in chunk) and not any(
                     x in chunk for x in ("Type the hot key", "cli->", "login:", "Username:")
                 ):
-                    if not live_print: log_verify(f"[yellow][!][/] {alias} (Opt {key}): OOB Vertiv hoi lai Password: sau lan 1 - thu lai 1 lan nua (cho 2s)...")
-                    time.sleep(2.0) # Tang delay retry cho an toan
-                    _write_cr(v_pass)
+                    v_pass_retry = v_pass
+                    if live_print:
+                        try:
+                            _con.print("\n  [bold yellow][!][/] Mat khau Vertiv tu dong bi tu choi hoac can xac nhan lai!")
+                            manual_p = _con.input("  [bold cyan]>> Nhap THU CONG Vertiv Connect Pass (Enter de giu nguyen mat khau cu)[/]: ").strip()
+                            if manual_p:
+                                v_pass_retry = manual_p
+                        except Exception: pass
+                    else:
+                        log_verify(f"[yellow][!][/] {alias} (Opt {key}): OOB Vertiv hoi lai Password: sau lan 1 - thu lai 1 lan nua...")
+                    time.sleep(0.5)
+                    _write(v_pass_retry)
                     chunk2 = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
                     out += chunk2
                     debug_dump(cfg, alias, key, "B2b-retry-vpass", chunk2)
