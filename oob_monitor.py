@@ -748,7 +748,7 @@ def extract_hostname(output: str) -> str:
     lines = [l.strip() for l in output.splitlines() if l.strip()]
     
     for line in reversed(lines):
-        if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->", "Welcome to ACS"]) or _CONN_ERR_RE.search(line): 
+        if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "suspend the connection", "Sharing connection", "cli->", "Welcome to ACS"]) or _CONN_ERR_RE.search(line): 
             continue
         
         # 1. Kieu login chuan Linux/Unix: "hostname login:"
@@ -967,21 +967,28 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                     out += chunk
                     debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
 
-                # Buoc 4: CHI go Enter "danh thuc" (va CHI 1 LAN) neu sau Buoc 3
-                # van CHUA thay bat ky dau hieu prompt/dang nhap nao - tuc la
-                # truong hop thiet bi vao thang shell nhung chua tu in prompt.
-                # Dung write_no_drain() de KHONG xoa mat du lieu da nhan nhung
-                # chua kip doc.
-                if not re.search(r'login:|Username:|Password:|[>#]\s*$|cli->|%', out, re.IGNORECASE):
-                    time.sleep(0.8)
-                    _write_no_drain("")
+                # Buoc 4: CHI go Enter "danh thuc" neu sau hotkey banner Vertiv (<CTRL>Z)
+                # van CHUA thay bat ky dau hieu prompt/dang nhap nào của máy đích.
+                target_out = out
+                if vendor == "vertiv":
+                    idx_z = target_out.rfind("<CTRL>Z")
+                    if idx_z != -1:
+                        target_out = target_out[idx_z + 7:]
+                    else:
+                        idx_hk = target_out.rfind("Type the hot key")
+                        if idx_hk != -1: target_out = target_out[idx_hk:]
+
+                if not re.search(r'login:|Username:|Password:|Login authentication|[>#]\s*$|cli->|%', target_out, re.IGNORECASE):
+                    if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Vertiv OOB vao session nhung chua in prompt, gui Enter danh thuc...")
+                    time.sleep(0.5)
+                    _write_no_drain("") # Gui phim Enter thu nhat
                     time.sleep(0.3)
-                    _write_no_drain("")
-                    chunk = _read(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
+                    _write_no_drain("") # Gui phim Enter thu hai
+                    chunk = _read(["login:", "Username:", "Password:", "Login authentication", ">", "#", "cli->", "%"], timeout=5)
                     out += chunk
-                debug_dump(cfg, alias, key, "B4-wake-enter", chunk)
-            else:
-                debug_dump(cfg, alias, key, "B4-SKIPPED", "(da thay prompt/login o Buoc 3, khong go Enter)")
+                    debug_dump(cfg, alias, key, "B4-wake-enter", chunk)
+                else:
+                    debug_dump(cfg, alias, key, "B4-SKIPPED", "(da thay prompt/login sau banner, khong go Enter)")
             
         else: 
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
@@ -1058,7 +1065,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
         
         for line in reversed(lines):
             # Bo qua cac dong lenh hoac thong bao ket noi cua Vertiv/Network/OS
-            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "cli->", "Data Buffering Suspended", "{master"]): 
+            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "suspend the connection", "Sharing connection", "cli->", "Data Buffering Suspended", "{master"]): 
                 continue
             
             # 1. Kiem tra Prompt truc tiep (VD: HCM-ROUTER-01> hoac HCM-ROUTER-01#)
