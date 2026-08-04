@@ -1620,32 +1620,50 @@ def verify_specific_devices(cfg):
 # ---------------------------------------------------------------------------
 # Import / Export / TIM KIEM
 # ---------------------------------------------------------------------------
-def _parse_verify_logs_for_status(max_age_hours: float = 24.0) -> dict:
+def _parse_verify_logs_for_status(max_age_hours: float = 24.0 * 30) -> dict:
     log_dir = "verify-logs"
     if not os.path.exists(log_dir): return {}
     cutoff = time.time() - max_age_hours * 3600
-    alias_files: dict = {}
+    
+    import re
+    alias_files_map: dict = {}
     for fname in os.listdir(log_dir):
-        if not fname.endswith('.json') or not fname.startswith('Verify_'): continue
-        body = fname[len('Verify_'):-len('.json')]
-        if len(body) < 17: continue
-        alias, fpath = body[:-16], os.path.join(log_dir, fname)
+        m = re.match(r"^Verify_(.+)_(\d{8}_\d{6})\.json$", fname)
+        if not m: continue
+        alias = m.group(1)
+        fpath = os.path.join(log_dir, fname)
         mtime = os.path.getmtime(fpath)
         if mtime < cutoff: continue
-        if alias not in alias_files or mtime > alias_files[alias][1]: alias_files[alias] = (fpath, mtime)
+        
+        if alias not in alias_files_map:
+            alias_files_map[alias] = []
+        alias_files_map[alias].append((fpath, mtime))
 
-    STATUS_MAP = {"OK": "OK", "CANH BAO": "CANH BAO", "KO PIVOT": "KHONG PIVOT", "TIMEOUT": "TIMEOUT", "YC DANG NHAP": "YEU CAU DANG NHAP"}
+    STATUS_MAP = {
+        "OK": "OK", 
+        "CANH BAO": "CANH BAO", 
+        "KO PIVOT": "KHONG PIVOT", 
+        "TIMEOUT": "TIMEOUT", 
+        "YC DANG NHAP": "YEU CAU DANG NHAP"
+    }
+    
     result: dict = {}
-    for alias, (fpath, _) in alias_files.items():
-        try:
-            with open(fpath, "r", encoding="utf-8") as f: data = json.load(f)
-        except Exception: continue
-        for item in data:
-            opt_key = item.get("key")
-            if not opt_key: continue
-            status_raw = item.get("status", "")
-            act_host = item.get("act_host")
-            result[(alias, opt_key)] = {"status": STATUS_MAP.get(status_raw, status_raw), "act_host": act_host if act_host not in ('-', '') else None}
+    for alias, file_list in alias_files_map.items():
+        file_list.sort(key=lambda x: x[1])  # Sap xep mtime tang dan (cu -> moi)
+        for fpath, _ in file_list:
+            try:
+                with open(fpath, "r", encoding="utf-8") as f: data = json.load(f)
+            except Exception: continue
+            if isinstance(data, list):
+                for item in data:
+                    opt_key = str(item.get("key", ""))
+                    if not opt_key: continue
+                    status_raw = item.get("status", "")
+                    act_host = item.get("act_host")
+                    result[(alias, opt_key)] = {
+                        "status": STATUS_MAP.get(status_raw, status_raw),
+                        "act_host": act_host if act_host not in ('-', '') else None
+                    }
     return result
 
 def search_device(cfg):
