@@ -194,7 +194,6 @@ def _run_push(tid, target_ip=None):
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
             if not bl: return
             vendor = next(iter(bl.values())).get("vendor","cisco") if bl else "cisco"
-            if vendor == "vertiv": pfn("  [!] " + alias + ": Vertiv khong ho tro Push."); return
             results = oob_monitor.run_deep_verify(cfg, alias, ip, bl, print_fn=pfn)
             if any(r["status"]=="CANH BAO" for r in results):
                 oob_monitor.process_push_and_reverify(cfg, alias, ip, bl, results, print_fn=pfn)
@@ -587,6 +586,7 @@ def api_config():
         return jsonify({k:v for k,v in oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT).items() if k!="credentials"})
     cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
     allowed = ["username","password","enable_password","vertiv_connect_password",
+               "vertiv_admin_username","vertiv_admin_password",
                "menu_name_override","ssh_port","telnet_port","interval","verify_interval",
                "ip_list","baseline_db","snapshot_db","auto_verify","verify_schedule_mode",
                "verify_schedule_time","verify_schedule_weekday","scan_schedule_mode",
@@ -671,7 +671,7 @@ def api_revert():
         pfn = _make_print_fn(tid, oob_ip)
         pfn(f"Bat dau REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
         try:
-            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10)
+            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10, print_fn=pfn, dry_run=True)
             pfn("[OK] Hoan thien Revert!")
             _finish_task(tid)
         except Exception as e:
@@ -1167,6 +1167,10 @@ select.fc option{background:#1a1a2e}
           <div class="fg"><label class="fl">Enable Password</label><input type="password" id="ce" class="fc"></div>
           <div class="fg"><label class="fl">Vertiv Connect Password</label><input type="password" id="cv" class="fc"></div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+            <div class="fg"><label class="fl">Vertiv Admin Username</label><input type="text" id="cvau" class="fc" placeholder="admin"></div>
+            <div class="fg"><label class="fl">Vertiv Admin Password</label><input type="password" id="cvap" class="fc"></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
             <div class="fg"><label class="fl">SSH Port</label><input type="number" id="csp" class="fc" placeholder="22"></div>
             <div class="fg"><label class="fl">Telnet Port</label><input type="number" id="ctp" class="fc" placeholder="23"></div>
           </div>
@@ -1657,6 +1661,7 @@ async function loadSettings(){
   if(!isAdmin) return;
   const cfg=await fetch('/api/config').then(r=>r.json()).catch(()=>({}));
   const m={'username':'cu','password':'cp','enable_password':'ce','vertiv_connect_password':'cv',
+           'vertiv_admin_username':'cvau','vertiv_admin_password':'cvap',
            'ssh_port':'csp','telnet_port':'ctp','menu_name_override':'cmno',
            'interval':'ci','verify_interval':'cvi','ip_list':'cil','baseline_db':'cbd','snapshot_db':'csd',
            'verify_wait_after_connect':'cvwac','max_verify_duration':'cmvd',
@@ -1678,7 +1683,9 @@ function togSF(p){
 async function saveCfg(){
   if(!isAdmin) return;
   const pay={username:g('cu').value,password:g('cp').value,enable_password:g('ce').value,
-             vertiv_connect_password:g('cv').value,ssh_port:parseInt(g('csp').value)||22,
+             vertiv_connect_password:g('cv').value,
+             vertiv_admin_username:g('cvau').value,vertiv_admin_password:g('cvap').value,
+             ssh_port:parseInt(g('csp').value)||22,
              telnet_port:parseInt(g('ctp').value)||23,menu_name_override:g('cmno').value,
              auto_verify:g('cav').checked};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});

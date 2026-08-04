@@ -46,6 +46,8 @@ DEFAULT_CONFIG = {
     "password": "",
     "enable_password": "",
     "vertiv_connect_password": "",  
+    "vertiv_admin_username": "",
+    "vertiv_admin_password": "",
     "credentials": [],          
     "menu_name_override": "",
     "ssh_port": 22,
@@ -1242,15 +1244,24 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
     if not updates_list: return
     print_fn(f"[*] Dang PUSH thuc thi sua loi {len(updates_list)} option cho {alias}...")
     
+    vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
     success = False
-    for c in get_all_credentials(cfg, oob_ip):
-        success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], updates_list, timeout=10)
-        if success:
-            save_working_credential(oob_ip, c)
-            break
+    if str(vendor).lower() == "vertiv":
+        admin_user = cfg.get("vertiv_admin_username")
+        admin_pass = cfg.get("vertiv_admin_password")
+        if not admin_user or not admin_pass:
+            print_fn(f"[red][LOI][/] {alias}: Chua cau hinh Vertiv Admin Username/Password trong Cau hinh he thong!")
+            return
+        success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), admin_user, admin_pass, "", updates_list, timeout=10, vendor="vertiv", cfg=cfg, print_fn=print_fn, dry_run=True)
+    else:
+        for c in get_all_credentials(cfg, oob_ip):
+            success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], updates_list, timeout=10, vendor="cisco", cfg=cfg, print_fn=print_fn, dry_run=True)
+            if success:
+                save_working_credential(oob_ip, c)
+                break
 
     if not success:
-        print_fn(f"[red][LOI][/] {alias}: Push cau hinh that bai (Cisco tu choi hoac sai authen).")
+        print_fn(f"[red][LOI][/] {alias}: Push cau hinh that bai (Thiet bi tu choi hoac sai authen/phuong thuc).")
         return
 
     os.makedirs("push-logs", exist_ok=True)
@@ -1291,12 +1302,6 @@ def manual_push_devices(cfg):
         _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
         if not baseline:
             _con.print(f"  [yellow][!][/] OOB nay chua co Baseline. Vui long quet cau hinh (Option 7) truoc!")
-            continue
-            
-        vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
-        if vendor == "vertiv":
-            _con.print(f"  [yellow][!][/] Thiet bi {alias} la Vertiv. Tinh nang Push Config chua duoc ho tro cho hang nay!")
-            run_deep_verify(cfg, alias, ip, baseline, cli_print)
             continue
             
         results = run_deep_verify(cfg, alias, ip, baseline, cli_print)

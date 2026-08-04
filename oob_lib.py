@@ -672,14 +672,92 @@ def fetch_hostname_via_auto(host, ssh_port, telnet_port,
             pass
         tn.close()
 
-def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, updates_list, timeout=10):
+def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, updates_list, timeout=10, print_fn=None, dry_run=True):
     """
-    Kết nối, ghi đè cấu hình và BẮT LỖI TỪ CISCO IOS.
-    updates_list: danh sách các tuple (real_menu_name, real_key, new_desc)
+    Dành riêng cho Vertiv ACS8000: Đăng nhập tài khoản Administrator qua SSH,
+    chuyển tới từng port và đổi port_name.
+    (Mặc định dry_run=True: Chỉ IN RA màn hình câu lệnh dự định gửi chứ KHÔNG gửi thật)
+    """
+    if not updates_list:
+        return True
+
+    if print_fn:
+        print_fn(f"[yellow][DRY-RUN / MOCK PUSH][/] Gia lap ket noi SSH Admin (User: {username}) toi Vertiv {host}...")
+        for _m_name, k, new_desc in updates_list:
+            print_fn(f"  --:- / cli-> cd /")
+            print_fn(f"  --:- / cli-> cd ports/serial_ports/")
+            print_fn(f"  --:- serial_ports cli-> cd {k}")
+            print_fn(f"  --:#- [serial_ports/physical] cli-> cd cas/")
+            print_fn(f'  --:#- [serial_ports/cas] cli-> set port_name="{new_desc}"')
+            print_fn(f"  --:#- [serial_ports/cas] cli-> save")
+
+    if dry_run:
+        return True
+
+    tn = connect_auto(host, ssh_port, telnet_port, username, password, "", timeout=timeout)
+    try:
+        tn.read_until("cli->", timeout=5)
+        all_success = True
+        for _m_name, k, new_desc in updates_list:
+            tn.write("cd /")
+            tn.read_until("cli->", timeout=5)
+            tn.write("cd ports/serial_ports/")
+            tn.read_until("cli->", timeout=5)
+            tn.write(f"cd {k}")
+            out1 = tn.read_until("cli->", timeout=5)
+            if "not found" in out1.lower() or "error" in out1.lower() or "invalid" in out1.lower():
+                all_success = False
+                continue
+            tn.write("cd cas/")
+            out2 = tn.read_until("cli->", timeout=5)
+            if "error" in out2.lower() or "invalid" in out2.lower():
+                all_success = False
+                continue
+            tn.write(f'set port_name="{new_desc}"')
+            out3 = tn.read_until("cli->", timeout=5)
+            if "error" in out3.lower() or "invalid" in out3.lower():
+                all_success = False
+            tn.write("save")
+            out4 = tn.read_until("cli->", timeout=5)
+            if "error" in out4.lower() or "failed" in out4.lower():
+                all_success = False
+        return all_success
+    except Exception:
+        return False
+    finally:
+        try:
+            tn.write("exit")
+        except OSError:
+            pass
+        tn.close()
+
+def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, updates_list, timeout=10, vendor="cisco", cfg=None, print_fn=None, dry_run=True):
+    """
+    Kết nối, ghi đè cấu hình cho Cisco IOS hoặc Vertiv ACS8000.
+    (Mặc định dry_run=True: Chỉ IN RA màn hình câu lệnh dự định gửi chứ KHÔNG gửi thật)
     """
     if not updates_list: 
         return True
-        
+
+    if str(vendor).lower() == "vertiv":
+        admin_user = (cfg or {}).get("vertiv_admin_username")
+        admin_pass = (cfg or {}).get("vertiv_admin_password")
+        if not admin_user or not admin_pass:
+            if print_fn:
+                print_fn(f"[red][LOI][/] Chua cau hinh Vertiv Admin Username/Password trong Cau hinh he thong!")
+            return False
+        return push_vertiv_port_names(host, ssh_port, telnet_port, admin_user, admin_pass, updates_list, timeout=timeout, print_fn=print_fn, dry_run=dry_run)
+
+    if print_fn:
+        print_fn(f"[yellow][DRY-RUN / MOCK PUSH][/] Gia lap ket noi ({username}) toi Cisco {host}...")
+        print_fn("  Cisco# configure terminal")
+        for m_name, k, new_desc in updates_list:
+            print_fn(f"  Cisco(config)# menu {m_name} text {k} {new_desc}")
+        print_fn("  Cisco(config)# end")
+
+    if dry_run:
+        return True
+
     tn = connect_auto(host, ssh_port, telnet_port, username, password, enable_password, timeout=timeout)
     try:
         tn.write("configure terminal")
