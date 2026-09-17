@@ -155,8 +155,9 @@ def _run_scan(tid, target_ip=None):
             oob_monitor.save_options(cfg["snapshot_db"],"snapshot_menu",ip,mn,hn,snap)
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
             if bl is None or not oob_monitor.options_equal(bl, snap):
+                diff = oob_monitor.diff_options(bl, snap) if bl is not None else None
                 oob_monitor.save_options(cfg["baseline_db"],"baseline_menu",ip,mn,hn,snap)
-                oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB")
+                oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB", diff=diff)
                 pfn("  [OK] " + alias + ": Cap nhat baseline (" + str(len(snap)) + " option).")
             else: pfn("  [OK] " + alias + ": Khop baseline.")
             
@@ -579,20 +580,34 @@ def api_export_excel():
     return send_file(fp,as_attachment=True,download_name=fn,mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # CÁC API KHÓA HÀNH ĐỘNG THAY ĐỔI DỮ LIỆU (Action / Quản trị)
+_CONFIG_MASK = "******"
+
 @app.route("/api/config", methods=["GET","POST"])
 @login_required
 def api_config():
     if request.method == "GET":
-        return jsonify({k:v for k,v in oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT).items() if k!="credentials"})
+        cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
+        out = {k:v for k,v in cfg.items() if k != "credentials"}
+        for k in oob_monitor._SENSITIVE_CONFIG_FIELDS:
+            if out.get(k): out[k] = _CONFIG_MASK
+        return jsonify(out)
     cfg = oob_monitor.load_config(oob_monitor.CONFIG_FILE_DEFAULT)
     allowed = ["username","password","enable_password","vertiv_connect_password",
                "vertiv_admin_username","vertiv_admin_password",
                "menu_name_override","ssh_port","telnet_port","interval","verify_interval",
                "ip_list","baseline_db","snapshot_db","auto_verify","verify_schedule_mode",
                "verify_schedule_time","verify_schedule_weekday","scan_schedule_mode",
-               "scan_schedule_time","scan_schedule_weekday","verify_wait_after_connect","max_verify_duration"]
+               "scan_schedule_time","scan_schedule_weekday","verify_wait_after_connect",
+               "verify_wait_after_connect_telnet","verify_wait_after_connect_ssh","max_verify_duration"]
+    body = request.json or {}
     for k in allowed:
-        if k in (request.json or {}): cfg[k] = request.json[k]
+        if k not in body: continue
+        v = body[k]
+        # Field nhay cam gui len dung y het mask nghia la UI chi "doc lai roi
+        # luu nguyen" (khong sua) - bo qua de khong ghi de mat khau that bang
+        # chuoi "******" van chuong.
+        if k in oob_monitor._SENSITIVE_CONFIG_FIELDS and v == _CONFIG_MASK: continue
+        cfg[k] = v
     oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
     return jsonify({"status":"ok"})
 
@@ -1211,8 +1226,9 @@ select.fc option{background:#1a1a2e}
                 <div class="fg" id="v_wf" style="display:none"><label class="fl">Thứ</label><input type="text" id="cvw" class="fc" placeholder="mon"></div>
               </div>
             </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-              <div class="fg"><label class="fl">Chờ sau connect (s)</label><input type="number" id="cvwac" class="fc" step="0.5" placeholder="1.5"></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">
+              <div class="fg"><label class="fl">Chờ sau connect - Telnet (s)</label><input type="number" id="cvwact" class="fc" step="0.5" placeholder="1.5"></div>
+              <div class="fg"><label class="fl">Chờ sau connect - SSH (s)</label><input type="number" id="cvwacs" class="fc" step="0.5" placeholder="3.0"></div>
               <div class="fg"><label class="fl">Timeout Verify (s)</label><input type="number" id="cmvd" class="fc" placeholder="300"></div>
             </div>
           </div>
@@ -1664,7 +1680,7 @@ async function loadSettings(){
            'vertiv_admin_username':'cvau','vertiv_admin_password':'cvap',
            'ssh_port':'csp','telnet_port':'ctp','menu_name_override':'cmno',
            'interval':'ci','verify_interval':'cvi','ip_list':'cil','baseline_db':'cbd','snapshot_db':'csd',
-           'verify_wait_after_connect':'cvwac','max_verify_duration':'cmvd',
+           'verify_wait_after_connect_telnet':'cvwact','verify_wait_after_connect_ssh':'cvwacs','max_verify_duration':'cmvd',
            'scan_schedule_time':'cst','scan_schedule_weekday':'csw','verify_schedule_time':'cvt','verify_schedule_weekday':'cvw'};
   for(const[k,id] of Object.entries(m)){const el=document.getElementById(id);if(el)el.value=cfg[k]??'';}
   const av=document.getElementById('cav');if(av)av.checked=cfg.auto_verify??true;
@@ -1698,7 +1714,9 @@ async function saveSched(){
              scan_schedule_time:g('cst').value,scan_schedule_weekday:g('csw').value,
              verify_schedule_mode:g('cvm').value,verify_interval:parseInt(g('cvi').value)||3600,
              verify_schedule_time:g('cvt').value,verify_schedule_weekday:g('cvw').value,
-             verify_wait_after_connect:parseFloat(g('cvwac').value)||1.5,max_verify_duration:parseInt(g('cmvd').value)||300};
+             verify_wait_after_connect_telnet:parseFloat(g('cvwact').value)||1.5,
+             verify_wait_after_connect_ssh:parseFloat(g('cvwacs').value)||3.0,
+             max_verify_duration:parseInt(g('cmvd').value)||300};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
   if(r.ok)toast('Đã lưu lịch!','success');else toast('Lỗi!','error');
 }

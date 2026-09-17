@@ -1,12 +1,15 @@
 # --- Kết nối SSH & Telnet ---
-paramiko==3.5.1[cite: 4]
+paramiko==3.5.1
 
 # --- Giao diện CLI (Bảng, Màu sắc, Live Console) ---
-rich>=13.7.0,<15.0.0[cite: 4]
+rich>=13.7.0,<15.0.0
 
 # --- Giao diện Web Dashboard & Bảo mật ---
 flask>=3.0.0,<4.0.0
 werkzeug>=3.0.0
 
 # --- Xử lý file Excel (Import/Export) ---
-openpyxl>=3.1.0[cite: 4]
+openpyxl>=3.1.0
+
+# --- Mã hoá credential trong oob_config.json khi ở trạng thái nghỉ ---
+cryptography>=42.0.0

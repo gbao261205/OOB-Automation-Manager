@@ -1,0 +1,24 @@
+# --- Credential & config nhay cam (khong duoc commit) ---
+.oob_secret.key
+oob_config.json
+working_creds.json
+
+# --- Du lieu runtime sinh ra khi chay tool ---
+oob_ips.txt
+baseline.db
+snapshot.db
+*.db-wal
+*.db-shm
+verify-logs/
+debug-logs/
+baseline-logs/
+alarms/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- IDE ---
+.vscode/
+.idea/

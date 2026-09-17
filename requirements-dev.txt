@@ -1,0 +1,3 @@
+# --- Test framework (chỉ dùng khi phát triển, không cần trên máy chạy production) ---
+-r requirements.txt
+pytest>=7.4.0,<9.0.0

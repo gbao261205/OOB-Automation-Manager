@@ -65,6 +65,8 @@ DEFAULT_CONFIG = {
     "scan_schedule_time": "01:00",      
     "scan_schedule_weekday": "mon",     
     "verify_wait_after_connect": 1.5,
+    "verify_wait_after_connect_telnet": 1.5,
+    "verify_wait_after_connect_ssh": 3.0,
     "max_verify_duration": 300,
     "debug_verify": False,
 }
@@ -125,30 +127,41 @@ def log_verify(msg: str):
 
 DEBUG_VERIFY_LOG = os.path.join("debug-logs", "deep_verify_debug.log")
 
-def debug_dump(cfg, alias, key, label, text, extra=""):
+def debug_dump(cfg, alias, key, label, text, extra="", elapsed_ms=None):
     """Ghi RAW output (repr, khong bi mat ky tu an \\r \\n \\x1a...) cua tung buoc
     doc trong Deep Verify ra file, va in 1 dong preview NGAN gon (da escape,
     khong vo Rich markup) len panel Deep Verify - de xem TAI SAO 1 buoc doc bi
     thieu/mat du lieu (vd banner FreeBSD bi drain mat, hay bi cat som do timeout).
-    Chi hoat dong khi cfg["debug_verify"] = True. An toan (khong bao gio raise)."""
+    Chi hoat dong khi cfg["debug_verify"] = True. An toan (khong bao gio raise).
+
+    elapsed_ms (optional): so ms tinh tu luc bat dau check_port_via_oob() cho
+    lan goi nay - dung de do khoang cach thoi gian giua cac buoc doc/ghi, phat
+    hien lenh gui ra nhung data ve qua cham (hoac drain mat) gay TIMEOUT gia."""
     if not cfg.get("debug_verify"):
         return
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    t_tag = f"+{elapsed_ms}ms" if elapsed_ms is not None else ""
     try:
         os.makedirs("debug-logs", exist_ok=True)
         with file_lock:
             with open(DEBUG_VERIFY_LOG, "a", encoding="utf-8") as f:
-                f.write(f"[{ts}] {alias} (Opt {key}) - {label} {extra}\n")
+                f.write(f"[{ts}]{(' ' + t_tag) if t_tag else ''} {alias} (Opt {key}) - {label} {extra}\n")
                 f.write(f"    len={len(text)} repr={text!r}\n")
     except OSError:
         pass
     try:
         preview = rich_escape(text.replace("\r", "").replace("\n", "\\n"))[:140]
-        log_verify(f"[dim]\\[{ts}][/][dim white] DEBUG[/] {alias} (Opt {key}) {label} {extra} [dim](len={len(text)})[/] -> {preview}")
+        t_display = f" [dim]{t_tag}[/]" if t_tag else ""
+        log_verify(f"[dim]\\[{ts}][/]{t_display}[dim white] DEBUG[/] {alias} (Opt {key}) {label} {extra} [dim](len={len(text)})[/] -> {preview}")
     except Exception:
         pass
 
-def log_baseline_change(alias, ip, action):
+def log_baseline_change(alias, ip, action, diff=None):
+    """Ghi 1 dong audit khi baseline duoc tao/cap nhat. Neu diff (dict tra ve
+    tu diff_options()) duoc truyen va co noi dung (extra/missing/changed
+    khong rong ca 3), ghi kem 1 dong JSON compact ngay ben duoi de tra cuu
+    lai sau nay baseline da doi TU gi SANG gi - truoc day chi ghi 1 dong text
+    khong co chi tiet gi thay doi."""
     os.makedirs("baseline-logs", exist_ok=True)
     log_path = os.path.join("baseline-logs", "baseline_updates.log")
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -156,6 +169,8 @@ def log_baseline_change(alias, ip, action):
         with file_lock:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"[{ts}] {action}: {alias} ({ip})\n")
+                if diff and (diff.get("extra") or diff.get("missing") or diff.get("changed")):
+                    f.write(f"    diff={json.dumps(diff, ensure_ascii=False)}\n")
     except Exception: pass
 
 # ---------------------------------------------------------------------------
@@ -195,12 +210,23 @@ def load_config(path):
     cfg = DEFAULT_CONFIG.copy()
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f: cfg.update(json.load(f))
+            with open(path, "r", encoding="utf-8") as f: raw = json.load(f)
+            cfg.update(raw)
+            # Migration: config cu chi co 1 gia tri "verify_wait_after_connect"
+            # dung chung cho ca SSH lan Telnet. Neu file chua tung luu 2 key
+            # rieng moi, dung lai dung gia tri cu nguoi dung da chinh (thay vi
+            # am tham doi ve default moi) - tuong thich nguoc, khong can
+            # migrate thu cong.
+            if "verify_wait_after_connect" in raw:
+                if "verify_wait_after_connect_telnet" not in raw:
+                    cfg["verify_wait_after_connect_telnet"] = raw["verify_wait_after_connect"]
+                if "verify_wait_after_connect_ssh" not in raw:
+                    cfg["verify_wait_after_connect_ssh"] = raw["verify_wait_after_connect"]
         except (json.JSONDecodeError, OSError) as exc: pass
-    return cfg
+    return _decrypt_config_fields(cfg)
 
 def save_config(path, cfg):
-    with open(path, "w", encoding="utf-8") as f: json.dump(cfg, f, indent=2, ensure_ascii=False)
+    with open(path, "w", encoding="utf-8") as f: json.dump(_encrypt_config_fields(cfg), f, indent=2, ensure_ascii=False)
 
 def mask(value): return "******" if value else "(chua dat)"
 
@@ -234,11 +260,18 @@ def _decrypt_cred(text):
         c = _get_cipher()
         if c:
             try: return c.decrypt(text[4:].encode("utf-8")).decode("utf-8")
-            except Exception: pass
-        return text
+            except Exception:
+                _con.print("  [bold red][!!!][/] Khong the giai ma 1 field credential (key .oob_secret.key sai/mat/hong) - "
+                            "TRA VE RONG thay vi dung nham chuoi ma hoa lam mat khau that.")
+                return None
+        _con.print("  [bold red][!!!][/] Field credential dang o dang ma hoa (ENC:) nhung thu vien 'cryptography' "
+                    "khong co san de giai ma - TRA VE RONG.")
+        return None
     elif text.startswith("B64:"):
         try: return base64.b64decode(text[4:].encode("utf-8")).decode("utf-8")
-        except Exception: pass
+        except Exception:
+            _con.print("  [bold red][!!!][/] Khong the giai ma B64 1 field credential (du lieu hong) - TRA VE RONG.")
+            return None
     return text
 
 def _encrypt_dict(d):
@@ -246,6 +279,35 @@ def _encrypt_dict(d):
 
 def _decrypt_dict(d):
     return {k: _decrypt_cred(v) if k in ["password", "enable_password"] else v for k, v in d.items()}
+
+# Field cua oob_config.json can ma hoa tai rest (khong bao gom tung phan tu
+# trong credentials[], xu ly rieng ben duoi bang _encrypt_dict/_decrypt_dict).
+_SENSITIVE_CONFIG_FIELDS = ("password", "enable_password", "vertiv_connect_password", "vertiv_admin_password")
+
+def _encrypt_config_fields(cfg):
+    """Tra ve BAN SAO cfg voi cac field nhay cam da ma hoa - dung ngay truoc
+    khi ghi xuong dia (save_config). Khong sua doi cfg goc dang dung trong bo
+    nho (van giu plaintext de code con lai dung nhu cu)."""
+    out = dict(cfg)
+    for k in _SENSITIVE_CONFIG_FIELDS:
+        if k in out:
+            out[k] = _encrypt_cred(out[k])
+    if out.get("credentials"):
+        out["credentials"] = [_encrypt_dict(c) for c in out["credentials"]]
+    return out
+
+def _decrypt_config_fields(cfg):
+    """Nguoc lai _encrypt_config_fields - dung ngay sau khi doc tu dia
+    (load_config). File cu (chua tung ma hoa) khong co prefix ENC:/B64: nen
+    _decrypt_cred tra ve nguyen gia tri - tuong thich nguoc, khong can migrate
+    thu cong; lan save() ke tiep se tu dong nang cap len dang ma hoa."""
+    out = dict(cfg)
+    for k in _SENSITIVE_CONFIG_FIELDS:
+        if k in out:
+            out[k] = _decrypt_cred(out[k])
+    if out.get("credentials"):
+        out["credentials"] = [_decrypt_dict(c) for c in out["credentials"]]
+    return out
 
 def save_working_credential(ip, cred):
     if not ip or not cred: return
@@ -633,6 +695,56 @@ TEXT_RE       = re.compile(r'^\s*menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', re.IGNOREC
 CMD_TELNET_RE = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)(?:\s+(\d+))?', re.IGNORECASE)
 CMD_SSH_RE    = re.compile(r'^\s*menu\s+(\S+)\s+command\s+(\S+)\s+ssh\s+(?:-l\s+\S+\s+|\S+@)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:\s+(\d+))?', re.IGNORECASE)
 
+def _parse_vertiv_acs_show(raw, ip):
+    """Parse output lenh 'show' trong thu muc 'access/' cua Vertiv ACS.
+    Tra ve (hostname, final_options) - hostname co the None neu khong tim
+    thay dong '===' + ten thiet bi ngay sau no. Ham thuan (khong I/O), tach
+    rieng khoi poll_host_multi() de test duoc ma khong can ket noi that."""
+    final_options = {}
+    hostname = None
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if line.startswith("===") and i + 1 < len(lines):
+            potential_host = lines[i+1].strip()
+            if potential_host and " " not in potential_host: hostname = potential_host
+
+        m = re.match(r'^(\S+)\s+(\d+)\s+serial\s+', line, re.IGNORECASE)
+        if m:
+            desc, port_str = m.group(1), m.group(2)
+            key = str(port_str)
+            final_options[key] = {
+                "description": desc, "ip": ip, "port": int(port_str),
+                "protocol": "serial", "_raw_key": key, "_menu_name": "access", "vendor": "vertiv"
+            }
+    return hostname, final_options
+
+
+def _parse_cisco_menu_config(raw, menu_names):
+    """Parse output 'show running-config | include menu' cho danh sach
+    menu_names da xac dinh tren thiet bi Cisco/async. Tra ve final_options
+    dict (key hien thi -> option data). Ham thuan (khong I/O), tach rieng
+    khoi poll_host_multi() de test duoc ma khong can ket noi that."""
+    all_texts, all_commands = {}, {}
+    for r_line in raw.splitlines():
+        line = r_line.strip()
+        m_t = TEXT_RE.match(line)
+        if m_t and m_t.group(1) in menu_names: all_texts[(m_t.group(1), m_t.group(2).strip())] = m_t.group(3).strip(); continue
+        m_c = CMD_TELNET_RE.match(line)
+        if m_c and m_c.group(1) in menu_names: all_commands[(m_c.group(1), m_c.group(2).strip())] = {"ip": m_c.group(3), "port": int(m_c.group(4)) if m_c.group(4) else 23, "protocol": "telnet"}; continue
+        m_s = CMD_SSH_RE.match(line)
+        if m_s and m_s.group(1) in menu_names: all_commands[(m_s.group(1), m_s.group(2).strip())] = {"ip": m_s.group(3), "port": int(m_s.group(4)) if m_s.group(4) else 22, "protocol": "ssh"}
+
+    final_options = {}
+    for (m_name, cmd_k), cmd_data in all_commands.items():
+        if (m_name, f"[{cmd_k}]") in all_texts: real_key, desc = f"[{cmd_k}]", all_texts[(m_name, f"[{cmd_k}]")]
+        elif (m_name, cmd_k) in all_texts: real_key, desc = cmd_k, all_texts[(m_name, cmd_k)]
+        else: real_key, desc = cmd_k, ""
+        display_key = real_key[1:-1] if real_key.startswith("[") and real_key.endswith("]") else real_key
+        final_options[f"{m_name} [{display_key}]" if len(menu_names) > 1 else display_key] = {"description": desc, "ip": cmd_data["ip"], "port": cmd_data["port"], "protocol": cmd_data["protocol"], "_raw_key": real_key, "_menu_name": m_name, "vendor": "cisco"}
+    return final_options
+
+
 def poll_host_multi(ip, cfg, timeout=10):
     menu_name_override = cfg.get("menu_name_override") or None
     creds = get_all_credentials(cfg, ip)
@@ -653,23 +765,7 @@ def poll_host_multi(ip, cfg, timeout=10):
 
                     if tn.last_read_timed_out and not raw.strip(): return None, None, {}, "fetch_failed"
 
-                    final_options = {}
-                    hostname = None
-                    lines = raw.splitlines()
-                    for i, line in enumerate(lines):
-                        line = line.strip()
-                        if line.startswith("===") and i + 1 < len(lines):
-                            potential_host = lines[i+1].strip()
-                            if potential_host and " " not in potential_host: hostname = potential_host
-
-                        m = re.match(r'^(\S+)\s+(\d+)\s+serial\s+', line, re.IGNORECASE)
-                        if m:
-                            desc, port_str = m.group(1), m.group(2)
-                            key = str(port_str)
-                            final_options[key] = {
-                                "description": desc, "ip": ip, "port": int(port_str),
-                                "protocol": "serial", "_raw_key": key, "_menu_name": "access", "vendor": "vertiv"
-                            }
+                    hostname, final_options = _parse_vertiv_acs_show(raw, ip)
 
                     if not final_options: return hostname, None, {}, "no_menu"
                     return hostname, "Vertiv ACS", final_options, "ok"
@@ -688,24 +784,8 @@ def poll_host_multi(ip, cfg, timeout=10):
                     else: menu_names = detected_names
 
                     if not menu_names: return hostname, None, {}, "fetch_failed" if tn.last_read_timed_out else "no_menu"
-                        
-                    all_texts, all_commands = {}, {}
-                    for r_line in raw.splitlines():
-                        line = r_line.strip()
-                        m_t = TEXT_RE.match(line)
-                        if m_t and m_t.group(1) in menu_names: all_texts[(m_t.group(1), m_t.group(2).strip())] = m_t.group(3).strip(); continue
-                        m_c = CMD_TELNET_RE.match(line)
-                        if m_c and m_c.group(1) in menu_names: all_commands[(m_c.group(1), m_c.group(2).strip())] = {"ip": m_c.group(3), "port": int(m_c.group(4)) if m_c.group(4) else 23, "protocol": "telnet"}; continue
-                        m_s = CMD_SSH_RE.match(line)
-                        if m_s and m_s.group(1) in menu_names: all_commands[(m_s.group(1), m_s.group(2).strip())] = {"ip": m_s.group(3), "port": int(m_s.group(4)) if m_s.group(4) else 22, "protocol": "ssh"}
 
-                    final_options = {}
-                    for (m_name, cmd_k), cmd_data in all_commands.items():
-                        if (m_name, f"[{cmd_k}]") in all_texts: real_key, desc = f"[{cmd_k}]", all_texts[(m_name, f"[{cmd_k}]")]
-                        elif (m_name, cmd_k) in all_texts: real_key, desc = cmd_k, all_texts[(m_name, cmd_k)]
-                        else: real_key, desc = cmd_k, ""
-                        display_key = real_key[1:-1] if real_key.startswith("[") and real_key.endswith("]") else real_key
-                        final_options[f"{m_name} [{display_key}]" if len(menu_names) > 1 else display_key] = {"description": desc, "ip": cmd_data["ip"], "port": cmd_data["port"], "protocol": cmd_data["protocol"], "_raw_key": real_key, "_menu_name": m_name, "vendor": "cisco"}
+                    final_options = _parse_cisco_menu_config(raw, menu_names)
                     return hostname, " + ".join(sorted(menu_names)), final_options, "ok"
             finally:
                 try: tn.write("exit")
@@ -744,49 +824,56 @@ def _build_verify_report(alias, oob_ip, own_hostname, results):
     return "\n".join(lines)
 
 def extract_hostname(output: str) -> str:
-    """Ham quet va boc tach Hostname tu luong text dau ra cua thiet bi.
-    Da duoc nang cap de d?n sach ky tu an (Control Chars) va tang cuong Regex cho FreeBSD."""
-    output = _ANSI_STRIP_RE.sub('', output)
-    # Loai bo toan bo ky tu dien khien ngoai tru xuong dong (\r, \n)
-    output = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]', '', output)
-    
+    """Ham quet va boc tach Hostname tu luong text dau ra cua thiet bi trong
+    Deep Verify (check_port_via_oob). Ham thuan (khong I/O), dat o module-level
+    de test duoc doc lap khong can ket noi that.
+
+    LUU Y: truoc day co 2 ban gan giong nhau - 1 ban module-level (khong bao
+    gio duoc goi, da xoa) va 1 ban nested trong run_deep_verify (ban nay, gio
+    da chuyen ra module-level). Ban con lai la ban DUY NHAT dang chay san
+    xuat, gom them exclusion "Data Buffering Suspended"/"{master" cho Vertiv
+    va loai tru prompt noi bo Vertiv (cli/access/admin/root) o ca 2 nhanh
+    kiem tra prompt."""
+    output_clean = _ANSI_STRIP_RE.sub('', output)
+    output_clean = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]', '', output_clean)
+
     auth_seen = False
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
-    
+    lines = [l.strip() for l in output_clean.splitlines() if l.strip()]
+
     for line in reversed(lines):
-        if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "suspend the connection", "Sharing connection", "cli->", "Welcome to ACS"]) or _CONN_ERR_RE.search(line): 
+        # Bo qua cac dong lenh hoac thong bao ket noi cua Vertiv/Network/OS
+        if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "suspend the connection", "Sharing connection", "cli->", "Data Buffering Suspended", "{master"]):
             continue
-        
-        # 1. Kieu login chuan Linux/Unix: "hostname login:"
-        m_login = re.search(r'([A-Za-z0-9_\-\.]+)\s+login:', line, re.IGNORECASE)
+
+        # 1. Kiem tra Prompt truc tiep (VD: HCM-ROUTER-01> hoac HCM-ROUTER-01#)
+        m_prompt = _HOSTNAME_PROMPT_RE.search(line)
+        if m_prompt:
+            h = m_prompt.group(1)
+            # Loai tru prompt noi bo cua Vertiv
+            if h.lower() not in ["cli", "cli-", "access", "admin", "root"]:
+                return h
+
+        # 2. Kiem tra dang nhap kieu Unix/Linux (hostname login:)
+        m_login = _HOSTNAME_LOGIN_RE.search(line)
         if m_login: return m_login.group(1)
-        
-        # 2. Kieu FreeBSD (Dung tren nhieu OOB/Firewall): "FreeBSD/amd64 (hostname) (ttyu0)" hoac Linux
-        m_bsd = re.search(r'(?:FreeBSD|Linux|NetBSD|OpenBSD).*?\(([A-Za-z0-9_\-\.]+)\)', line, re.IGNORECASE)
+
+        # 3. Kiem tra đi kèm he dieu hanh FreeBSD / Linux
+        m_bsd = _HOSTNAME_BSD_RE.search(line)
         if m_bsd: return m_bsd.group(1)
-        
-        # 3. Kieu Cisco Console: "hostname con0 is now available"
-        m_con = re.search(r'([A-Za-z0-9_\-\.]+)\s+con\d+\s+is now available', line, re.IGNORECASE)
-        if m_con: return m_con.group(1)
-        
+
+        m_bsd_new = re.search(r'(?:FreeBSD|Linux|NetBSD|OpenBSD).*?\(([A-Za-z0-9_\-\.]+)\)', line, re.IGNORECASE)
+        if m_bsd_new: return m_bsd_new.group(1)
+
         # 4. Kieu Banner HW (Huawei): *    HOSTNAME    *
         m_hw = re.search(r'^\*\s+([A-Za-z0-9_\-\.]+)\s+\*$', line)
         if m_hw:
             h = m_hw.group(1)
-            if h.lower() not in ["warning", "note", "important", "notice"]: 
+            if h.lower() not in ["warning", "note", "important", "notice"]:
                 return h
 
-        # 5. Prompt chung: "hostname>" hoac "hostname#"
-        m_prompt = _HOSTNAME_PROMPT_RE.search(line)
-        if m_prompt: 
-            h = m_prompt.group(1)
-            # Loai tru cac prompt he thong
-            if h.lower() not in ["cli", "cli-", "access", "admin", "root"]: 
-                return h
-                
-        if re.search(r'Username:|Password:|login:|Login authentication', line, re.IGNORECASE): 
+        if re.search(r'Username:|Password:|login:|Login authentication', line, re.IGNORECASE):
             auth_seen = True
-            
+
     return "AUTH_REQUIRED" if auth_seen else None
 
 def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=None):
@@ -836,12 +923,17 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
         session = None
 
     def check_port_via_oob(t_ip, t_port, proto, vendor, t_desc, key="?", live_print=None):
+        t_start = time.time()
+
+        def _dbg(label, text, extra=""):
+            debug_dump(cfg, alias, key, label, text, extra=extra, elapsed_ms=int((time.time() - t_start) * 1000))
+
         try: s = get_session(vendor)
         except Exception: raise RuntimeError("Khong the ket noi toi OOB")
-        
+
         out = ""
         password_rejected = False
-        
+
         def _read(match_list, timeout=5):
             chunk = s.read_until(match_list, timeout)
             if live_print and chunk:
@@ -871,12 +963,12 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
         if vendor == "vertiv": 
             cmd = f"connect {t_desc}"
             _write(cmd)
-            debug_dump(cfg, alias, key, "B0-CMD-SENT", cmd)
+            _dbg("B0-CMD-SENT", cmd)
             
             # Buoc 1: Cho xem thiet bi hoi Pass hay vao thang/xuat hien Prompt/Hot key
             out_tmp = _read(["assword:", "Password:", "Type the hot key", "cli->"], timeout=5)
             out += out_tmp
-            debug_dump(cfg, alias, key, "B1-after-connect", out_tmp)
+            _dbg("B1-after-connect", out_tmp)
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
                 v_pass = cfg.get("vertiv_connect_password", "")
@@ -886,7 +978,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
                 chunk = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:", "Enter your option:"], timeout=12)
                 out += chunk
-                debug_dump(cfg, alias, key, "B2-after-vpass", chunk, extra=f"(v_pass_set={'yes' if v_pass else 'EMPTY!'}, repr={repr(v_pass)})")
+                _dbg("B2-after-vpass", chunk, extra=f"(v_pass_set={'yes' if v_pass else 'EMPTY!'}, repr={repr(v_pass)})")
 
                 # Xu ly dac biet neu Vertiv ra Multi Session Menu (khi co nhieu session)
                 if "Enter your option:" in chunk:
@@ -895,7 +987,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                     _write("1")
                     chunk_menu = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
                     out += chunk_menu
-                    debug_dump(cfg, alias, key, "B2m-after-menu", chunk_menu)
+                    _dbg("B2m-after-menu", chunk_menu)
                     chunk = chunk_menu  # Ghi de chunk de xu ly logic ben duoi y nhu binh thuong
 
 
@@ -921,21 +1013,21 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                     _write(v_pass_retry)
                     chunk2 = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
                     out += chunk2
-                    debug_dump(cfg, alias, key, "B2b-retry-vpass", chunk2)
+                    _dbg("B2b-retry-vpass", chunk2)
                     if ("assword:" in chunk2 or "Password:" in chunk2) and not any(
                         x in chunk2 for x in ("Type the hot key", "cli->", "login:", "Username:")
                     ):
                         msg = (f"[bold red][!!!][/] {alias} (Opt {key}): 'Vertiv Connect Pass' bi TU CHOI 2 lan lien tiep "
                                f"khi connect toi '{t_desc}' - kiem tra lai muc [y] trong Cai dat!")
                         log_verify(msg)
-                        debug_dump(cfg, alias, key, "B2c-PASSWORD-REJECTED", out, extra="(v_pass sai hoac thiet bi tu choi)")
+                        _dbg("B2c-PASSWORD-REJECTED", out, extra="(v_pass sai hoac thiet bi tu choi)")
                         password_rejected = True
                 
             # Đọc nốt dòng chứa Hot key để bỏ qua ký tự '>' trong <CTRL>Z
             if "Type the hot key" in out:
                 chunk = _read(["\n"], timeout=2)
                 out += chunk
-                debug_dump(cfg, alias, key, "B2b-hotkey-tail", chunk)
+                _dbg("B2b-hotkey-tail", chunk)
 
             # Neu da xac nhan mat khau bi tu choi 2 lan o tren, bo qua toan bo
             # cac buoc cho/doc them ben duoi (khong con gi de doc nua, chi ton
@@ -957,7 +1049,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 #     duoc gi them.
                 chunk = _read(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=4)
                 out += chunk
-                debug_dump(cfg, alias, key, "B3-banner-read", chunk)
+                _dbg("B3-banner-read", chunk)
 
                 # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm để hiện prompt
                 if "Data Buffering Suspended" in out and not any(x in out for x in (">", "#", "login:", "Username:")):
@@ -968,7 +1060,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                     _write_no_drain("") # Gui phím Enter thứ hai
                     chunk = _read(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=5)
                     out += chunk
-                    debug_dump(cfg, alias, key, "B3c-after-buffering-wake", chunk)
+                    _dbg("B3c-after-buffering-wake", chunk)
 
                 # Buoc 4: CHI go Enter "danh thuc" neu sau hotkey banner Vertiv (<CTRL>Z)
                 # van CHUA thay bat ky dau hieu prompt/dang nhap nào của máy đích.
@@ -989,19 +1081,40 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                     _write_no_drain("") # Gui phim Enter thu hai
                     chunk = _read(["login:", "Username:", "Password:", "Login authentication", ">", "#", "cli->", "%"], timeout=5)
                     out += chunk
-                    debug_dump(cfg, alias, key, "B4-wake-enter", chunk)
+                    _dbg("B4-wake-enter", chunk)
                 else:
-                    debug_dump(cfg, alias, key, "B4-SKIPPED", "(da thay prompt/login sau banner, khong go Enter)")
+                    _dbg("B4-SKIPPED", "(da thay prompt/login sau banner, khong go Enter)")
             
-        else: 
+        else:
             cmd = f"ssh -l admin {t_ip}" if proto == "ssh" else f"telnet {t_ip} {t_port}"
             _write(cmd)
-            time.sleep(float(cfg.get("verify_wait_after_connect", 1.5))) 
-            _write("") 
-            _write("") 
-            out += _read([">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"], timeout=5)
-        
-        debug_dump(cfg, alias, key, "B5-FULL-OUT-before-trim", out)
+            wait_key = "verify_wait_after_connect_ssh" if proto == "ssh" else "verify_wait_after_connect_telnet"
+            time.sleep(float(cfg.get(wait_key, cfg.get("verify_wait_after_connect", 1.5))))
+
+            read_patterns = [">", "#", "login:", "Username:", "Password:", "Connection refused", "refused", "unknown"]
+            # Doc TRUOC, KHONG go Enter voi - giong pattern da chung minh hoat
+            # dong o nhanh Vertiv ben tren. Truoc day dung _write("") (map toi
+            # session.write(), LUON drain buffer truoc khi gui) ngay tai day
+            # truoc khi doc - neu data that (banner/prompt) da ve dung luc
+            # nhung chua kip doc, no bi XOA MAT boi drain, gay TIMEOUT gia du
+            # thiet bi van phan hoi binh thuong (pivot thu cong van vao duoc).
+            chunk = _read(read_patterns, timeout=5)
+            out += chunk
+            _dbg("C1-after-connect-wait", chunk)
+
+            # Chi "danh thuc" (Enter, KHONG DRAIN) + retry 1 lan voi timeout
+            # dai hon (gap doi) NEU lan doc dau tien rong hoac khong khop bat
+            # ky pattern nao - tranh 1 lan doc cham/rong la TIMEOUT vinh vien
+            # trong ca chu ky, ma khong lam cham cac truong hop da co data ngay.
+            if not chunk or not any(p in chunk for p in read_patterns):
+                _write_no_drain("")
+                time.sleep(0.3)
+                _write_no_drain("")
+                chunk2 = _read(read_patterns, timeout=10)
+                out += chunk2
+                _dbg("C2-retry-after-wake", chunk2)
+
+        _dbg("B5-FULL-OUT-before-trim", out)
 
         # Buoc 4: Thoat phien ket noi ve lai Vertiv CLI
         try:
@@ -1040,7 +1153,7 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                     idx_nl = out.find("\n", idx)
                     out = out[idx_nl:] if idx_nl != -1 else out[idx:]
 
-        debug_dump(cfg, alias, key, "B6-FINAL-OUT-after-trim", out)
+        _dbg("B6-FINAL-OUT-after-trim", out)
         return out
 
     def clear_line_via_oob(t_port, v_vendor):
@@ -1059,69 +1172,31 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
             reset_session()
             return False
 
-    def extract_hostname(output: str) -> str:
-        output_clean = _ANSI_STRIP_RE.sub('', output)
-        output_clean = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]', '', output_clean)
-        
-        auth_seen = False
-        lines = [l.strip() for l in output_clean.splitlines() if l.strip()]
-        
-        for line in reversed(lines):
-            # Bo qua cac dong lenh hoac thong bao ket noi cua Vertiv/Network/OS
-            if any(x in line for x in ["telnet ", "ssh ", "Trying ", "Open", "Connection refused", "disconnect", "clear line", "Type the hot key", "suspend the connection", "Sharing connection", "cli->", "Data Buffering Suspended", "{master"]): 
-                continue
-            
-            # 1. Kiem tra Prompt truc tiep (VD: HCM-ROUTER-01> hoac HCM-ROUTER-01#)
-            m_prompt = _HOSTNAME_PROMPT_RE.search(line)
-            if m_prompt: 
-                h = m_prompt.group(1)
-                # Loai tru prompt noi bo cua Vertiv
-                if h.lower() not in ["cli", "cli-", "access", "admin", "root"]: 
-                    return h
-
-            # 2. Kiem tra dang nhap kieu Unix/Linux (hostname login:)
-            m_login = _HOSTNAME_LOGIN_RE.search(line)
-            if m_login: return m_login.group(1)
-            
-            # 3. Kiem tra đi kèm he dieu hanh FreeBSD / Linux
-            m_bsd = _HOSTNAME_BSD_RE.search(line)
-            if m_bsd: return m_bsd.group(1)
-                
-            m_bsd_new = re.search(r'(?:FreeBSD|Linux|NetBSD|OpenBSD).*?\(([A-Za-z0-9_\-\.]+)\)', line, re.IGNORECASE)
-            if m_bsd_new: return m_bsd_new.group(1)
-            
-            # 4. Kieu Banner HW (Huawei): *    HOSTNAME    *
-            m_hw = re.search(r'^\*\s+([A-Za-z0-9_\-\.]+)\s+\*$', line)
-            if m_hw:
-                h = m_hw.group(1)
-                if h.lower() not in ["warning", "note", "important", "notice"]: 
-                    return h
-                    
-            if re.search(r'Username:|Password:|login:|Login authentication', line, re.IGNORECASE): 
-                auth_seen = True
-                
-        return "AUTH_REQUIRED" if auth_seen else None
-
     for key, opt in options.items():
+        if time.time() > _verify_deadline:
+            print_fn(f"[yellow][!][/] {alias}: Da vuot qua max_verify_duration ({max_duration:.0f}s) - "
+                      f"dung Deep Verify som, cac option con lai giu ket qua Verify gan nhat (neu co).")
+            break
+
         desc = opt.get("description", "")
         if not desc: continue
         target_ip, port, proto, vendor = opt.get("ip"), opt.get("port", 23), opt.get("protocol", "telnet"), opt.get("vendor", "cisco")
         act_host, note_parts = None, []
-        
+
         is_live = (live_debug_opt == key)
         lp = print_fn if is_live else None
 
         try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor, desc, key=key, live_print=lp))
-        except Exception: pass
-            
+        except Exception as e: note_parts.append(f"Exception: {type(e).__name__}: {e}")
+
         if not act_host:
             if port > 2000 and vendor != "vertiv":
                 print_fn(f"[yellow][!][/] {alias} (Opt {key}): Dang clear line {port - 2000}...")
                 note_parts.append(f"Da thu clear line {port - 2000}")
                 if clear_line_via_oob(port, vendor):
-                    time.sleep(2) 
+                    time.sleep(2)
                     try: act_host = extract_hostname(check_port_via_oob(target_ip, port, proto, vendor, desc, key=key, live_print=lp))
-                    except Exception: pass
+                    except Exception as e: note_parts.append(f"Exception: {type(e).__name__}: {e}")
                 else: note_parts.append("Khong clear duoc line")
             else: note_parts.append("Port la Direct/Vertiv, bo qua clear line")
 
@@ -1448,7 +1523,7 @@ def run_daemon(cfg, config_path=None):
                         _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
                         print_diff(baseline, snapshot)
                         save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
-                        log_baseline_change(alias, ip, "CAP NHAT BASELINE")
+                        log_baseline_change(alias, ip, "CAP NHAT BASELINE", diff=diff_options(baseline, snapshot))
                         _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
                         live.start()
                     pending_verifies.append((alias, ip, snapshot, pfx))
@@ -1538,7 +1613,7 @@ def scan_specific_devices(cfg):
             _con.rule(f"[bold red]CANH BAO  {alias} ({ip}) KHAC baseline![/]", style="red")
             print_diff(baseline, snapshot)
             save_options(cfg["baseline_db"], "baseline_menu", ip, menu_name, hostname, snapshot)
-            log_baseline_change(alias, ip, "CAP NHAT BASELINE")
+            log_baseline_change(alias, ip, "CAP NHAT BASELINE", diff=diff_options(baseline, snapshot))
             _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
         pending_verifies.append((alias, ip, snapshot, pfx))
 
