@@ -2,15 +2,18 @@
 oob_lib.py
 
 Thu vien dung chung: ket noi SSH (uu tien) hoac Telnet (du phong) toi thiet bi
-Cisco IOS, dang nhap, lay va parse cau hinh "menu OOB_MENU" de doi chieu (verify)
-voi baseline da luu. CHI DOC (read-only) - khong con chuc nang day/sua cau hinh
-nguoc lai thiet bi.
+Cisco IOS/Vertiv ACS, dang nhap va lay hostname (fetch_hostname). Cung cung cap
+push_menu_descriptions()/push_vertiv_port_names() de sua mo ta port khi Deep
+Verify phat hien sai lech (xem push_live_mode trong oob_monitor.py de biet co
+che dry-run/live). Viec DOC + PARSE cau hinh "menu ..." de doi chieu baseline
+nam trong oob_monitor.py (poll_host_multi(), _parse_cisco_menu_config(),
+_parse_vertiv_acs_show()) - khong con o file nay (da gop, xoa ban parse_menu()/
+poll_host() trung lap o day, xem WP-E(b)).
 
 Tat ca ket noi deu dung connect_auto():
     - Thu SSH truoc (paramiko) -> neu that bai -> fallback Telnet (MiniTelnet).
     - MiniSSH va MiniTelnet co cung interface (read_until / write / close) nen
-      cac ham ben tren (fetch_hostname, detect_and_fetch_menu, ...)
-      khong can biet dang dung protocol nao.
+      cac ham ben tren (fetch_hostname, ...) khong can biet dang dung protocol nao.
 
 Phu thuoc ben ngoai:
     pip install paramiko
@@ -47,17 +50,6 @@ SE   = 240
 # sau 1 ky tu "#" khac hay "----> ") - tuc la dung PROMPT THAT cua thiet bi,
 # khong phai 1 doan text nam giua noi dung dang doc.
 PROMPT_TAIL_RE = re.compile(r'(?:^|[\r\n])[\w\-\.\(\)]{1,64}[>#]\s*$')
-
-TEXT_RE       = re.compile(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)',                          re.IGNORECASE)
-CMD_TELNET_RE = re.compile(r'menu\s+(\S+)\s+command\s+(\S+)\s+telnet\s+(\S+)(?:\s+(\d+))?',  re.IGNORECASE)
-# SSH: bao gom 'ssh -l user IP', 'ssh user@IP', 'ssh IP'
-CMD_SSH_RE    = re.compile(
-    r'menu\s+(\S+)\s+command\s+(\S+)\s+ssh\s+'
-    r'(?:-l\s+\S+\s+|\S+@)?'                            # -l username  hoac  user@
-    r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'           # IP
-    r'(?:\s+(\d+))?',                                   # port tuy chon
-    re.IGNORECASE
-)
 
 
 # ---------------------------------------------------------------------------
@@ -479,30 +471,6 @@ def fetch_hostname(tn):
     return m.group(1) if m else None
 
 
-MENU_NAME_RE = re.compile(r'^\s*menu\s+(\S+)\s+(?:text|command)\b', re.IGNORECASE | re.MULTILINE)
-
-
-def detect_and_fetch_menu(tn):
-    """Tat phan trang, chay 'show running-config | include menu' MOT LAN DUY NHAT:
-    vua lay toan bo cac dong cau hinh 'menu ...' tren thiet bi, vua TU DONG DO ten
-    menu (menu_name) tu dong dau tien khop dang 'menu <ten> text|command ...'.
-
-    Khong con can biet truoc menu_name de build lenh 'section menu <ten>' nhu truoc.
-
-    Tra ve (menu_name, raw_output):
-        menu_name  -> str neu tim thay, None neu thiet bi khong co cau hinh menu nao.
-        raw_output -> toan bo output tho (dung lai duoc cho parse_menu(), khong can
-                       goi show lan thu 2).
-    """
-    tn.write("terminal length 0")
-    tn.read_until("#", timeout=5)
-    tn.write("show running-config | include menu")
-    output = tn.read_until("#", timeout=15)
-    m = MENU_NAME_RE.search(output)
-    menu_name = m.group(1) if m else None
-    return menu_name, output
-
-
 # ---------------------------------------------------------------------------
 # Kiem tra hostname khop description (word-boundary)
 # ---------------------------------------------------------------------------
@@ -522,138 +490,6 @@ def _hostname_matches_desc(hostname: str, description: str) -> bool:
 # Alias cong khai: oob_monitor.py va cac module khac nen dung ham nay (thay vi so
 # sanh chuoi con "in") de tranh nham lan kieu "CTO-SW-02-2" khop nham "CTO-SW-02-20".
 hostname_matches_description = _hostname_matches_desc
-
-
-# ---------------------------------------------------------------------------
-# Parse menu
-# ---------------------------------------------------------------------------
-
-def parse_menu(output: str, menu_name: str) -> dict:
-    """{option_key: {"description":..., "ip":..., "port":..., "protocol":...}}
-    Bo qua option khong co IP dich (vi du 'q'/menu-exit/resume).
-    Ho tro ca lenh telnet lan ssh trong menu."""
-    options = {}
-    
-    # 1. Hàm làm sạch cơ bản (giữ nguyên để tránh lỗi khoảng trắng)
-    def clean_key(raw_key: str) -> str:
-        return raw_key.strip()
-
-    # 2. HÀM MỚI: Hàm Chuẩn hóa để GOM NHÓM (Bóc ngoặc vuông nếu có)
-    # Ví dụ: "[1]" -> "1", "1" -> "1", "[KTHT]" -> "KTHT"
-    def normalize_key(raw_key: str) -> str:
-        k = raw_key.strip()
-        if k.startswith("[") and k.endswith("]"):
-            return k[1:-1]
-        return k
-        
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-
-        # Quét dòng TEXT (Hiển thị)
-        m = TEXT_RE.match(line)
-        if m and m.group(1) == menu_name:
-            original_key = clean_key(m.group(2))
-            norm_key = normalize_key(original_key)
-            
-            # Khởi tạo dict nếu chưa có, lưu lại CẢ original_key để dùng lúc Push
-            if norm_key not in options:
-                options[norm_key] = {"original_key": original_key}
-                
-            options[norm_key]["description"] = m.group(3).strip()
-            # Cập nhật original_key nếu dòng text có ngoặc vuông (ưu tiên lưu key hiển thị)
-            if original_key.startswith("["):
-                options[norm_key]["original_key"] = original_key
-            continue
-
-        # Quét dòng COMMAND TELNET
-        m = CMD_TELNET_RE.match(line)
-        if m and m.group(1) == menu_name:
-            norm_key = normalize_key(clean_key(m.group(2)))
-            
-            if norm_key not in options:
-                options[norm_key] = {"original_key": clean_key(m.group(2))}
-                
-            entry = options[norm_key]
-            entry["ip"]       = m.group(3)
-            entry["port"]     = int(m.group(4)) if m.group(4) else 23
-            entry["protocol"] = "telnet"
-            continue
-
-        # Quét dòng COMMAND SSH
-        m = CMD_SSH_RE.match(line)
-        if m and m.group(1) == menu_name:
-            norm_key = normalize_key(clean_key(m.group(2)))
-            
-            if norm_key not in options:
-                options[norm_key] = {"original_key": clean_key(m.group(2))}
-                
-            entry = options[norm_key]
-            entry["ip"]       = m.group(3)
-            entry["port"]     = int(m.group(4)) if m.group(4) else 22
-            entry["protocol"] = "ssh"
-
-    # Trả về dict, LỌC BỎ CÁC OPTION KHÔNG CÓ IP (như exit, resume)
-    # SỬ DỤNG original_key LÀM KEY CHÍNH CỦA DICTIONARY ĐỂ TOOL HIỂN THỊ ĐÚNG NGOẶC VUÔNG
-    final_options = {}
-    for norm_k, v in options.items():
-        if "ip" in v:
-            final_key = v.get("original_key", norm_k)
-            # Dọn dẹp original_key ra khỏi value dict trước khi trả về (cho sạch data)
-            if "original_key" in v:
-                del v["original_key"]
-            final_options[final_key] = v
-            
-    return final_options
-
-
-# ---------------------------------------------------------------------------
-# Poll va Push
-# ---------------------------------------------------------------------------
-
-def poll_host(host, telnet_port, username, password, enable_password,
-              menu_name=None, ssh_port=22, timeout=10, debug=False):
-    """Ket noi (SSH-first, fallback Telnet), lay hostname va parse menu cua 1 thiet bi OOB.
-
-    menu_name:
-        - None (mac dinh) -> TU DONG DO ten menu tren thiet bi bang
-          'show running-config | include menu' (xem detect_and_fetch_menu()).
-        - Truyen mot chuoi cu the -> ep dung ten do de loc, bo qua ten tu dong do
-          duoc (huu ich neu thiet bi co nhieu menu va chi muon lay 1 menu cu the).
-
-    Tra ve (hostname, menu_name_da_dung, options). menu_name_da_dung co the None
-    neu khong tim thay cau hinh menu nao tren thiet bi.
-    Luon dong ket noi khi xong. debug=True: in raw output truoc khi parse de chan doan loi.
-    """
-    tn = connect_auto(host, ssh_port, telnet_port,
-                      username, password, enable_password, timeout=timeout)
-    try:
-        hostname = fetch_hostname(tn)
-        detected_name, raw = detect_and_fetch_menu(tn)
-        effective_name = menu_name or detected_name
-
-        if debug:
-            print(f"\n    ===== [DEBUG] RAW OUTPUT TU SSH/TELNET ({len(raw)} chars) =====")
-            # In repr() de thay ro escape codes, \r, \n, ky tu an
-            for i, chunk in enumerate([raw[j:j+120] for j in range(0, min(len(raw), 1200), 120)]):
-                print(f"    {repr(chunk)}")
-            if len(raw) > 1200:
-                print(f"    ... (con {len(raw)-1200} chars nua, bi cat bot)")
-            print(f"    ===== [DEBUG] KET THUC RAW OUTPUT =====\n")
-            print(f"    [DEBUG] menu_name tu dong do duoc: {detected_name!r} (dang dung: {effective_name!r})")
-
-        options = parse_menu(raw, effective_name) if effective_name else {}
-
-        if debug:
-            print(f"    [DEBUG] parse_menu -> {len(options)} option(s): {list(options.keys())}")
-
-        return hostname, effective_name, options
-    finally:
-        try:
-            tn.write("exit")
-        except OSError:
-            pass
-        tn.close()
-
 
 
 def fetch_hostname_via_auto(host, ssh_port, telnet_port,

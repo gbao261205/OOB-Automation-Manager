@@ -61,9 +61,10 @@ Tài liệu này mô tả chi tiết tất cả các endpoint (API) hiện có t
 
 ### `[GET, POST] /api/config`
 - **Chức năng**: 
-  - **GET**: Trả về cấu hình hệ thống hiện tại (bỏ qua credentials).
-  - **POST**: Cập nhật cấu hình hệ thống (interval, ports, schedules...).
+  - **GET**: Trả về cấu hình hệ thống hiện tại (bỏ qua `credentials`; các field nhạy cảm như `password`, `enable_password`, `vertiv_connect_password`, `vertiv_admin_password` trả về `"******"` nếu đã đặt, không trả mật khẩu thật).
+  - **POST**: Cập nhật cấu hình hệ thống (interval, ports, schedules, `push_live_mode`...). Gửi lại đúng chuỗi `"******"` cho field nhạy cảm sẽ được bỏ qua (giữ nguyên giá trị cũ), không ghi đè bằng chuỗi mask.
 - **Payload (POST)**: JSON các khóa cần cập nhật.
+- **Lưu ý an toàn**: `push_live_mode` (mặc định `false`) quyết định `/api/action {"action":"push"}` và `/api/revert` gửi lệnh thật hay chỉ mô phỏng — xem mục 4.
 
 ### `[GET, POST, DELETE] /api/credentials`
 - **Chức năng**: Quản lý danh sách tài khoản SSH/Telnet chung.
@@ -71,10 +72,16 @@ Tài liệu này mô tả chi tiết tất cả các endpoint (API) hiện có t
   - **POST**: Thêm tài khoản mới.
   - **DELETE**: Xóa tài khoản theo `index`.
 
-### `[POST, DELETE] /api/device`
+### `[POST, PUT, DELETE] /api/device`
 - **Chức năng**: Quản lý danh sách IP OOB.
-  - **POST**: Thêm một OOB mới (Payload: `ip`, `alias`).
+  - **POST**: Thêm một OOB mới (Payload: `ip`, `alias`). IP được validate định dạng, trả `400` nếu sai.
+  - **PUT**: Sửa alias và/hoặc IP của 1 thiết bị đã có, **giữ nguyên vị trí dòng** trong file danh sách (Payload: `old_ip` *, `alias`, `new_ip` — 2 field sau optional). Trả `400` nếu `old_ip` không tồn tại, `new_ip` sai định dạng, hoặc `new_ip` trùng 1 dòng khác.
   - **DELETE**: Xóa một OOB khỏi danh sách (Payload: `ip`).
+
+### `[GET] /api/daemon-status`
+- **Chức năng**: Đọc trạng thái tiến trình `--daemon` CLI thật (qua file `daemon.pid`, không phải task tự tạo trên Web) — khác với sidebar cũ vốn chỉ đếm task Web tự khởi tạo.
+- **Response**: `{"status": "running"|"stale"|"unknown", "pid": int|null, "age_seconds": number|null}`.
+- **Không yêu cầu đăng nhập** (read-only, giống `/api/stats`).
 
 ### `[POST] /api/import`
 - **Chức năng**: Nhập danh sách IP hàng loạt từ file Excel.
@@ -95,13 +102,17 @@ Tài liệu này mô tả chi tiết tất cả các endpoint (API) hiện có t
   }
   ```
 - **Response**: JSON chứa `task_id`.
+- **`action=push`**: nếu cấu hình `push_live_mode=false` (mặc định), lệnh push CHỈ MÔ PHỎNG — không kết nối thiết bị, Baseline không đổi, push-log ghi tiêu đề `[MO PHONG]`. Chỉ khi `push_live_mode=true`, lệnh được gửi thật, Baseline chỉ cập nhật nếu thành công, và tự động Re-Verify ngay sau đó.
 
 ### `[POST] /api/revert`
-- **Chức năng**: Thực thi lệnh Revert lại cấu hình Menu từ một file log Push thất bại trước đó.
+- **Chức năng**: Thực thi lệnh Revert lại cấu hình Menu (mô tả cũ) từ một file log Push trước đó, dựa trên các dòng `REVERT CMD:` trong file.
 - **Payload**: JSON
   ```json
   {"filename": "Push_HCM-OOB_2026...log"}
   ```
+- **Ràng buộc**: 
+  - Trả về `400` nếu file push-log là push MÔ PHỎNG (`[MO PHONG]`) — không có gì để revert vì chưa từng gửi gì thật tới thiết bị.
+  - Cũng tuân theo `push_live_mode` giống `action=push`: tắt thì chỉ mô phỏng revert, bật mới gửi lệnh thật.
 
 ### `[POST] /api/live-debug`
 - **Chức năng**: Thực thi lệnh Verify chuyên sâu 1 Option cụ thể với kết nối trực tiếp (Live Debug) qua giao thức SSE.

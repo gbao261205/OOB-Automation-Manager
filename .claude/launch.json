@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "oob-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["oob_web.py"],
+      "port": 5000
+    }
+  ]
+}

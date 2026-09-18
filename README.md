@@ -163,7 +163,7 @@ Daemon pivot vào từng port console, lấy hostname thực để kiểm tra de
 
 - `[b]` = Bật/tắt chạy Verify ngầm tự động.
 - `[v]`/`[d]` = tần suất/lịch **pivot vật lý** vào từng port console để lấy hostname thực.
-- Đây là **2 luồng hoàn toàn độc lập**, chạy song song trên 2 thread khác nhau, mỗi luồng có lịch chạy riêng (interval/daily/weekly), không ảnh hưởng lẫn nhau.
+- Đây là **2 luồng độc lập theo từng thiết bị** (per-host lock, không còn dùng 1 khoá toàn cục như trước), chạy song song trên 2 thread khác nhau, mỗi luồng có lịch chạy riêng (interval/daily/weekly). Scan thiết bị A và Verify thiết bị B chạy đồng thời thật sự; chỉ khi CÙNG một thiết bị thì Scan và Verify mới chờ nhau (tránh 2 phiên SSH/Telnet cùng lúc tới cùng 1 thiết bị).
 
 > ⚠️ Cả `[s]` (lịch Luồng 1) và `[v]`/`[d]` (lịch Luồng 2) **chỉ có tác dụng khi tiến trình `--daemon` đang chạy**. Ghi các giá trị này qua Web (xem mục 7, tab "Lịch chạy") vẫn lưu được xuống `oob_config.json`, nhưng **không tự kích hoạt bất kỳ vòng lặp nào ở phía Web** — xem mục 8.1.
 
@@ -212,13 +212,14 @@ Xuất toàn bộ dữ liệu menu ra `reports/OOB_Menu_Report_YYYYMMDD_HHMMSS.x
 
 ### `[7]` Quét kiểm tra cấu hình / `[8]` Deep Verify vật lý (CLI)
 
-Giống hệt logic mô tả ở mục 7 (Web) — cả 2 nơi dùng chung hàm trong `oob_monitor.py`/`oob_lib.py`. Khác biệt duy nhất: khi chạy tay ở CLI, bước xác nhận ghi baseline mới hoặc push sửa mô tả **luôn hỏi `y/n` ngay trên terminal**; khi chạy tự động trong `--daemon`, hành vi tuân theo cờ `auto_push_desc`.
+Giống hệt logic mô tả ở mục 7 (Web) — cả 2 nơi dùng chung hàm trong `oob_monitor.py`/`oob_lib.py`. Push **không bao giờ chạy tự động không người xác nhận**: `--daemon` chỉ Scan/Verify và cảnh báo `CANH BAO`, không tự push — bạn phải chủ động vào CLI `[8]` (trả lời `y/n`) hoặc bấm nút Push trên Web.
 
 **Nguyên tắc an toàn của tính năng push (áp dụng cho cả CLI và Web):**
-- Chỉ sửa đúng 1 dòng `menu <tên> text <key> <mô tả mới>` của option đang sai lệch.
-- Không bao giờ tự chạy `write memory` — chỉ sửa running-config.
-- Luôn ghi log vào `push-logs/` và verify lại sau khi sửa.
-- **Thiết bị Vertiv ACS chưa được hỗ trợ Push** — Deep Verify vẫn chạy và báo cáo bình thường trên Vertiv, nhưng chương trình chỉ cảnh báo chứ không tự sửa.
+- Chỉ sửa đúng 1 dòng `menu <tên> text <key> <mô tả mới>` của option đang sai lệch (Cisco) hoặc `port_name` (Vertiv).
+- Không bao giờ tự chạy `write memory`/`save` — chỉ sửa running-config (Cisco) hoặc cấu hình đang chạy (Vertiv, lệnh `save` của Vertiv chỉ áp dụng thay đổi, không phải ghi vĩnh viễn kiểu Cisco).
+- Luôn ghi log vào `push-logs/` (kèm dòng `REVERT CMD:` để phục hồi) và verify lại sau khi sửa.
+- **Cờ `push_live_mode` (mặc định `TẮT`) quyết định Push/Revert có gửi lệnh THẬT hay chỉ MÔ PHỎNG**: khi tắt (mặc định), Push/Revert chỉ in ra lệnh dự định gửi, không kết nối gì tới thiết bị, và Baseline **không** bị cập nhật — an toàn để thử trước. Khi bật, lệnh được gửi thật, Baseline chỉ cập nhật nếu push thành công, và bước Re-Verify tự động chạy ngay sau đó để xác nhận. Bật ở CLI qua Cài đặt hệ thống `[pl]`, hoặc ở Web qua tab Cài đặt. **Khuyến nghị bật trên 1 thiết bị không phải production trước, theo dõi vài ngày, rồi mới mở rộng.**
+- **Vertiv ACS**: code push thật (`set port_name=...` + `save`) đã có sẵn — chỉ cần cấu hình `Vertiv Admin Username/Password` và bật `push_live_mode` là hoạt động, không còn là tính năng "chưa hỗ trợ".
 
 ## 7. Web Dashboard (`oob_web.py`) — những gì ĐANG CÓ
 
@@ -325,18 +326,18 @@ Web chỉ là 1 tiến trình `python oob_web.py` duy nhất — không có khá
 |---|---|---|
 | Scan cấu hình (1 lần, thủ công) | ✅ `[7]`, 1 hoặc nhiều IP | ✅ nút Scan, chỉ định 1 IP |
 | Deep Verify (1 lần, thủ công) | ✅ `[8]` | ✅ nút Verify |
-| Push sửa mô tả (1 lần, thủ công) | ✅ theo sau `[8]`, hỏi xác nhận | ✅ nút Push, không hỏi xác nhận trên web, chỉ định 1 IP |
+| Push sửa mô tả (1 lần, thủ công) | ✅ theo sau `[8]`, hỏi xác nhận | ✅ nút Push, có hỏi xác nhận kèm chế độ MÔ PHỎNG/THẬT, chỉ định 1 IP |
 | **Tự động lặp lại theo chu kỳ/lịch (không cần người bấm)** | ✅ `--daemon`, 2 luồng độc lập | ❌ **không có** |
-| Trạng thái Daemon thật (`daemon.pid`) | ✅ | ❌ không đọc file này |
+| Trạng thái Daemon thật (`daemon.pid`) | ✅ | ✅ qua `GET /api/daemon-status`, hiện ở sidebar |
 | Toggle "Tự động Verify ngầm" có tác dụng | ✅ Đã khắc phục | ✅ Đã khắc phục |
 | Import Excel — đọc file `.xlsx` thật | ✅ | ✅ |
 | Export Excel | ✅ `[e]`, 3 sheet (Chi tiết/Tóm tắt/Cảnh báo) | ✅ 1 sheet "Chi tiet OOB" |
 | Xem lịch sử log Verify/Push | ✅ `[9]` (Verify gần nhất) | ✅ xem được nhiều file, cả 2 loại log |
 | Revert theo log Push | ❌ không có sẵn trong menu CLI | ✅ có nút Revert |
-| Sửa alias thiết bị đã thêm | có thể xóa/thêm lại | ❌ chỉ Thêm/Xóa |
+| Sửa alias/IP thiết bị đã thêm | có thể xóa/thêm lại (mất vị trí dòng gốc) | ✅ nút Sửa, giữ nguyên vị trí dòng (`PUT /api/device`) |
 | Đăng nhập / phân quyền Guest-Admin | không áp dụng (CLI chạy local) | ✅ có |
 | Multi-account (tài khoản dự phòng) | ✅ | ✅ |
-| Push cho thiết bị Vertiv | ❌ chưa hỗ trợ | ❌ chưa hỗ trợ (giống CLI) |
+| Push cho thiết bị Vertiv | ✅ (cần `push_live_mode` + Vertiv Admin cred) | ✅ (giống CLI) |
 
 ## 9. Log
 
@@ -369,7 +370,7 @@ Xem nhanh log Verify gần nhất ngay trong menu CLI qua mục **[9]**, hoặc 
 
 7. Khởi động và **giữ chạy liên tục** `python oob_monitor.py --daemon` (nên chạy dưới dạng service/systemd/Task Scheduler/tmux để không bị tắt khi đóng terminal hoặc mất kết nối SSH tới máy chủ). Đây là tiến trình duy nhất tự lặp lại theo lịch đã đặt ở bước 4 — nếu không có tiến trình này chạy nền, sẽ **không có gì tự động xảy ra**, bất kể bạn có mở Web hay không.
 8. (Tuỳ chọn, không bắt buộc) Chạy thêm `python oob_web.py` song song **chỉ để xem** dashboard/log/báo cáo qua trình duyệt, hoặc để thao tác thủ công khi cần gấp (ví dụ vừa thay dây console, muốn Verify ngay 1 thiết bị mà không chờ tới lịch tiếp theo của daemon).
-9. Khi `--daemon` phát hiện `CANH BAO` (Deep Verify sai lệch) và `auto_push_desc` đang bật → daemon tự sửa mô tả, ghi log vào `push-logs/`, tự verify lại. Nếu tắt `auto_push_desc`, daemon chỉ cảnh báo — bạn cần vào CLI `[8]` hoặc bấm nút Push trên Web để tự xác nhận sửa.
+9. `--daemon` **không tự push** dù phát hiện `CANH BAO` — daemon chỉ Scan/Verify và ghi cảnh báo. Sửa mô tả sai lệch luôn cần người chủ động vào CLI `[8]` (trả lời `y/n`) hoặc bấm nút Push trên Web, và chỉ thật sự gửi lệnh tới thiết bị nếu `push_live_mode` đang bật (mặc định tắt, chỉ mô phỏng).
 10. Định kỳ (tuần/tháng) vào CLI `[e]` hoặc Web → Import/Export → "Tải về Excel" để lưu báo cáo tổng hợp, đối chiếu với đội vận hành.
 
 ### 11.3. Nếu chỉ muốn dùng Web (không chạy `--daemon`)
@@ -378,15 +379,15 @@ Vẫn hoạt động được, nhưng cần hiểu rõ giới hạn: **không c�
 
 11. Người trực chủ động mở Web, thực hiện **Scan CONFIG** cho từng thiết bị theo lịch làm việc thực tế của mình (ví dụ đầu giờ mỗi ca trực).
 12. Bấm **DEEP VERIFY** khi cần xác minh vật lý (sau khi đấu lại dây, sau bảo trì phòng máy, hoặc theo lịch kiểm tra định kỳ tự quy định bằng tay).
-13. Khi thấy `CANH BAO`, bấm **PUSH CONFIG** cho thiết bị đó để tự sửa mô tả sai lệch — nút Push trên Web **không hỏi xác nhận lại**, sửa ngay khi bấm (tính năng tự động chạy tất cả đã bị khóa).
+13. Khi thấy `CANH BAO`, bấm **PUSH CONFIG** cho thiết bị đó để sửa mô tả sai lệch — nút Push trên Web **có hỏi xác nhận**, hiển thị rõ chế độ MÔ PHỎNG (mặc định, an toàn) hay THẬT (chỉ khi đã bật `push_live_mode` trong Cài đặt).
 14. Nếu sửa nhầm hoặc cần khôi phục mô tả cũ, vào trang **Logs → push-logs**, mở log lần Push liên quan, bấm **Revert**.
 
 > Cách dùng này phù hợp cho môi trường có người trực theo dõi thường xuyên; nếu cần giám sát 24/7 không phụ thuộc con người, bắt buộc quay lại mục 11.2 (chạy `--daemon`).
 
 ## 12. Giới hạn hiện tại (áp dụng chung, ngoài mục 8)
 
-- **Thiết bị Vertiv ACS chưa hỗ trợ tính năng Push Config** ở cả CLI lẫn Web. Deep Verify vẫn chạy và báo cáo `CANH BAO` bình thường trên Vertiv, nhưng không tự sửa description cho thiết bị loại này.
-- Lịch `daily`/`weekly` (cả `[s]` và `[d]`, dù đặt qua CLI hay Web) hiện chỉ hỗ trợ mốc **giờ cố định trong ngày, hoặc thứ + giờ cố định trong tuần**. Chưa hỗ trợ lịch theo ngày cụ thể trong tháng (VD "ngày 15 hàng tháng") hay một mốc ngày/tháng/năm duy nhất (chạy 1 lần rồi thôi).
+- Push/Revert mặc định `push_live_mode=False` (chỉ MÔ PHỎNG, không gửi gì tới thiết bị, Baseline không đổi) — phải chủ động bật trong Cài đặt mới push/revert thật. Khuyến nghị thử trên thiết bị không phải production trước.
+- Lịch `[s]`/`[d]` (cả CLI và Web) hỗ trợ 5 chế độ: `interval` (lặp theo chu kỳ), `daily` (giờ cố định), `weekly` (thứ + giờ cố định), `monthly` (ngày cố định trong tháng + giờ — nếu tháng đó không đủ ngày, ví dụ chọn 31 nhưng tháng chỉ có 28/30, tự động chạy vào **ngày cuối cùng** của tháng đó), và `once` (đúng 1 mốc ngày/giờ duy nhất, hết hạn thì daemon tự rơi về interval dự phòng và ghi log cảnh báo — cần đặt lại lịch khác nếu muốn chạy `once` lần tiếp theo).
 - 2 tiến trình `--menu` và `--daemon` (khi chạy chế độ 3) không chia sẻ bộ nhớ — đổi cấu hình ở cửa sổ Menu chỉ có hiệu lực ngay với 2 mục lịch chạy (`[s]`, `[d]`), các mục còn lại cần khởi động lại `--daemon` mới nhận.
 - `oob_web.py` là 1 tiến trình hoàn toàn riêng biệt với `--daemon`/`--menu` — cũng không chia sẻ bộ nhớ, chỉ chia sẻ file config/DB trên đĩa. Đổi cấu hình trên Web ghi xuống `oob_config.json` như CLI, áp dụng đúng quy tắc trên nếu có `--daemon` đang chạy song song.
-- `oob_web.py` mặc định tự sinh `SECRET_KEY` ngẫu nhiên mỗi lần khởi động (mất session khi restart) và hiển thị mật khẩu thiết bị dạng chữ thường trong form Settings — xem lưu ý bảo mật ở mục 7.
+- `oob_web.py` mặc định tự sinh `SECRET_KEY` ngẫu nhiên mỗi lần khởi động (mất session khi restart) — xem lưu ý bảo mật ở mục 7. `oob_config.json` được mã hoá tại chỗ (field credential) và `GET /api/config` trả `"******"` cho field nhạy cảm thay vì mật khẩu thật.

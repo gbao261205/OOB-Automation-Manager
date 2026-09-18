@@ -161,7 +161,7 @@ def _run_scan(tid, target_ip=None):
                 pfn("  [OK] " + alias + ": Cap nhat baseline (" + str(len(snap)) + " option).")
             else: pfn("  [OK] " + alias + ": Khop baseline.")
             
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("scan_max_workers", 10)) as ex:
             ex.map(_scan_single, hosts)
         pfn("[OK] Hoan thanh SCAN!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
@@ -179,7 +179,7 @@ def _run_verify(tid, target_ip=None):
             pfn("  [VERIFY] " + alias + " (" + ip + ")")
             oob_monitor.run_deep_verify(cfg, alias, ip, bl, print_fn=pfn)
             
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("verify_max_workers", 10)) as ex:
             ex.map(_verify_single, hosts)
         pfn("[OK] Hoan thanh VERIFY!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
@@ -200,7 +200,7 @@ def _run_push(tid, target_ip=None):
                 oob_monitor.process_push_and_reverify(cfg, alias, ip, bl, results, print_fn=pfn)
             else: pfn("  [OK] " + alias + ": Khong co sai lech.")
             
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("verify_max_workers", 10)) as ex:
             ex.map(_push_single, hosts)
         pfn("[OK] Hoan thanh PUSH!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
@@ -350,6 +350,11 @@ def api_events():
                 if q in _sse_clients: _sse_clients.remove(q)
     return Response(gen(), mimetype="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
+
+@app.route("/api/daemon-status")
+def api_daemon_status():
+    status, pid, age = oob_monitor._read_daemon_pid_info()
+    return jsonify({"status": status, "pid": pid, "age_seconds": round(age) if age is not None else None})
 
 @app.route("/api/stats")
 def api_stats():
@@ -598,7 +603,10 @@ def api_config():
                "ip_list","baseline_db","snapshot_db","auto_verify","verify_schedule_mode",
                "verify_schedule_time","verify_schedule_weekday","scan_schedule_mode",
                "scan_schedule_time","scan_schedule_weekday","verify_wait_after_connect",
-               "verify_wait_after_connect_telnet","verify_wait_after_connect_ssh","max_verify_duration"]
+               "verify_wait_after_connect_telnet","verify_wait_after_connect_ssh","max_verify_duration",
+               "push_live_mode","scan_max_workers","verify_max_workers",
+               "verify_schedule_day_of_month","verify_schedule_once_datetime",
+               "scan_schedule_day_of_month","scan_schedule_once_datetime"]
     body = request.json or {}
     for k in allowed:
         if k not in body: continue
@@ -607,6 +615,13 @@ def api_config():
         # luu nguyen" (khong sua) - bo qua de khong ghi de mat khau that bang
         # chuoi "******" van chuong.
         if k in oob_monitor._SENSITIVE_CONFIG_FIELDS and v == _CONFIG_MASK: continue
+        # push_live_mode la cong tac an toan cho phep gui lenh THAT toi thiet
+        # bi mang - bat buoc phai la boolean JSON thuc su. Neu chi kiem tra
+        # truthy (vd "not cfg.get(...)") thi mot chuoi KHONG RONG nhu
+        # "false" van la truthy trong Python -> gui {"push_live_mode":"false"}
+        # se VO TINH BAT che do that, nguoc voi y dinh ro rang cua nguoi goi.
+        # Tu choi thang (fail-closed) neu khong phai bool, thay vi doan y.
+        if k == "push_live_mode" and not isinstance(v, bool): continue
         cfg[k] = v
     oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
     return jsonify({"status":"ok"})
@@ -627,14 +642,25 @@ def api_creds():
     cfg["credentials"] = creds; oob_monitor.save_config(oob_monitor.CONFIG_FILE_DEFAULT, cfg)
     return jsonify({"status":"ok"})
 
-@app.route("/api/device", methods=["POST","DELETE"])
+@app.route("/api/device", methods=["POST","PUT","DELETE"])
 @login_required
 def api_device():
     cfg = _cfg()
     if request.method == "POST":
         d = request.json or {}; ip = d.get("ip","").strip(); alias = d.get("alias","").strip() or None
-        if not ip: return jsonify({"status":"error"}),400
+        if not ip: return jsonify({"status":"error","msg":"Thieu IP"}),400
+        if not oob_monitor._IP_RE.match(ip): return jsonify({"status":"error","msg":f"IP '{ip}' khong hop le"}),400
         oob_monitor.add_ip(cfg["ip_list"],ip,alias); return jsonify({"status":"ok"})
+    if request.method == "PUT":
+        d = request.json or {}
+        old_ip = d.get("old_ip","").strip()
+        new_alias = d.get("alias","").strip() or None
+        new_ip = d.get("new_ip","").strip() or None
+        if not old_ip: return jsonify({"status":"error","msg":"Thieu old_ip"}),400
+        if new_ip and not oob_monitor._IP_RE.match(new_ip): return jsonify({"status":"error","msg":f"IP moi '{new_ip}' khong hop le"}),400
+        ok, msg = oob_monitor.update_ip(cfg["ip_list"], old_ip, new_alias, new_ip)
+        if not ok: return jsonify({"status":"error","msg":msg}),400
+        return jsonify({"status":"ok"})
     ip = (request.json or {}).get("ip","").strip()
     oob_monitor.remove_ip(cfg["ip_list"],ip); return jsonify({"status":"ok"})
 
@@ -664,35 +690,49 @@ def api_revert():
     import re
     revert_cmds = []
     oob_ip = None
+    push_mode = None
     try:
         with open(fp, "r", encoding="utf-8") as f:
             for line in f:
-                if "=== PUSH LOG TỰ ĐỘNG:" in line:
+                if "=== PUSH LOG" in line and "===" in line:
                     m = re.search(r'\(([\d\.]+)\)', line)
                     if m: oob_ip = m.group(1)
+                    m_mode = re.search(r'\[(MO PHONG|THAT)\]', line)
+                    if m_mode: push_mode = m_mode.group(1)
                 elif "REVERT CMD:" in line:
                     m = re.search(r'menu\s+(\S+)\s+text\s+(\S+)\s+(.+)', line)
                     if m: revert_cmds.append((m.group(1), m.group(2), m.group(3).strip()))
     except Exception as e: return jsonify({"error":str(e)}), 500
-    
+
     if not oob_ip or not revert_cmds: return jsonify({"error":"Khong the parse revert commands hoac OOB IP tu log"}), 400
-    
+    if push_mode == "MO PHONG":
+        return jsonify({"error": "Log nay la PUSH MO PHONG (chua he gui gi that toi thiet bi) - "
+                                  "khong co gi de revert. Thiet bi van dang giu cau hinh 'Cu' trong log."}), 400
+
     cfg = _cfg()
-    c = oob_monitor.get_all_credentials(cfg)[0] if oob_monitor.get_all_credentials(cfg) else {"username":"","password":"","enable_password":""}
-    
+    # push_live_mode=False (mac dinh) -> Revert cung CHI MO PHONG, giong het
+    # hanh vi Push - truoc day dry_run=True bi hardcode rieng tai day, tach
+    # biet (va khong dong bo) voi cong tac push_live_mode chung.
+    dry_run_flag = not cfg.get("push_live_mode", False)
+    all_creds = oob_monitor.get_all_credentials(cfg, oob_ip)
+    c = all_creds[0] if all_creds else {"username":"","password":"","enable_password":""}
+
     def _run_rev():
         tid = "revert_" + str(int(time.time()))
         _new_task(tid, "revert", oob_ip)
         pfn = _make_print_fn(tid, oob_ip)
-        pfn(f"Bat dau REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
+        pfn(f"Bat dau {'MO PHONG' if dry_run_flag else 'THUC THI THAT'} REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
         try:
-            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10, print_fn=pfn, dry_run=True)
-            pfn("[OK] Hoan thien Revert!")
+            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10, print_fn=pfn, dry_run=dry_run_flag)
+            if dry_run_flag:
+                pfn("[MO PHONG] Da mo phong xong Revert - chua gui gi that toi thiet bi. Bat 'push_live_mode' trong Cai dat de revert that.")
+            else:
+                pfn("[OK] Hoan thien Revert!")
             _finish_task(tid)
         except Exception as e:
             pfn(f"[LOI] Revert that bai: {e}")
             _finish_task(tid, e)
-            
+
     threading.Thread(target=_run_rev, daemon=True).start()
     return jsonify({"status":"ok","msg":f"Da bat dau revert {len(revert_cmds)} muc."})
 
@@ -1191,6 +1231,10 @@ select.fc option{background:#1a1a2e}
           </div>
           <div class="fg"><label class="fl">Tên menu ép dùng (trống = tự dò)</label><input type="text" id="cmno" class="fc" placeholder="OOB_MENU"></div>
           <div class="fg"><div class="tg"><label class="toggle"><input type="checkbox" id="cav"><span class="ts"></span></label><span style="font-size:13.5px">Bật Tự động Verify ngầm</span></div></div>
+          <div class="fg" style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.4);border-radius:var(--r);padding:12px">
+            <div class="tg"><label class="toggle"><input type="checkbox" id="cplm"><span class="ts"></span></label><span style="font-size:13.5px;font-weight:600">⚠️ Push/Revert THẬT (gửi lệnh thật tới thiết bị)</span></div>
+            <div style="font-size:12px;color:var(--text2);margin-top:6px">Mặc định TẮT: Push/Revert chỉ mô phỏng (in ra lệnh, không gửi gì, Baseline không đổi). Chỉ bật khi đã kiểm chứng trên thiết bị lab/không phải production.</div>
+          </div>
           <button class="btn btn-p" onclick="saveCfg()">💾 Lưu cài đặt</button>
         </div>
       </div>
@@ -1207,7 +1251,7 @@ select.fc option{background:#1a1a2e}
         <div style="max-width:600px">
           <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:20px">
             <div class="st mb16">🔍 Lịch Thu thập Config (Scan)</div>
-            <div class="fg"><label class="fl">Chế độ</label><select id="csm" class="fc" onchange="togSF('scan')"><option value="interval">Lặp lại theo chu kỳ</option><option value="daily">Hàng ngày</option><option value="weekly">Hàng tuần</option></select></div>
+            <div class="fg"><label class="fl">Chế độ</label><select id="csm" class="fc" onchange="togSF('scan')"><option value="interval">Lặp lại theo chu kỳ</option><option value="daily">Hàng ngày</option><option value="weekly">Hàng tuần</option><option value="monthly">Hàng tháng</option><option value="once">Chỉ 1 lần</option></select></div>
             <div class="fg"><label class="fl">Chu kỳ scan (giây)</label><input type="number" id="ci" class="fc" placeholder="30"></div>
             <div id="s_tf" style="display:none">
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
@@ -1215,10 +1259,12 @@ select.fc option{background:#1a1a2e}
                 <div class="fg" id="s_wf" style="display:none"><label class="fl">Thứ (mon/tue.../sun)</label><input type="text" id="csw" class="fc" placeholder="mon"></div>
               </div>
             </div>
+            <div class="fg" id="s_mf" style="display:none"><label class="fl">Ngày trong tháng (1-31)</label><input type="number" id="csdm" class="fc" min="1" max="31" placeholder="1"></div>
+            <div class="fg" id="s_of" style="display:none"><label class="fl">Thời điểm chạy (YYYY-MM-DD HH:MM)</label><input type="text" id="csod" class="fc" placeholder="2026-01-15 01:00"></div>
           </div>
           <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:20px">
             <div class="st mb16">⚡ Lịch Deep Verify</div>
-            <div class="fg"><label class="fl">Chế độ</label><select id="cvm" class="fc" onchange="togSF('verify')"><option value="interval">Lặp lại theo chu kỳ</option><option value="daily">Hàng ngày</option><option value="weekly">Hàng tuần</option></select></div>
+            <div class="fg"><label class="fl">Chế độ</label><select id="cvm" class="fc" onchange="togSF('verify')"><option value="interval">Lặp lại theo chu kỳ</option><option value="daily">Hàng ngày</option><option value="weekly">Hàng tuần</option><option value="monthly">Hàng tháng</option><option value="once">Chỉ 1 lần</option></select></div>
             <div class="fg"><label class="fl">Chu kỳ verify (giây)</label><input type="number" id="cvi" class="fc" placeholder="3600"></div>
             <div id="v_tf" style="display:none">
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
@@ -1226,10 +1272,16 @@ select.fc option{background:#1a1a2e}
                 <div class="fg" id="v_wf" style="display:none"><label class="fl">Thứ</label><input type="text" id="cvw" class="fc" placeholder="mon"></div>
               </div>
             </div>
+            <div class="fg" id="v_mf" style="display:none"><label class="fl">Ngày trong tháng (1-31)</label><input type="number" id="cvdm" class="fc" min="1" max="31" placeholder="1"></div>
+            <div class="fg" id="v_of" style="display:none"><label class="fl">Thời điểm chạy (YYYY-MM-DD HH:MM)</label><input type="text" id="cvod" class="fc" placeholder="2026-01-15 01:00"></div>
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">
               <div class="fg"><label class="fl">Chờ sau connect - Telnet (s)</label><input type="number" id="cvwact" class="fc" step="0.5" placeholder="1.5"></div>
               <div class="fg"><label class="fl">Chờ sau connect - SSH (s)</label><input type="number" id="cvwacs" class="fc" step="0.5" placeholder="3.0"></div>
               <div class="fg"><label class="fl">Timeout Verify (s)</label><input type="number" id="cmvd" class="fc" placeholder="300"></div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              <div class="fg"><label class="fl">Số luồng song song - Scan</label><input type="number" id="csmw" class="fc" min="1" max="50" placeholder="10"></div>
+              <div class="fg"><label class="fl">Số luồng song song - Verify</label><input type="number" id="cvmw" class="fc" min="1" max="50" placeholder="10"></div>
             </div>
           </div>
           <button class="btn btn-p" onclick="saveSched()">💾 Lưu lịch</button>
@@ -1260,6 +1312,18 @@ select.fc option{background:#1a1a2e}
       <div class="fg"><label class="fl">Alias (Tên gọi)</label><input type="text" id="nal" class="fc" placeholder="OOB-HCM-01"></div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="cModal('addDev')">Hủy</button><button class="btn btn-p" onclick="addDevice()">Thêm mới</button></div>
+  </div>
+</div>
+
+<div class="mo" id="editDev">
+  <div class="mb">
+    <div class="mh"><div class="mt">✏️ Sửa thiết bị OOB</div><button class="mc" onclick="cModal('editDev')">×</button></div>
+    <div class="mbody">
+      <input type="hidden" id="eOldIp">
+      <div class="fg"><label class="fl">IP Address</label><input type="text" id="eip" class="fc" placeholder="192.168.1.100"></div>
+      <div class="fg"><label class="fl">Alias (Tên gọi)</label><input type="text" id="eal" class="fc" placeholder="OOB-HCM-01"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="cModal('editDev')">Hủy</button><button class="btn btn-p" onclick="saveEditDevice()">Lưu</button></div>
   </div>
 </div>
 
@@ -1423,6 +1487,7 @@ async function loadDash(){
           <button class="btn btn-t btn-sm btn-ic" onclick="runAction('scan','${esc(d.ip)}')" title="Scan">🔍</button>
           <button class="btn btn-a btn-sm btn-ic" onclick="runAction('verify','${esc(d.ip)}')" title="Verify">⚡</button>
           <button class="btn btn-pk btn-sm btn-ic" onclick="runAction('push','${esc(d.ip)}')" title="Push">🚀</button>
+          <button class="btn btn-g btn-sm btn-ic" onclick="openEditDevice('${esc(d.ip)}','${esc(d.alias)}')" title="Sửa">✏️</button>
           <button class="btn btn-d btn-sm btn-ic" onclick="delDev('${esc(d.ip)}')" title="Xóa">🗑</button>
         `;
     }
@@ -1561,7 +1626,11 @@ async function runLiveDebug(ip, optKey) {
 async function runAction(action,ip){
   if(!isAdmin) { toast('Bạn cần Đăng nhập Quản trị để thực hiện lệnh này!','error'); return; }
   const lbl=action.toUpperCase()+' '+(ip||'Tất cả');
-  if(!confirm('Xác nhận chạy lệnh '+lbl+'?'))return;
+  if(action==='push'){
+    const cfg=await fetch('/api/config').then(r=>r.json()).catch(()=>({}));
+    const modeTxt=cfg.push_live_mode?'THẬT - SẼ GỬI LỆNH THẬT TỚI THIẾT BỊ!':'MÔ PHỎNG - an toàn, chỉ ghi log, KHÔNG gửi gì tới thiết bị';
+    if(!confirm('Xác nhận chạy lệnh '+lbl+'?\nChế độ Push hiện tại: '+modeTxt))return;
+  } else if(!confirm('Xác nhận chạy lệnh '+lbl+'?'))return;
   if(curPage!=='verify')sPage('verify');
   const con=document.getElementById('liveCon');
   con.innerHTML+='<div><span class="lts">['+nw()+']</span> <span class="linf">▶ Bắt đầu '+esc(lbl)+'...</span></div>';
@@ -1575,8 +1644,28 @@ async function addDevice(){
   if(!isAdmin) return;
   const ip=document.getElementById('nip').value.trim(),alias=document.getElementById('nal').value.trim();
   if(!ip){toast('Vui lòng nhập IP!','error');return;}
-  await fetch('/api/device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,alias})});
+  const r=await fetch('/api/device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,alias})});
+  const body=await r.json().catch(()=>({}));
+  if(!r.ok){toast(body.msg||'IP không hợp lệ!','error');return;}
   cModal('addDev');toast('Đã thêm '+ip+'!','success');loadDash();
+}
+
+function openEditDevice(ip,alias){
+  if(!isAdmin) return;
+  g('eOldIp').value=ip; g('eip').value=ip; g('eal').value=alias;
+  oModal('editDev');
+}
+
+async function saveEditDevice(){
+  if(!isAdmin) return;
+  const oldIp=g('eOldIp').value, newIp=g('eip').value.trim(), alias=g('eal').value.trim();
+  if(!newIp){toast('Vui lòng nhập IP!','error');return;}
+  const pay={old_ip:oldIp, alias};
+  if(newIp!==oldIp) pay.new_ip=newIp;
+  const r=await fetch('/api/device',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
+  const body=await r.json().catch(()=>({}));
+  if(!r.ok){toast(body.msg||'Không sửa được!','error');return;}
+  cModal('editDev');toast('Đã lưu!','success');loadDash();
 }
 
 async function delDev(ip){
@@ -1667,7 +1756,9 @@ async function loadLogCnt(fn){
 
 async function doRevert(){
   if(!isAdmin) return;
-  if(!confirm('Chắc chắn chạy lệnh REVERT phục hồi dựa trên log này?')) return;
+  const cfg=await fetch('/api/config').then(r=>r.json()).catch(()=>({}));
+  const modeTxt=cfg.push_live_mode?'THẬT - SẼ GỬI LỆNH THẬT TỚI THIẾT BỊ!':'MÔ PHỎNG - an toàn, chỉ ghi log, KHÔNG gửi gì tới thiết bị';
+  if(!confirm('Chắc chắn chạy lệnh REVERT phục hồi dựa trên log này?\nChế độ Push/Revert hiện tại: '+modeTxt)) return;
   const r=await fetch('/api/revert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:curLogFile})}).then(x=>x.json()).catch(()=>null);
   if(r&&r.status==='ok') toast(r.msg, 'success');
   else toast((r&&r.error)||'Lỗi phục hồi!', 'error');
@@ -1681,9 +1772,13 @@ async function loadSettings(){
            'ssh_port':'csp','telnet_port':'ctp','menu_name_override':'cmno',
            'interval':'ci','verify_interval':'cvi','ip_list':'cil','baseline_db':'cbd','snapshot_db':'csd',
            'verify_wait_after_connect_telnet':'cvwact','verify_wait_after_connect_ssh':'cvwacs','max_verify_duration':'cmvd',
-           'scan_schedule_time':'cst','scan_schedule_weekday':'csw','verify_schedule_time':'cvt','verify_schedule_weekday':'cvw'};
+           'scan_max_workers':'csmw','verify_max_workers':'cvmw',
+           'scan_schedule_time':'cst','scan_schedule_weekday':'csw','verify_schedule_time':'cvt','verify_schedule_weekday':'cvw',
+           'scan_schedule_day_of_month':'csdm','verify_schedule_day_of_month':'cvdm',
+           'scan_schedule_once_datetime':'csod','verify_schedule_once_datetime':'cvod'};
   for(const[k,id] of Object.entries(m)){const el=document.getElementById(id);if(el)el.value=cfg[k]??'';}
   const av=document.getElementById('cav');if(av)av.checked=cfg.auto_verify??true;
+  const plm=document.getElementById('cplm');if(plm)plm.checked=cfg.push_live_mode??false;
   const sm=document.getElementById('csm');if(sm){sm.value=cfg.scan_schedule_mode||'interval';togSF('scan');}
   const vm=document.getElementById('cvm');if(vm){vm.value=cfg.verify_schedule_mode||'interval';togSF('verify');}
 }
@@ -1691,19 +1786,23 @@ async function loadSettings(){
 function togSF(p){
   if(!isAdmin) return;
   const mode=document.getElementById(p==='scan'?'csm':'cvm').value;
-  const tf=document.getElementById(p[0]+'_tf'),wf=document.getElementById(p[0]+'_wf');
-  if(tf)tf.style.display=mode!=='interval'?'':'none';
+  const tf=g(p[0]+'_tf'),wf=g(p[0]+'_wf'),mf=g(p[0]+'_mf'),of=g(p[0]+'_of');
+  if(tf)tf.style.display=(mode==='daily'||mode==='weekly'||mode==='monthly')?'':'none';
   if(wf)wf.style.display=mode==='weekly'?'':'none';
+  if(mf)mf.style.display=mode==='monthly'?'':'none';
+  if(of)of.style.display=mode==='once'?'':'none';
 }
 
 async function saveCfg(){
   if(!isAdmin) return;
+  const wantLive=g('cplm').checked;
+  if(wantLive && !confirm('BẬT chế độ Push/Revert THẬT? Từ giờ các lệnh Push/Revert sẽ gửi THẬT tới thiết bị, không còn mô phỏng nữa. Chỉ bật khi đã kiểm chứng trên thiết bị lab/không phải production. Xác nhận?')) return;
   const pay={username:g('cu').value,password:g('cp').value,enable_password:g('ce').value,
              vertiv_connect_password:g('cv').value,
              vertiv_admin_username:g('cvau').value,vertiv_admin_password:g('cvap').value,
              ssh_port:parseInt(g('csp').value)||22,
              telnet_port:parseInt(g('ctp').value)||23,menu_name_override:g('cmno').value,
-             auto_verify:g('cav').checked};
+             auto_verify:g('cav').checked,push_live_mode:wantLive};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
   if(r.ok)toast('Đã lưu cài đặt!','success');else toast('Lỗi lưu!','error');
 }
@@ -1712,11 +1811,17 @@ async function saveSched(){
   if(!isAdmin) return;
   const pay={scan_schedule_mode:g('csm').value,interval:parseInt(g('ci').value)||30,
              scan_schedule_time:g('cst').value,scan_schedule_weekday:g('csw').value,
+             scan_schedule_day_of_month:parseInt(g('csdm').value)||1,
+             scan_schedule_once_datetime:g('csod').value.trim(),
              verify_schedule_mode:g('cvm').value,verify_interval:parseInt(g('cvi').value)||3600,
              verify_schedule_time:g('cvt').value,verify_schedule_weekday:g('cvw').value,
+             verify_schedule_day_of_month:parseInt(g('cvdm').value)||1,
+             verify_schedule_once_datetime:g('cvod').value.trim(),
              verify_wait_after_connect_telnet:parseFloat(g('cvwact').value)||1.5,
              verify_wait_after_connect_ssh:parseFloat(g('cvwacs').value)||3.0,
-             max_verify_duration:parseInt(g('cmvd').value)||300};
+             max_verify_duration:parseInt(g('cmvd').value)||300,
+             scan_max_workers:parseInt(g('csmw').value)||10,
+             verify_max_workers:parseInt(g('cvmw').value)||10};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
   if(r.ok)toast('Đã lưu lịch!','success');else toast('Lỗi!','error');
 }
@@ -1801,11 +1906,15 @@ document.getElementById('clk').textContent=new Date().toLocaleString('vi-VN');
 
 async function chkDaemon(){
   try{
-    const tasks=await fetch('/api/tasks').then(r=>r.json());
+    const[tasks,dstat]=await Promise.all([
+      fetch('/api/tasks').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/daemon-status').then(r=>r.json()).catch(()=>({status:'unknown'}))
+    ]);
     const run=Object.values(tasks).filter(t=>t.status==='running').length;
     const dot=document.getElementById('dDot'),txt=document.getElementById('dTxt');
-    if(run>0){dot.className='d-dot on';txt.textContent=run+' task đang chạy';}
-    else{dot.className='d-dot';txt.textContent='Web server hoạt động';}
+    const dLabel=dstat.status==='running'?'Daemon CLI: đang chạy':dstat.status==='stale'?'Daemon CLI: có thể đã dừng (heartbeat cũ)':'Daemon CLI: chưa chạy';
+    if(run>0){dot.className='d-dot on';txt.textContent=run+' task Web · '+dLabel;}
+    else{dot.className=dstat.status==='running'?'d-dot on':'d-dot';txt.textContent=dLabel;}
   }catch{}
 }
 setInterval(chkDaemon,8000);chkDaemon();

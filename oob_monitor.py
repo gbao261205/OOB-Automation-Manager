@@ -8,6 +8,7 @@ Kien truc Multi-Terminal:
     - Terminal 2: Menu Quan ly - Them/Xoa IP, Cau hinh, Xem danh sach, Log, Manual Push.
 """
 
+import calendar
 import getpass
 import json
 import os
@@ -34,7 +35,7 @@ from rich.markup import escape as rich_escape
 
 # Import tu oob_lib
 from oob_lib import (
-    poll_host, MiniTelnet, connect_auto, fetch_hostname,
+    MiniTelnet, connect_auto, fetch_hostname,
     fetch_hostname_via_auto, hostname_matches_description,
     push_menu_descriptions, ping_host
 )
@@ -58,26 +59,62 @@ DEFAULT_CONFIG = {
     "baseline_db": "baseline.db",
     "snapshot_db": "snapshot.db",
     "auto_verify": True,        
-    "verify_schedule_mode": "interval", 
-    "verify_schedule_time": "01:00",    
-    "verify_schedule_weekday": "mon",   
-    "scan_schedule_mode": "interval",   
-    "scan_schedule_time": "01:00",      
-    "scan_schedule_weekday": "mon",     
+    "verify_schedule_mode": "interval",
+    "verify_schedule_time": "01:00",
+    "verify_schedule_weekday": "mon",
+    "verify_schedule_day_of_month": 1,
+    "verify_schedule_once_datetime": "",
+    "scan_schedule_mode": "interval",
+    "scan_schedule_time": "01:00",
+    "scan_schedule_weekday": "mon",
+    "scan_schedule_day_of_month": 1,
+    "scan_schedule_once_datetime": "",
     "verify_wait_after_connect": 1.5,
     "verify_wait_after_connect_telnet": 1.5,
     "verify_wait_after_connect_ssh": 3.0,
     "max_verify_duration": 300,
     "debug_verify": False,
+    "push_live_mode": False,
+    "scan_max_workers": 10,
+    "verify_max_workers": 10,
 }
 
 # ---------------------------------------------------------------------------
 # Locks de dong bo luong
 # ---------------------------------------------------------------------------
-db_lock = threading.Lock()            
-action_lock = threading.Lock()        
-file_lock = threading.Lock()          
-ui_print_lock = threading.Lock()      
+db_lock = threading.Lock()
+file_lock = threading.Lock()
+ui_print_lock = threading.Lock()
+
+class HostLockRegistry:
+    """Cap 1 threading.Lock() rieng cho tung host (IP), tao on-demand va an
+    toan giua nhieu luong (thread-safe). Thay the action_lock toan cuc truoc
+    day (git blame commit e924f80 cho thay comment goc la 'Bat Verify phai
+    cho Scan chay xong moi duoc chay' - tuc la buoc TOAN BO chu ky Scan va
+    Verify chay tuan tu, khong lien quan gi den viec co IP cu the nao).
+
+    Voi lock rieng tung host: Scan(host A) va Verify(host B) gio chay THAT SU
+    dong thoi (dung nhu README da tu quang cao "2 luong doc lap" nhung truoc
+    day khong dung nhu vay); Scan(host A) va Verify(host A) van loai tru lan
+    nhau dung nhu truoc - dam bao khong bao gio co 2 phien SSH/Telnet cung
+    luc toi CUNG 1 thiet bi (ly do an toan thuc su, khong phai chi vi
+    'chua tung nghi toi').
+
+    Dict noi bo khong tu don dep - so luong host la co han (danh sach IP
+    quan ly), khong phinh to vo han theo thoi gian."""
+    def __init__(self):
+        self._locks = {}
+        self._registry_lock = threading.Lock()
+
+    def get(self, host_key):
+        with self._registry_lock:
+            lock = self._locks.get(host_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[host_key] = lock
+            return lock
+
+host_lock_registry = HostLockRegistry()
 
 # ---------------------------------------------------------------------------
 # Regex
@@ -206,6 +243,8 @@ MENU_STATE_LABELS = {
 # ---------------------------------------------------------------------------
 # Cac ham tien ich, cau hinh va DB
 # ---------------------------------------------------------------------------
+_config_error_warned = {}  # {path: mtime da canh bao lan gan nhat} - tranh spam canh bao moi lan goi
+
 def load_config(path):
     cfg = DEFAULT_CONFIG.copy()
     if os.path.exists(path):
@@ -222,7 +261,19 @@ def load_config(path):
                     cfg["verify_wait_after_connect_telnet"] = raw["verify_wait_after_connect"]
                 if "verify_wait_after_connect_ssh" not in raw:
                     cfg["verify_wait_after_connect_ssh"] = raw["verify_wait_after_connect"]
-        except (json.JSONDecodeError, OSError) as exc: pass
+        except (json.JSONDecodeError, OSError) as exc:
+            # Truoc day loi bi nuot am tham, khong ai biet config hong ma tool
+            # dang chay bang DEFAULT_CONFIG (vd mat het password/danh sach IP
+            # tuy chinh). Canh bao 1 LAN cho moi lan noi dung file thay doi
+            # (theo mtime) - tranh spam lai canh bao moi vong lap daemon/moi
+            # request Web trong khi file van con hong y nguyen.
+            try: mtime = os.path.getmtime(path)
+            except OSError: mtime = None
+            if _config_error_warned.get(path) != mtime:
+                _config_error_warned[path] = mtime
+                _con.print(f"  [bold red][!!!][/] KHONG THE DOC config '{path}': {exc}. "
+                            f"Dang dung config MAC DINH (co the mat het password/danh sach tuy chinh) - "
+                            f"kiem tra lai cu phap JSON cua file nay.")
     return _decrypt_config_fields(cfg)
 
 def save_config(path, cfg):
@@ -366,9 +417,53 @@ def _parse_hhmm(text, default="01:00"):
     dh, dm = default.split(":")
     return int(dh), int(dm)
 
-def compute_next_scheduled_run(mode, time_str, weekday_str, now=None):
+def _last_day_of_month(year, month):
+    return calendar.monthrange(year, month)[1]
+
+def _next_monthly_candidate(now, day_of_month, hh, mm):
+    """Lan chay tiep theo vao dung ngay day_of_month (1-31) hang thang, luc
+    hh:mm. Neu thang do khong co du ngay (vd chon 31 nhung thang 2 chi co 28)
+    thi CHAY VAO NGAY CUOI CUNG cua thang do (ASSUMPTION da xac nhan trong
+    implementation-plan.md muc 13.4, chua co lua chon nao khac trong scope
+    nay - vd 'bo qua thang do' - duoc yeu cau)."""
+    year, month = now.year, now.month
+    actual_day = min(day_of_month, _last_day_of_month(year, month))
+    candidate = now.replace(year=year, month=month, day=actual_day, hour=hh, minute=mm, second=0, microsecond=0)
+    if candidate <= now:
+        month += 1
+        if month > 12: month, year = 1, year + 1
+        actual_day = min(day_of_month, _last_day_of_month(year, month))
+        candidate = candidate.replace(year=year, month=month, day=actual_day)
+    return candidate
+
+def compute_next_scheduled_run(mode, time_str, weekday_str, now=None, day_of_month=None, once_datetime=None):
+    """mode: 'interval'|'daily'|'weekly'|'monthly'|'once'.
+    - 'monthly': can them day_of_month (int 1-31, mac dinh 1 neu thieu).
+    - 'once': can them once_datetime (str "YYYY-MM-DD HH:MM" hoac datetime).
+      Tra ve None neu da qua thoi diem do (KHONG tu dong lui lai) hoac chua
+      dat - logic "da chay xong 1 lan thi tat/doi mode" thuoc ve NOI GOI ham
+      nay (vd sau khi run_daemon thuc su chay xong 1 lan 'once', tu cap nhat
+      lai config), khong phai trach nhiem cua ham thuan nay."""
     now = now or datetime.now()
+
+    if mode == "once":
+        if not once_datetime: return None
+        if isinstance(once_datetime, str):
+            try:
+                dt = datetime.strptime(once_datetime.strip(), "%Y-%m-%d %H:%M")
+            except ValueError:
+                return None
+        else:
+            dt = once_datetime
+        return dt if dt > now else None
+
     hh, mm = _parse_hhmm(time_str)
+
+    if mode == "monthly":
+        try: dom = max(1, min(31, int(day_of_month)))
+        except (TypeError, ValueError): dom = 1
+        return _next_monthly_candidate(now, dom, hh, mm)
+
     candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if mode == "weekly":
         target_wd = _WEEKDAY_MAP.get((weekday_str or "mon").strip().lower()[:3], 0)
@@ -383,12 +478,16 @@ def _describe_verify_schedule(cfg):
     mode = cfg.get("verify_schedule_mode", "interval")
     if mode == "daily": return f"Hang ngay luc {cfg.get('verify_schedule_time', '01:00')}"
     if mode == "weekly": return f"Hang tuan vao {_WEEKDAY_LABELS.get((cfg.get('verify_schedule_weekday', 'mon') or 'mon').strip().lower()[:3], 'mon')} luc {cfg.get('verify_schedule_time', '01:00')}"
+    if mode == "monthly": return f"Ngay {cfg.get('verify_schedule_day_of_month', 1)} hang thang luc {cfg.get('verify_schedule_time', '01:00')}"
+    if mode == "once": return f"Chi 1 lan luc {cfg.get('verify_schedule_once_datetime') or '(chua dat)'}"
     return f"Lap lai moi {cfg.get('verify_interval', 3600)}s"
 
 def _describe_scan_schedule(cfg):
     mode = cfg.get("scan_schedule_mode", "interval")
     if mode == "daily": return f"Hang ngay luc {cfg.get('scan_schedule_time', '01:00')}"
     if mode == "weekly": return f"Hang tuan vao {_WEEKDAY_LABELS.get((cfg.get('scan_schedule_weekday', 'mon') or 'mon').strip().lower()[:3], 'mon')} luc {cfg.get('scan_schedule_time', '01:00')}"
+    if mode == "monthly": return f"Ngay {cfg.get('scan_schedule_day_of_month', 1)} hang thang luc {cfg.get('scan_schedule_time', '01:00')}"
+    if mode == "once": return f"Chi 1 lan luc {cfg.get('scan_schedule_once_datetime') or '(chua dat)'}"
     return f"Lap lai moi {cfg.get('interval', 30)}s"
 
 def _edit_verify_schedule(cfg):
@@ -397,7 +496,9 @@ def _edit_verify_schedule(cfg):
     _con.print("  1. Lap lai theo chu ky (interval)")
     _con.print("  2. Hang ngay, vao 1 gio co dinh")
     _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
-    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    _con.print("  4. Hang thang, vao 1 ngay + gio co dinh")
+    _con.print("  5. Chi chay 1 lan, vao 1 thoi diem co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1-5)[/]: ").strip()
     if mode_choice == "1":
         cfg["verify_schedule_mode"] = "interval"
         _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
@@ -417,6 +518,24 @@ def _edit_verify_schedule(cfg):
             h, m = _parse_hhmm(val)
             cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
         _con.print(f"  [green](OK)[/] Da dat lich: {_describe_verify_schedule(cfg)}.")
+    elif mode_choice == "4":
+        cfg["verify_schedule_mode"] = "monthly"
+        dom_val = _con.input(f"  [cyan]Ngay trong thang (1-31)[/]: ").strip()
+        if dom_val.isdigit() and 1 <= int(dom_val) <= 31: cfg["verify_schedule_day_of_month"] = int(dom_val)
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["verify_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_verify_schedule(cfg)}. [dim](Neu thang do khong co du ngay, se chay vao ngay cuoi thang.)[/]")
+    elif mode_choice == "5":
+        cfg["verify_schedule_mode"] = "once"
+        val = _con.input(f"  [cyan]Thoi diem chay (YYYY-MM-DD HH:MM)[/]: ").strip()
+        try:
+            datetime.strptime(val, "%Y-%m-%d %H:%M")
+            cfg["verify_schedule_once_datetime"] = val
+            _con.print(f"  [green](OK)[/] Da dat lich: {_describe_verify_schedule(cfg)}.")
+        except ValueError:
+            _con.print("  [red][!][/] Sai dinh dang, giu nguyen gia tri cu.")
     else:
         _con.print("  [yellow][!][/] Lua chon khong hop le.")
 
@@ -426,7 +545,9 @@ def _edit_scan_schedule(cfg):
     _con.print("  1. Lap lai theo chu ky (interval)")
     _con.print("  2. Hang ngay, vao 1 gio co dinh")
     _con.print("  3. Hang tuan, vao 1 thu + gio co dinh")
-    mode_choice = _con.input("  [cyan]Chon che do (1/2/3)[/]: ").strip()
+    _con.print("  4. Hang thang, vao 1 ngay + gio co dinh")
+    _con.print("  5. Chi chay 1 lan, vao 1 thoi diem co dinh")
+    mode_choice = _con.input("  [cyan]Chon che do (1-5)[/]: ").strip()
     if mode_choice == "1":
         cfg["scan_schedule_mode"] = "interval"
         _con.print("  [green](OK)[/] Da chuyen ve che do lap lai theo chu ky.")
@@ -446,13 +567,31 @@ def _edit_scan_schedule(cfg):
             h, m = _parse_hhmm(val)
             cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
         _con.print(f"  [green](OK)[/] Da dat lich: {_describe_scan_schedule(cfg)}.")
+    elif mode_choice == "4":
+        cfg["scan_schedule_mode"] = "monthly"
+        dom_val = _con.input(f"  [cyan]Ngay trong thang (1-31)[/]: ").strip()
+        if dom_val.isdigit() and 1 <= int(dom_val) <= 31: cfg["scan_schedule_day_of_month"] = int(dom_val)
+        val = _con.input(f"  [cyan]Gio chay (HH:MM)[/]: ").strip()
+        if val:
+            h, m = _parse_hhmm(val)
+            cfg["scan_schedule_time"] = f"{h:02d}:{m:02d}"
+        _con.print(f"  [green](OK)[/] Da dat lich: {_describe_scan_schedule(cfg)}. [dim](Neu thang do khong co du ngay, se chay vao ngay cuoi thang.)[/]")
+    elif mode_choice == "5":
+        cfg["scan_schedule_mode"] = "once"
+        val = _con.input(f"  [cyan]Thoi diem chay (YYYY-MM-DD HH:MM)[/]: ").strip()
+        try:
+            datetime.strptime(val, "%Y-%m-%d %H:%M")
+            cfg["scan_schedule_once_datetime"] = val
+            _con.print(f"  [green](OK)[/] Da dat lich: {_describe_scan_schedule(cfg)}.")
+        except ValueError:
+            _con.print("  [red][!][/] Sai dinh dang, giu nguyen gia tri cu.")
     else:
         _con.print("  [yellow][!][/] Lua chon khong hop le.")
 
 def settings_menu(cfg, config_path):
     while True:
-        v_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("verify_schedule_mode", "interval") in ("daily", "weekly") else "[dim green]<- Dang co hieu luc[/]"
-        s_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("scan_schedule_mode", "interval") in ("daily", "weekly") else "[dim green]<- Dang co hieu luc[/]"
+        v_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("verify_schedule_mode", "interval") in ("daily", "weekly", "monthly", "once") else "[dim green]<- Dang co hieu luc[/]"
+        s_note = "[dim red]<- Khong hieu luc[/]" if cfg.get("scan_schedule_mode", "interval") in ("daily", "weekly", "monthly", "once") else "[dim green]<- Dang co hieu luc[/]"
         auto_v = "[green bold]BAT[/]" if cfg.get('auto_verify', True) else "[red bold]TAT[/]"
 
         g = Table.grid(padding=(0, 1))
@@ -482,10 +621,16 @@ def settings_menu(cfg, config_path):
         g.add_row("\\[b]", f"Tu dong Verify ngam   : {auto_v}")
         g.add_row("\\[d]", f"Lich chay Verify      : [cyan]{_describe_verify_schedule(cfg)}[/]")
         g.add_row("\\[v]", f"Chu ky interval (s)   : [bold cyan]{cfg.get('verify_interval', 3600)}[/]  {v_note}")
-        g.add_row("\\[w]", f"Cho sau connect (s)   : [bold cyan]{cfg.get('verify_wait_after_connect', 1.5)}[/]")
+        g.add_row("\\[w]", f"Cho sau connect-Telnet: [bold cyan]{cfg.get('verify_wait_after_connect_telnet', 1.5)}[/]s")
+        g.add_row("\\[ws]", f"Cho sau connect-SSH   : [bold cyan]{cfg.get('verify_wait_after_connect_ssh', 3.0)}[/]s")
         g.add_row("\\[m]", f"Timeout Verify (s)    : [bold cyan]{cfg.get('max_verify_duration', 300)}[/]")
+        g.add_row("\\[sw]", f"So luong song song Scan/Verify: [bold cyan]{cfg.get('scan_max_workers', 10)}[/] / [bold cyan]{cfg.get('verify_max_workers', 10)}[/]")
         dbg_on = "[green bold]BAT[/]" if cfg.get("debug_verify") else "[red bold]TAT[/]"
         g.add_row("\\[u]", f"Debug Verify (raw log): {dbg_on}  [dim]-> debug-logs/{os.path.basename(DEBUG_VERIFY_LOG)}[/]")
+        g.add_row("", "")
+        g.add_row("", "[dim]-- LUONG 3: PUSH / REVERT -----------------------------------------[/]")
+        push_live_on = "[red bold]THAT (gui lenh that toi thiet bi!)[/]" if cfg.get("push_live_mode") else "[green bold]MO PHONG (an toan, khong gui gi that)[/]"
+        g.add_row("\\[pl]", f"Che do Push/Revert    : {push_live_on}")
         g.add_row("", "")
         g.add_row("\\[t]",  "[bold yellow]Thu ket noi nhanh (test credential)[/]")
         g.add_row("[0]",   "[bold red]Quay lai menu chinh[/]")
@@ -505,8 +650,21 @@ def settings_menu(cfg, config_path):
         elif choice == "6": val = input("  Telnet port moi: ").strip(); cfg["telnet_port"] = int(val) if val.isdigit() else cfg["telnet_port"]
         elif choice == "7": val = input("  Chu ky thu thap (giay): ").strip(); cfg["interval"] = int(val) if val.isdigit() else cfg["interval"]
         elif choice == "v": val = input("  Chu ky Verify vat ly (giay): ").strip(); cfg["verify_interval"] = int(val) if val.isdigit() else cfg["verify_interval"]
-        elif choice == "w": val = input("  Cho sau connect (giay): ").strip(); cfg["verify_wait_after_connect"] = round(float(val), 2) if val else cfg["verify_wait_after_connect"]
+        elif choice == "w": val = input("  Cho sau connect - Telnet (giay): ").strip(); cfg["verify_wait_after_connect_telnet"] = round(float(val), 2) if val else cfg.get("verify_wait_after_connect_telnet", 1.5)
+        elif choice == "ws": val = input("  Cho sau connect - SSH (giay): ").strip(); cfg["verify_wait_after_connect_ssh"] = round(float(val), 2) if val else cfg.get("verify_wait_after_connect_ssh", 3.0)
         elif choice == "m": val = input("  Timeout tong Verify (giay): ").strip(); cfg["max_verify_duration"] = int(val) if val.isdigit() and int(val)>=30 else cfg["max_verify_duration"]
+        elif choice == "sw":
+            val = input("  So luong thread song song cho Scan (1-50): ").strip()
+            if val.isdigit() and 1 <= int(val) <= 50: cfg["scan_max_workers"] = int(val)
+            val2 = input("  So luong thread song song cho Verify (1-50): ").strip()
+            if val2.isdigit() and 1 <= int(val2) <= 50: cfg["verify_max_workers"] = int(val2)
+        elif choice == "pl":
+            cfg["push_live_mode"] = not cfg.get("push_live_mode", False)
+            state = "THAT" if cfg["push_live_mode"] else "MO PHONG"
+            if cfg["push_live_mode"]:
+                _con.print(f"  [bold red][!!!][/] CANH BAO: Push/Revert se gui LENH THAT toi thiet bi tu bay gio. "
+                            f"Khuyen nghi thu nghiem tren thiet bi khong phai production truoc.")
+            _con.print(f"  [green](OK)[/] Che do Push/Revert: {state}.")
         elif choice == "u":
             cfg["debug_verify"] = not cfg.get("debug_verify", False)
             state = "BAT" if cfg["debug_verify"] else "TAT"
@@ -601,10 +759,40 @@ def remove_ip(path, ip):
         for h_ip, alias in remaining: f.write(f"{h_ip} {alias}\n")
     _con.print(f"  [green](OK)[/] Da xoa {ip}")
 
+def update_ip(path, old_ip, new_alias=None, new_ip=None):
+    """Sua alias va/hoac IP cua 1 dong da co san trong file danh sach IP,
+    GIU NGUYEN vi tri dong trong file (khac voi lam remove_ip() roi add_ip()
+    lai - se day dong do xuong CUOI file, mat thu tu goc). Tra ve
+    (success: bool, message: str)."""
+    hosts = load_ip_list(path)
+    if not any(h[0] == old_ip for h in hosts):
+        return False, f"Khong tim thay IP {old_ip} trong danh sach."
+    target_ip = (new_ip or "").strip() or old_ip
+    if target_ip != old_ip and any(h[0] == target_ip for h in hosts):
+        return False, f"IP {target_ip} da ton tai o 1 dong khac - khong the doi trung."
+    with open(path, "w", encoding="utf-8") as f:
+        for h_ip, h_alias in hosts:
+            if h_ip == old_ip:
+                out_alias = (new_alias or "").strip() or h_alias
+                f.write(f"{target_ip} {out_alias}\n")
+            else:
+                f.write(f"{h_ip} {h_alias}\n")
+    return True, "OK"
+
 _DB_INIT_CACHE = set()
 def _init_db(path, table):
     conn = sqlite3.connect(path)
     if (path, table) in _DB_INIT_CACHE: return conn
+    try:
+        # WAL: reader (Web dashboard doc) khong con bi chan boi writer (daemon
+        # dang ghi baseline) va nguoc lai - giam tranh chap db_lock trong luc
+        # nhieu request Web doc dong thoi voi luc Scan/Verify dang ghi.
+        # journal_mode luu trong file DB nen chi can set 1 lan/lan dau tien
+        # ket noi toi file do (khop cache _DB_INIT_CACHE hien co). Bo qua neu
+        # filesystem khong ho tro WAL (vd network share/NFS).
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (host TEXT NOT NULL, menu_name TEXT NOT NULL, option_key TEXT NOT NULL, device_name TEXT, description TEXT, target_ip TEXT NOT NULL, target_port INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (host, menu_name, option_key))")
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
     if "device_name" not in cols: conn.execute(f"ALTER TABLE {table} ADD COLUMN device_name TEXT")
@@ -1272,7 +1460,8 @@ def _thread_verify_only(cfg, alias, ip, snapshot, pfx="", prog_state=None):
             
     log_verify(f"{pfx} [*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
     def _print_fn(msg): log_verify(f"{pfx} {msg}")
-    run_deep_verify(cfg, alias, ip, snapshot, print_fn=_print_fn)
+    with host_lock_registry.get(ip):
+        run_deep_verify(cfg, alias, ip, snapshot, print_fn=_print_fn)
     
     if prog_state:
         with prog_state["lock"]:
@@ -1321,8 +1510,15 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
         push_log_entries.append({"key": key, "real_menu_name": real_menu_name, "real_key": real_key, "target_ip": target_ip, "old": w["desc"], "new": new_desc})
 
     if not updates_list: return
-    print_fn(f"[*] Dang PUSH thuc thi sua loi {len(updates_list)} option cho {alias}...")
-    
+    # push_live_mode=False (mac dinh) -> dry_run_flag=True -> push CHI MO PHONG
+    # (in ra lenh du dinh gui, KHONG gui that, luon tra ve True). push_live_mode
+    # phai duoc nguoi dung CHU DONG bat trong Cai dat truoc khi lenh that su
+    # duoc gui toi thiet bi - truoc day dry_run=True bi hardcode tai day, nen
+    # push "thanh cong" luon la GIA, nhung code van cap nhat Baseline nhu that.
+    dry_run_flag = not cfg.get("push_live_mode", False)
+    mode_label = "MO PHONG" if dry_run_flag else "THAT"
+    print_fn(f"[*] Dang {'MO PHONG' if dry_run_flag else 'THUC THI THAT'} PUSH sua loi {len(updates_list)} option cho {alias}...")
+
     vendor = next(iter(baseline.values())).get("vendor", "cisco") if baseline else "cisco"
     success = False
     if str(vendor).lower() == "vertiv":
@@ -1331,10 +1527,10 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
         if not admin_user or not admin_pass:
             print_fn(f"[red][LOI][/] {alias}: Chua cau hinh Vertiv Admin Username/Password trong Cau hinh he thong!")
             return
-        success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), admin_user, admin_pass, "", updates_list, timeout=10, vendor="vertiv", cfg=cfg, print_fn=print_fn, dry_run=True)
+        success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), admin_user, admin_pass, "", updates_list, timeout=10, vendor="vertiv", cfg=cfg, print_fn=print_fn, dry_run=dry_run_flag)
     else:
         for c in get_all_credentials(cfg, oob_ip):
-            success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], updates_list, timeout=10, vendor="cisco", cfg=cfg, print_fn=print_fn, dry_run=True)
+            success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], updates_list, timeout=10, vendor="cisco", cfg=cfg, print_fn=print_fn, dry_run=dry_run_flag)
             if success:
                 save_working_credential(oob_ip, c)
                 break
@@ -1347,10 +1543,17 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     with file_lock:
         with open(os.path.join("push-logs", f"Push_{alias}_{ts_str}.log"), "w", encoding="utf-8") as f:
-            f.write(f"=== PUSH LOG THU CONG: {alias} ({oob_ip}) ===\nThoi gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"=== PUSH LOG THU CONG [{mode_label}]: {alias} ({oob_ip}) ===\nThoi gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             for entry in push_log_entries:
-                baseline[entry["key"]]["description"] = entry["new"] 
-                f.write(f"- Option [{entry['key']}] (Target IP: {entry['target_ip']}):\n  + Cu : {entry['old']}\n  + Moi: {entry['new']}\n")
+                if not dry_run_flag:
+                    baseline[entry["key"]]["description"] = entry["new"]
+                f.write(f"- Option [{entry['key']}] (Target IP: {entry['target_ip']}):\n  + Cu : {entry['old']}\n  + Moi: {entry['new']}\n"
+                        f"  REVERT CMD: menu {entry['real_menu_name']} text {entry['real_key']} {entry['old']}\n")
+
+    if dry_run_flag:
+        print_fn(f"[yellow][MO PHONG][/] {alias}: Lenh push DA DUOC MO PHONG (xem chi tiet lenh o tren) - "
+                  f"CHUA gui gi that toi thiet bi, Baseline KHONG doi. Bat 'push_live_mode' trong Cai dat de push that.")
+        return
 
     save_options(cfg["baseline_db"], "baseline_menu", oob_ip, mn, dn, baseline)
     print_fn(f"[green](OK)[/] Da cap nhat cau hinh vao Switch & cap nhat lai Baseline DB.")
@@ -1385,7 +1588,8 @@ def manual_push_devices(cfg):
             
         results = run_deep_verify(cfg, alias, ip, baseline, cli_print)
         if any(r["status"] == "CANH BAO" for r in results):
-            ans = _con.input(f"\n  [bold yellow]Phat hien sai lech tren {alias}. Ban co chac chan PUSH de sua Description? (y/N)[/]: ").strip().lower()
+            mode_txt = "[bold red]THAT (se gui lenh that toi thiet bi!)[/]" if cfg.get("push_live_mode") else "[bold green]MO PHONG (an toan, chi in lenh, khong gui gi)[/]"
+            ans = _con.input(f"\n  [bold yellow]Phat hien sai lech tren {alias}. Che do hien tai: {mode_txt}. Ban co chac chan PUSH de sua Description? (y/N)[/]: ").strip().lower()
             if ans == 'y': process_push_and_reverify(cfg, alias, ip, baseline, results, print_fn=cli_print)
             else: _con.print(f"  [dim]Da huy PUSH cho {alias}.[/]")
         else:
@@ -1394,13 +1598,39 @@ def manual_push_devices(cfg):
 # ---------------------------------------------------------------------------
 # Daemon Thread
 # ---------------------------------------------------------------------------
+# Overlap guard cho 2 vong lap TU DONG (run_daemon/run_verify_daemon): bao ve
+# 1 chu ky khong bi chong len chinh no. Ca 2 vong lap deu da tuan tu (blocking
+# wait truoc khi sleep) nen thuc te chua bao gio tu chong duoc trong kien truc
+# hien tai - guard nay la luoi an toan phong khi logic vong lap doi trong
+# tuong lai (vd chay bat dong bo). KHONG bao ve duoc: (1) hanh dong CLI thu
+# cong (scan_specific_devices/verify_specific_devices - nguoi dung chu dong
+# yeu cau nen khong nen bi am tham bo qua), (2) oob_web.py (process rieng,
+# khong chia se bo nho/lock voi process --daemon) - ca 2 gioi han nay ngoai
+# pham vi WP-F (can co che khoa file/DB rieng moi giai quyet duoc, chua co
+# trong 24 hang muc).
+_scan_in_progress = {"active": False, "started_at": 0.0}
+_verify_in_progress = {"active": False, "started_at": 0.0}
+_OVERLAP_GUARD_MAX_AGE = 6 * 3600  # tu reset neu 1 chu ky "treo" qua 6h (deadlock/crash khong don duoc co)
+
+def _try_enter_cycle(state, label, log_fn):
+    now = time.time()
+    if state["active"] and (now - state["started_at"]) < _OVERLAP_GUARD_MAX_AGE:
+        log_fn(f"[yellow][!][/] Bo qua chu ky {label} moi - 1 chu ky {label} khac van dang chay "
+               f"(bat dau luc {datetime.fromtimestamp(state['started_at']).strftime('%H:%M:%S')}).")
+        return False
+    state["active"], state["started_at"] = True, now
+    return True
+
+def _exit_cycle(state):
+    state["active"] = False
+
 def run_verify_daemon(config_path):
     cfg = load_config(config_path)
     log_verify(f"[green][START][/] Khoi dong Verify vat ly - lich: {_describe_verify_schedule(cfg)}.")
     time.sleep(15)
     while True:
         cfg = load_config(config_path)
-        
+
         if cfg.get("auto_verify", True):
             hosts = load_ip_list(cfg["ip_list"])
             if hosts:
@@ -1408,21 +1638,35 @@ def run_verify_daemon(config_path):
                 for ip, alias in hosts:
                     _mn, _dn, baseline = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
                     if baseline: valid_hosts.append((ip, alias, baseline))
-                    
-                if valid_hosts:
-                    prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(valid_hosts)}
-                    with action_lock: 
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+
+                if valid_hosts and _try_enter_cycle(_verify_in_progress, "Verify", log_verify):
+                    try:
+                        prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(valid_hosts)}
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("verify_max_workers", 10)) as executor:
                             for ip, alias, baseline in valid_hosts:
                                 executor.submit(_thread_verify_only, cfg, alias, ip, baseline, "", prog_state)
+                    finally:
+                        _exit_cycle(_verify_in_progress)
         else:
             log_verify("[dim][zzz] Tinh nang Verify ngam dang bi TAT trong cau hinh. Dang cho...[/]")
 
         schedule_mode = cfg.get("verify_schedule_mode", "interval")
-        if schedule_mode in ("daily", "weekly"):
-            next_run = compute_next_scheduled_run(schedule_mode, cfg.get("verify_schedule_time", "01:00"), cfg.get("verify_schedule_weekday", "mon"))
-            sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()))
-            log_verify(f"[dim][zzz] Lan Verify tiep theo: {next_run.strftime('%Y-%m-%d %H:%M')} (con {sleep_seconds}s)...[/]")
+        if schedule_mode in ("daily", "weekly", "monthly", "once"):
+            next_run = compute_next_scheduled_run(
+                schedule_mode, cfg.get("verify_schedule_time", "01:00"), cfg.get("verify_schedule_weekday", "mon"),
+                day_of_month=cfg.get("verify_schedule_day_of_month", 1),
+                once_datetime=cfg.get("verify_schedule_once_datetime"),
+            )
+            if next_run is None:
+                # "once" chua dat hoac da qua thoi diem - roi ve interval cho
+                # vong lap khong "treo" vinh vien; nguoi dung can tu dat lai
+                # lich neu muon chay "1 lan" khac.
+                sleep_seconds = cfg.get("verify_interval", 3600)
+                log_verify(f"[yellow][!][/] Lich Verify 'chay 1 lan' da qua thoi diem hoac chua duoc cau hinh - "
+                            f"dang cho {sleep_seconds}s theo interval du phong. Hay dat lai lich neu can.")
+            else:
+                sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()))
+                log_verify(f"[dim][zzz] Lan Verify tiep theo: {next_run.strftime('%Y-%m-%d %H:%M')} (con {sleep_seconds}s)...[/]")
         else:
             sleep_seconds = cfg.get("verify_interval", 3600)
             log_verify(f"[dim][zzz] Dang cho {sleep_seconds}s cho dot Verify tiep theo...[/]")
@@ -1430,10 +1674,19 @@ def run_verify_daemon(config_path):
 
 def _scan_wait(cfg):
     mode = cfg.get("scan_schedule_mode", "interval")
-    if mode in ("daily", "weekly"):
-        next_run = compute_next_scheduled_run(mode, cfg.get("scan_schedule_time", "01:00"), cfg.get("scan_schedule_weekday", "mon"))
-        sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()))
-        log_oob(f"[dim][zzz] Lan Thu thap tiep theo: {next_run.strftime('%Y-%m-%d %H:%M')} (con {sleep_seconds}s)...[/]")
+    if mode in ("daily", "weekly", "monthly", "once"):
+        next_run = compute_next_scheduled_run(
+            mode, cfg.get("scan_schedule_time", "01:00"), cfg.get("scan_schedule_weekday", "mon"),
+            day_of_month=cfg.get("scan_schedule_day_of_month", 1),
+            once_datetime=cfg.get("scan_schedule_once_datetime"),
+        )
+        if next_run is None:
+            sleep_seconds = cfg["interval"]
+            log_oob(f"[yellow][!][/] Lich Scan 'chay 1 lan' da qua thoi diem hoac chua duoc cau hinh - "
+                     f"dang cho {sleep_seconds}s theo interval du phong. Hay dat lai lich neu can.")
+        else:
+            sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()))
+            log_oob(f"[dim][zzz] Lan Thu thap tiep theo: {next_run.strftime('%Y-%m-%d %H:%M')} (con {sleep_seconds}s)...[/]")
     else:
         sleep_seconds = cfg["interval"]
         log_oob(f"[dim][zzz] Dang cho {sleep_seconds}s de quet lai...[/]")
@@ -1485,7 +1738,9 @@ def run_daemon(cfg, config_path=None):
                         return
 
                     log_oob(f"[cyan]{pfx} [SCAN][/] [bold]{alias}[/] ({ip}) ...")
-                    try: hostname, menu_name, snapshot, menu_state = poll_host_multi(ip, cfg, timeout=cfg.get("interval", 30))
+                    try:
+                        with host_lock_registry.get(ip):
+                            hostname, menu_name, snapshot, menu_state = poll_host_multi(ip, cfg, timeout=cfg.get("interval", 30))
                     except Exception as exc:
                         save_device_status(ip, alias=alias, menu_state="conn_failed")
                         log_oob(f"[red]{pfx} [LOI][/] {alias} ({ip}): {exc}")
@@ -1528,16 +1783,19 @@ def run_daemon(cfg, config_path=None):
                         live.start()
                     pending_verifies.append((alias, ip, snapshot, pfx))
 
-                with action_lock: 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        futures = [executor.submit(_scan_single_daemon, ip, alias) for ip, alias in hosts]
-                        concurrent.futures.wait(futures)
+                if _try_enter_cycle(_scan_in_progress, "Scan", log_oob):
+                    try:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("scan_max_workers", 10)) as executor:
+                            futures = [executor.submit(_scan_single_daemon, ip, alias) for ip, alias in hosts]
+                            concurrent.futures.wait(futures)
 
-                    if cfg.get("auto_verify", True) and pending_verifies:
-                        prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(pending_verifies)}
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                            for alias, ip, snap, _ in pending_verifies:
-                                executor.submit(_thread_verify_only, cfg, alias, ip, snap, "", prog_state)
+                        if cfg.get("auto_verify", True) and pending_verifies:
+                            prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(pending_verifies)}
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("verify_max_workers", 10)) as executor:
+                                for alias, ip, snap, _ in pending_verifies:
+                                    executor.submit(_thread_verify_only, cfg, alias, ip, snap, "", prog_state)
+                    finally:
+                        _exit_cycle(_scan_in_progress)
 
                 _scan_wait(cfg)
         except KeyboardInterrupt: pass
@@ -1579,7 +1837,9 @@ def scan_specific_devices(cfg):
             return
 
         with ui_print_lock: _con.print(f"  [cyan]{pfx} [SCAN CONFIG][/] [bold]{alias}[/] ({ip}) ...")
-        try: hostname, menu_name, snapshot, menu_state = poll_host_multi(ip, cfg, timeout=10)
+        try:
+            with host_lock_registry.get(ip):
+                hostname, menu_name, snapshot, menu_state = poll_host_multi(ip, cfg, timeout=10)
         except Exception as exc:
             save_device_status(ip, alias=alias, menu_state="conn_failed")
             with ui_print_lock: _con.print(f"  [red]{pfx} [LOI][/] {alias} ({ip}): {exc}")
@@ -1617,13 +1877,13 @@ def scan_specific_devices(cfg):
             _con.print(f"  [green]{pfx} (OK)[/] Da TU DONG cap nhat baseline moi cho {alias}.")
         pending_verifies.append((alias, ip, snapshot, pfx))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("scan_max_workers", 10)) as executor:
         futures = [executor.submit(_scan_single_cli, ip, alias) for ip, alias in hosts_to_scan]
         concurrent.futures.wait(futures)
 
     if cfg.get("auto_verify", True) and pending_verifies:
         prog_state = {"lock": threading.Lock(), "started": 0, "completed": 0, "total": len(pending_verifies)}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("verify_max_workers", 10)) as executor:
             for alias, ip, snap, _ in pending_verifies:
                 executor.submit(_thread_verify_only, cfg, alias, ip, snap, "", prog_state)
 
@@ -1697,18 +1957,44 @@ def verify_specific_devices(cfg):
         with ui_print_lock:
             _con.print(f"  [green]{pfx_done} [OK][/] Da hoan thanh Verify: [bold]{alias}[/]")
             
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("verify_max_workers", 10)) as executor:
         for ip, alias, baseline in valid_hosts:
             executor.submit(_worker, alias, ip, baseline)
 
 # ---------------------------------------------------------------------------
 # Import / Export / TIM KIEM
 # ---------------------------------------------------------------------------
+
+# Cache ket qua _parse_verify_logs_for_status(): key = max_age_hours (gia tri
+# nay thuc te luon giong nhau giua tat ca call site - 24*30), value =
+# (signature, result). signature la (so file .json trong cutoff, mtime lon
+# nhat) - RE de khong doc lai NOI DUNG (phan dat tien: mo + json.load moi
+# file) khi thu muc verify-logs/ chua co gi moi ke tu lan goi truoc. Truoc day
+# ham nay doc + parse LAI TOAN BO file .json moi lan goi, ke ca khi Dashboard
+# Web (/api/stats, /api/devices, /api/device/<ip>/options, /api/search,
+# /api/export/excel) goi lien tuc trong vai giay.
+_verify_log_status_cache: dict = {}
+_verify_log_cache_lock = threading.Lock()
+
+def _verify_logs_dir_signature(log_dir, cutoff):
+    try:
+        mtimes = [os.path.getmtime(os.path.join(log_dir, fn)) for fn in os.listdir(log_dir) if fn.endswith(".json")]
+    except OSError:
+        return (0, 0.0)
+    mtimes = [mt for mt in mtimes if mt >= cutoff]
+    return (len(mtimes), max(mtimes) if mtimes else 0.0)
+
 def _parse_verify_logs_for_status(max_age_hours: float = 24.0 * 30) -> dict:
     log_dir = "verify-logs"
     if not os.path.exists(log_dir): return {}
     cutoff = time.time() - max_age_hours * 3600
-    
+
+    sig = _verify_logs_dir_signature(log_dir, cutoff)
+    with _verify_log_cache_lock:
+        cached = _verify_log_status_cache.get(max_age_hours)
+        if cached and cached[0] == sig:
+            return cached[1]
+
     import re
     alias_files_map: dict = {}
     for fname in os.listdir(log_dir):
@@ -1718,19 +2004,19 @@ def _parse_verify_logs_for_status(max_age_hours: float = 24.0 * 30) -> dict:
         fpath = os.path.join(log_dir, fname)
         mtime = os.path.getmtime(fpath)
         if mtime < cutoff: continue
-        
+
         if alias not in alias_files_map:
             alias_files_map[alias] = []
         alias_files_map[alias].append((fpath, mtime))
 
     STATUS_MAP = {
-        "OK": "OK", 
-        "CANH BAO": "CANH BAO", 
-        "KO PIVOT": "KHONG PIVOT", 
-        "TIMEOUT": "TIMEOUT", 
+        "OK": "OK",
+        "CANH BAO": "CANH BAO",
+        "KO PIVOT": "KHONG PIVOT",
+        "TIMEOUT": "TIMEOUT",
         "YC DANG NHAP": "YEU CAU DANG NHAP"
     }
-    
+
     result: dict = {}
     for alias, file_list in alias_files_map.items():
         file_list.sort(key=lambda x: x[1])  # Sap xep mtime tang dan (cu -> moi)
@@ -1748,6 +2034,9 @@ def _parse_verify_logs_for_status(max_age_hours: float = 24.0 * 30) -> dict:
                         "status": STATUS_MAP.get(status_raw, status_raw),
                         "act_host": act_host if act_host not in ('-', '') else None
                     }
+
+    with _verify_log_cache_lock:
+        _verify_log_status_cache[max_age_hours] = (sig, result)
     return result
 
 def search_device(cfg):
@@ -2029,13 +2318,25 @@ def _daemon_heartbeat_loop():
         except OSError: pass
         time.sleep(30)
 
-def _get_daemon_status() -> str:
+def _read_daemon_pid_info():
+    """Tra ve (status, pid, age_seconds). status: 'running' (heartbeat < 90s
+    truoc)|'stale' (file co nhung heartbeat qua cu, tien trinh co the da
+    chet)|'unknown' (khong doc duoc file). Dung chung boi _get_daemon_status()
+    (CLI, tra ve Rich markup) va /api/daemon-status (Web, tra ve JSON) - 1
+    nguon du lieu duy nhat cho ca 2 giao dien."""
     try:
         with open(DAEMON_PID_FILE, "r") as f: lines = f.read().splitlines()
+        pid = int(lines[0])
         age = (datetime.now() - datetime.fromisoformat(lines[1])).total_seconds()
-        if age < 90: return f"[green bold]RUNNING[/] [dim](PID {lines[0]})[/]"
-        return f"[yellow bold]STALE[/]"
-    except Exception: return "[dim]KHONG RO[/]"
+        return ("running" if age < 90 else "stale"), pid, age
+    except Exception:
+        return "unknown", None, None
+
+def _get_daemon_status() -> str:
+    status, pid, _age = _read_daemon_pid_info()
+    if status == "running": return f"[green bold]RUNNING[/] [dim](PID {pid})[/]"
+    if status == "stale": return f"[yellow bold]STALE[/]"
+    return "[dim]KHONG RO[/]"
 
 def live_debug_device(cfg):
     target_input = _con.input("  [cyan]Nhap IP hoac Alias cua OOB can debug[/]: ").strip().lower()
