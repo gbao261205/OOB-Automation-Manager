@@ -105,6 +105,20 @@ Tài liệu này mô tả chi tiết tất cả các endpoint (API) hiện có t
 - **Response**: JSON chứa `task_id`.
 - **`action=push`**: nếu cấu hình `push_live_mode=false` (mặc định), lệnh push CHỈ MÔ PHỎNG — không kết nối thiết bị, Baseline không đổi, push-log ghi tiêu đề `[MO PHONG]`. Chỉ khi `push_live_mode=true`, lệnh được gửi thật, Baseline chỉ cập nhật nếu thành công, và tự động Re-Verify ngay sau đó.
 
+### `[POST] /api/scan-all`
+- **Chức năng**: Scan TẤT CẢ OOB trong danh sách: lấy menu (lưu baseline ngay sau mỗi OOB) rồi Deep Verify description từng line (lưu ngay sau mỗi line). Không Push.
+- **Payload**: JSON `{"resume": false}`. Nếu `resume` là `true`, bỏ qua các OOB/line đã xong ở lần chạy trước (đọc từ `scan_all_progress.json`).
+- **Response**: `{"status":"ok","task_id":"scanall_<ts>"}`.
+  - `409` nếu đang có 1 lần Scan tất cả chạy.
+  - `400` nếu `resume=true` mà không có lần nào đang dở.
+
+### `[POST] /api/scan-all/stop`
+- **Chức năng**: Dừng lần Scan tất cả đang chạy. Line đang verify dở sẽ chạy nốt rồi mới dừng; phần đã xong được giữ lại. Trả `400` nếu không có gì đang chạy.
+
+### `[GET] /api/scan-all/status`
+- **Chức năng**: Xem tiến độ Scan tất cả.
+- **Response**: `{"running", "stopping", "task_id", "progress": {...}}`. Object `progress` gồm `total`, `done`, `failed`, `opts_verified`, `opts_total`, `finished`, `stopped`, `started`, `updated`, `in_progress`; bằng `null` nếu chưa chạy lần nào.
+
 ### `[POST] /api/revert`
 - **Chức năng**: Thực thi lệnh Revert lại cấu hình Menu (mô tả cũ) từ một file log Push trước đó, dựa trên các dòng `REVERT CMD:` trong file.
 - **Payload**: JSON

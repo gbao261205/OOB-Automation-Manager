@@ -16,6 +16,7 @@ alarms/
 push-logs/
 reports/
 task_history.json
+scan_all_progress.json
 device_status.json
 daemon.pid
 

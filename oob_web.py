@@ -140,27 +140,8 @@ def _run_scan(tid, target_ip=None):
         pfn = _make_print_fn(tid, target_ip)
         pfn("Bat dau SCAN " + str(len(hosts)) + " thiet bi (5 threads)...")
         def _scan_single(h):
-            ip, alias = h[0], h[1]
-            pfn("  [PING] " + alias + " (" + ip + ")")
-            alive = oob_monitor.ping_host(ip)
-            oob_monitor.save_device_status(ip, alias=alias, ping=alive)
-            if not alive: pfn("  [!] " + alias + ": Khong ping duoc."); return
-            pfn("  [SCAN] " + alias + " (" + ip + ")")
-            try: hn, mn, snap, ms = oob_monitor.poll_host_multi(ip, cfg, timeout=10)
-            except Exception as e:
-                oob_monitor.save_device_status(ip, alias=alias, menu_state="conn_failed")
-                pfn("  [LOI] " + alias + ": " + str(e)); return
-            oob_monitor.save_device_status(ip, alias=alias, menu_state=ms)
-            if ms in ["fetch_failed","no_menu"] or not snap: pfn("  [!] " + alias + ": Khong co menu."); return
-            oob_monitor.save_options(cfg["snapshot_db"],"snapshot_menu",ip,mn,hn,snap)
-            _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
-            if bl is None or not oob_monitor.options_equal(bl, snap):
-                diff = oob_monitor.diff_options(bl, snap) if bl is not None else None
-                oob_monitor.save_options(cfg["baseline_db"],"baseline_menu",ip,mn,hn,snap)
-                oob_monitor.log_baseline_change(alias, ip, "CAP NHAT QUA WEB", diff=diff)
-                pfn("  [OK] " + alias + ": Cap nhat baseline (" + str(len(snap)) + " option).")
-            else: pfn("  [OK] " + alias + ": Khop baseline.")
-            
+            oob_monitor.scan_and_save_host(cfg, h[0], h[1], pfn)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("scan_max_workers", 10)) as ex:
             ex.map(_scan_single, hosts)
         pfn("[OK] Hoan thanh SCAN!"); _finish_task(tid)
@@ -183,6 +164,20 @@ def _run_verify(tid, target_ip=None):
             ex.map(_verify_single, hosts)
         pfn("[OK] Hoan thanh VERIFY!"); _finish_task(tid)
     except Exception as e: _finish_task(tid, e)
+
+# SCAN TAT CA: chi 1 lan chay tai 1 thoi diem, dung bang nut Dung (Event).
+_scan_all_state = {"tid": None, "stop": threading.Event()}
+_scan_all_lock = threading.Lock()
+
+def _run_scan_all(tid, resume=False):
+    try:
+        pfn = _make_print_fn(tid)
+        oob_monitor.run_scan_all(_cfg(), print_fn=pfn, resume=resume,
+                                 should_stop=_scan_all_state["stop"].is_set)
+        _finish_task(tid)
+    except Exception as e: _finish_task(tid, e)
+    finally:
+        with _scan_all_lock: _scan_all_state["tid"] = None
 
 def _run_push(tid, target_ip=None):
     try:
@@ -712,6 +707,45 @@ def api_action():
     threading.Thread(target=runners[action], args=(tid,tip), daemon=True).start()
     return jsonify({"status":"ok","task_id":tid,"msg":"Da dua lenh " + action.upper() + " vao hang doi!"})
 
+@app.route("/api/scan-all", methods=["POST"])
+@login_required
+def api_scan_all():
+    """Scan TAT CA OOB (lay menu + verify desc tung line). Khong co Push - push
+    hang loat van bi tat. resume=true: bo qua phan da xong o lan chay truoc."""
+    resume = (request.json or {}).get("resume") is True
+    with _scan_all_lock:
+        if _scan_all_state["tid"]:
+            return jsonify({"status": "error", "msg": "Đang có 1 lần Scan tất cả đang chạy!", "task_id": _scan_all_state["tid"]}), 409
+        if resume:
+            prog = oob_monitor.scan_all_summary(oob_monitor.load_scan_all_progress())
+            if not prog or prog["done"] >= prog["total"]:
+                return jsonify({"status": "error", "msg": "Không có lần Scan tất cả nào đang dở để chạy tiếp."}), 400
+        tid = "scanall_" + str(int(time.time()))
+        _scan_all_state["tid"] = tid
+        _scan_all_state["stop"].clear()
+    _new_task(tid, action="scan_all", ip=None)
+    threading.Thread(target=_run_scan_all, args=(tid, resume), daemon=True).start()
+    return jsonify({"status": "ok", "task_id": tid,
+                    "msg": "Đã bắt đầu " + ("chạy tiếp Scan tất cả" if resume else "Scan tất cả") + "!"})
+
+@app.route("/api/scan-all/stop", methods=["POST"])
+@login_required
+def api_scan_all_stop():
+    with _scan_all_lock:
+        if not _scan_all_state["tid"]:
+            return jsonify({"status": "error", "msg": "Không có lần Scan tất cả nào đang chạy."}), 400
+        _scan_all_state["stop"].set()
+    return jsonify({"status": "ok", "msg": "Đã gửi lệnh dừng - chờ các line đang chạy dở xong (kết quả đã lưu)."})
+
+@app.route("/api/scan-all/status")
+@login_required
+def api_scan_all_status():
+    with _scan_all_lock:
+        tid = _scan_all_state["tid"]
+        stopping = bool(tid) and _scan_all_state["stop"].is_set()
+    return jsonify({"running": bool(tid), "task_id": tid, "stopping": stopping,
+                    "progress": oob_monitor.scan_all_summary(oob_monitor.load_scan_all_progress())})
+
 @app.route("/api/revert", methods=["POST"])
 @login_required
 def api_revert():
@@ -1133,6 +1167,7 @@ select.fc option{background:#1a1a2e}
       <div class="sh">
         <div class="st"><span class="dot"></span>Thiết bị OOB</div>
         <div class="bg2">
+          {% if is_admin %}<button class="btn btn-t btn-sm" onclick="sPage('verify')" title="Lấy menu + kiểm tra description toàn bộ OOB">🔍 Scan tất cả</button>{% endif %}
           <button class="btn btn-g btn-sm" onclick="loadDash()">↻ Làm mới</button>
         </div>
       </div>
@@ -1178,6 +1213,16 @@ select.fc option{background:#1a1a2e}
     <!-- VERIFY & SCAN (Chi Admin) -->
     <div class="page" id="page-verify">
       <div class="sh mb16"><div class="st"><span class="dot"></span>Vận hành Tức thì</div></div>
+      <div class="sh"><div class="st"><span class="dot"></span>Scan tất cả thiết bị</div></div>
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:24px">
+        <div style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.5">Lấy menu của <b>toàn bộ</b> OOB (lưu baseline) rồi kiểm tra description từng line console có đúng thiết bị đầu xa không. Kết quả được <b>lưu ngay sau từng thiết bị / từng line</b>: dừng giữa chừng (nút Dừng, tắt server...) không mất phần đã xong, bấm <b>Chạy tiếp</b> để làm nốt phần còn lại. Không Push gì tới thiết bị.</div>
+        <div id="saInfo" style="font-size:13px;margin-bottom:14px"><span class="text-m">Đang tải trạng thái...</span></div>
+        <div class="bg2">
+          <button class="btn btn-t" id="saStart" onclick="scanAll(false)">🔍 Scan tất cả (từ đầu)</button>
+          <button class="btn btn-a" id="saResume" style="display:none" onclick="scanAll(true)">⏯ Chạy tiếp lần dở</button>
+          <button class="btn btn-d" id="saStop" style="display:none" onclick="stopScanAll()">⏹ Dừng</button>
+        </div>
+      </div>
       <div class="sh"><div class="st"><span class="dot"></span>Chạy cho thiết bị cụ thể</div></div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:24px">
         <div class="fg"><label class="fl">IP hoặc Alias (để trống = Tất cả)</label><input type="text" id="specIP" class="fc" placeholder="VD: 192.168.1.1"></div>
@@ -1453,11 +1498,13 @@ function logMsg(d){
 function taskDone(d){
   const tid=d.task;
   if(actTasks[tid]){
+    const lbl=actTasks[tid].label||tid.split('_')[0].toUpperCase();
     delete actTasks[tid]; renderTasks();
-    toast(tid.split('_')[0].toUpperCase()+' hoàn thành!','success');
+    toast(lbl+' - đã kết thúc!','success');
     if(curPage==='dashboard')loadDash();
     if(curPage==='devices'&&curIP)loadDevOpts(curIP);
   }
+  if(tid&&tid.startsWith('scanall_'))loadScanAll();
 }
 
 function addTask(tid,lbl){actTasks[tid]={label:lbl};renderTasks();}
@@ -1483,6 +1530,61 @@ function sPage(page,btn){
   if(page==='devices')loadDevicesPage();
   if(page==='logs')loadLogs();
   if(isAdmin && page==='settings')loadSettings();
+  if(isAdmin && page==='verify')loadScanAll();
+}
+
+// ---- SCAN TAT CA ----
+let saTimer=null;
+async function loadScanAll(){
+  if(!isAdmin)return;
+  clearTimeout(saTimer);
+  const d=await fetch('/api/scan-all/status').then(r=>r.ok?r.json():null).catch(()=>null);
+  if(!d)return;
+  renderScanAll(d);
+  if(d.running&&curPage==='verify')saTimer=setTimeout(loadScanAll,3000);
+}
+function renderScanAll(d){
+  const p=d.progress, info=g('saInfo');
+  const pending=p&&p.done<p.total;
+  g('saStart').disabled=d.running;
+  g('saResume').style.display=(!d.running&&pending)?'':'none';
+  g('saStop').style.display=d.running?'':'none';
+  g('saStop').disabled=d.stopping;
+  if(d.running&&d.task_id&&!actTasks[d.task_id])addTask(d.task_id,'SCAN TẤT CẢ');
+  if(!p){info.innerHTML='<span class="text-m">Chưa chạy Scan tất cả lần nào.</span>';return;}
+  const pct=p.total?Math.round(p.done*100/p.total):0;
+  const tm=t=>t?new Date(t*1000).toLocaleString('vi-VN'):'-';
+  let state;
+  if(d.running)state=d.stopping?'<span class="badge ba">ĐANG DỪNG...</span>':'<span class="badge bv bpulse">ĐANG CHẠY</span>';
+  else if(pending)state='<span class="badge ba">'+(p.stopped?'ĐÃ DỪNG':'CHƯA XONG')+' - có thể chạy tiếp</span>';
+  else state='<span class="badge bg">HOÀN THÀNH</span>';
+  info.innerHTML=`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">${state}
+      <span><b>${p.done}/${p.total}</b> OOB xong</span><span class="text-m">·</span>
+      <span><b>${p.opts_verified}</b>${p.opts_total?'/'+p.opts_total:''} line đã verify</span>
+      ${p.failed?`<span class="text-m">·</span><span>${p.failed} OOB offline/lỗi kết nối/không có menu</span>`:''}</div>
+    <div style="height:6px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden;margin-bottom:8px"><div style="height:100%;width:${pct}%;background:var(--teal);transition:width .5s"></div></div>
+    <div class="text-m" style="font-size:12px">Bắt đầu: ${esc(tm(p.started))} · Lưu gần nhất: ${esc(tm(p.updated))}
+      ${d.running&&p.in_progress&&p.in_progress.length?' · Đang xử lý: '+p.in_progress.map(esc).join(', '):''}</div>`;
+}
+async function scanAll(resume){
+  if(!isAdmin)return;
+  const msg=resume?'Chạy tiếp lần Scan tất cả đang dở (bỏ qua OOB/line đã xong)?'
+    :'Scan TẤT CẢ thiết bị từ đầu?\n(Lấy menu + kiểm tra description từng line, có thể mất nhiều thời gian. Không push gì tới thiết bị.)';
+  if(!confirm(msg))return;
+  const r=await fetch('/api/scan-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume})}).catch(()=>null);
+  const d=r?await r.json().catch(()=>({})):{};
+  if(!r||!r.ok){toast(d.msg||'Lỗi gửi lệnh! Bạn có thể đã hết phiên đăng nhập.','error');return;}
+  if(curPage!=='verify')sPage('verify');
+  addTask(d.task_id,resume?'SCAN TẤT CẢ (chạy tiếp)':'SCAN TẤT CẢ');
+  toast(d.msg||'Đã bắt đầu!','info');
+  loadScanAll();
+}
+async function stopScanAll(){
+  if(!confirm('Dừng Scan tất cả?\nPhần đã xong được giữ lại - bấm "Chạy tiếp lần dở" để làm nốt sau.'))return;
+  const r=await fetch('/api/scan-all/stop',{method:'POST'}).catch(()=>null);
+  const d=r?await r.json().catch(()=>({})):{};
+  toast(d.msg||'Lỗi!',r&&r.ok?'info':'error');
+  loadScanAll();
 }
 
 function sTab(tabId,btn){

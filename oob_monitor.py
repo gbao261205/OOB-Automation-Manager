@@ -1083,11 +1083,59 @@ def extract_hostname(output: str) -> str:
 
     return "AUTH_REQUIRED" if auth_seen else None
 
-def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=None):
+_VERIFY_JSON_RE = re.compile(r"^Verify_(.+)_(\d{8}_\d{6})\.json$")
+
+def _load_latest_verify_results(alias):
+    """Ket qua trong file Verify_<alias>_<ts>.json moi nhat ([] neu chua co).
+    So khop DUNG alias (truoc day startswith('Verify_ACS_') khop nham ca file
+    cua alias 'ACS_DC2')."""
+    log_dir = "verify-logs"
+    latest_file, latest_time = None, 0
+    try:
+        for fname in os.listdir(log_dir):
+            m = _VERIFY_JSON_RE.match(fname)
+            if not m or m.group(1) != alias: continue
+            fpath = os.path.join(log_dir, fname)
+            mtime = os.path.getmtime(fpath)
+            if mtime > latest_time:
+                latest_time, latest_file = mtime, fpath
+        if latest_file:
+            with open(latest_file, "r", encoding="utf-8") as f: data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception: pass
+    return []
+
+def _atomic_write_text(path, text):
+    """Ghi file qua file tam + os.replace: Dashboard dang doc song song khong
+    bao gio thay JSON viet do dang. Windows co the tu choi replace khi file
+    dich dang mo boi tien trinh khac -> thu lai vai lan."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f: f.write(text)
+    for i in range(10):
+        try:
+            os.replace(tmp, path); return
+        except PermissionError:
+            time.sleep(0.05 * (i + 1))
+    try: os.remove(tmp)
+    except OSError: pass
+    raise PermissionError(f"Khong ghi duoc {path}")
+
+def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=None,
+                    on_result=None, should_stop=None):
+    """on_result(key, result): goi ngay sau khi xong TUNG option (ket qua da
+    duoc luu xuong verify-logs/ truoc do). should_stop(): tra True de dung som
+    giua chung - cac option da xong van duoc giu lai."""
     if print_fn is None: print_fn = log_verify
     max_duration = float(cfg.get("max_verify_duration", 300))
     _verify_deadline = time.time() + max_duration
     print_fn(f"[*] Bat dau kiem tra vat ly (PIVOT) cho OOB: [bold]{alias}[/]")
+
+    # Ket qua duoc ghi xuong verify-logs/ SAU MOI OPTION (cung 1 file cho ca
+    # lan chay) - dung giua chung (Ctrl+C, tat server, nut Dung) khong mat cac
+    # option da verify xong. Truoc day chi ghi 1 lan o cuoi.
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
+    prev_results = _load_latest_verify_results(alias)
 
     creds = get_all_credentials(cfg, oob_ip)
     own_hostname, working_cred = None, creds[0]
@@ -1433,7 +1481,26 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
             reset_session()
             return False
 
+    def _merged_results():
+        done = {r.get("key") for r in results}
+        return results + [pr for pr in prev_results if pr.get("key") and pr["key"] not in done]
+
+    def _persist(final):
+        merged = _merged_results()
+        report = _build_verify_report(alias, oob_ip, own_hostname, merged)
+        if not final:
+            report += (f"\n[DANG CHAY] Moi verify xong {len(results)}/{len(options)} option - file nay duoc cap nhat "
+                       f"sau moi option; neu dung giua chung, cac option chua chay giu ket qua Verify truoc do.\n")
+        os.makedirs("verify-logs", exist_ok=True)
+        with file_lock:
+            _atomic_write_text(log_path, report)
+            _atomic_write_text(log_path[:-4] + ".json", json.dumps(merged, ensure_ascii=False, indent=2))
+        return merged
+
     for key, opt in options.items():
+        if should_stop and should_stop():
+            print_fn(f"[yellow][!][/] {alias}: Da nhan lenh DUNG - ngung Deep Verify, giu {len(results)} option da xong.")
+            break
         if time.time() > _verify_deadline:
             print_fn(f"[yellow][!][/] {alias}: Da vuot qua max_verify_duration ({max_duration:.0f}s) - "
                       f"dung Deep Verify som, cac option con lai giu ket qua Verify gan nhat (neu co).")
@@ -1492,37 +1559,162 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 
                 results.append({"key": key, "status": "CANH BAO", "act_host": act_host, "desc": desc, "port": port, "note": note})
 
+        try: _persist(final=False)
+        except Exception as e: print_fn(f"[yellow][!][/] {alias}: Khong luu duoc ket qua tam: {e}")
+        if on_result:
+            try: on_result(key, results[-1])
+            except Exception: pass
+
     if session: session.close()
-    
-    # Ke thua cac ket qua verify cu cho cac option bi bo qua (do dung filter hoac push)
+
+    # Ban cuoi: ke thua ket qua verify cu cho cac option bi bo qua (filter, push,
+    # het max_verify_duration, dung giua chung).
+    try: return _persist(final=True)
+    except Exception: return _merged_results()
+
+# ---------------------------------------------------------------------------
+# SCAN TAT CA (lay menu + verify desc) co CHECKPOINT - dung giua chung roi chay
+# tiep khong phai lam lai phan da xong.
+# ---------------------------------------------------------------------------
+
+SCAN_ALL_PROGRESS_FILE = "scan_all_progress.json"
+
+def scan_and_save_host(cfg, ip, alias, print_fn):
+    """Ping + lay menu 1 OOB, luu snapshot/baseline NGAY. Tra ve trang thai:
+    'ok' | 'offline' | 'conn_failed' | 'no_menu'."""
+    print_fn(f"  [PING] {alias} ({ip})")
+    alive = ping_host(ip)
+    save_device_status(ip, alias=alias, ping=alive)
+    if not alive:
+        print_fn(f"  [!] {alias}: Khong ping duoc.")
+        return "offline"
+    print_fn(f"  [SCAN] {alias} ({ip})")
+    try: hn, mn, snap, ms = poll_host_multi(ip, cfg, timeout=10)
+    except Exception as e:
+        save_device_status(ip, alias=alias, menu_state="conn_failed")
+        print_fn(f"  [LOI] {alias}: {e}")
+        return "conn_failed"
+    save_device_status(ip, alias=alias, menu_state=ms)
+    if ms in ("fetch_failed", "no_menu") or not snap:
+        print_fn(f"  [!] {alias}: Khong co menu.")
+        return "no_menu"
+    save_options(cfg["snapshot_db"], "snapshot_menu", ip, mn, hn, snap)
+    _, _, bl = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+    if bl is None or not options_equal(bl, snap):
+        diff = diff_options(bl, snap) if bl is not None else None
+        save_options(cfg["baseline_db"], "baseline_menu", ip, mn, hn, snap)
+        log_baseline_change(alias, ip, "CAP NHAT QUA WEB", diff=diff)
+        print_fn(f"  [OK] {alias}: Cap nhat baseline ({len(snap)} option).")
+    else:
+        print_fn(f"  [OK] {alias}: Khop baseline.")
+    return "ok"
+
+def _scan_host_done(h):
+    return h.get("scan") in ("offline", "conn_failed", "no_menu") or h.get("verify") == "done"
+
+def load_scan_all_progress(path=SCAN_ALL_PROGRESS_FILE):
     try:
-        log_dir = "verify-logs"
-        if os.path.exists(log_dir):
-            latest_file = None
-            latest_time = 0
-            for fname in os.listdir(log_dir):
-                if fname.startswith(f"Verify_{alias}_") and fname.endswith(".json"):
-                    fpath = os.path.join(log_dir, fname)
-                    mtime = os.path.getmtime(fpath)
-                    if mtime > latest_time:
-                        latest_time, latest_file = mtime, fpath
-            if latest_file:
-                with open(latest_file, "r", encoding="utf-8") as f: prev_results = json.load(f)
-                current_keys = {r.get("key") for r in results if "key" in r}
-                for pr in prev_results:
-                    if pr.get("key") and pr["key"] not in current_keys:
-                        results.append(pr)
-    except Exception: pass
-    
-    os.makedirs("verify-logs", exist_ok=True)
-    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join("verify-logs", f"Verify_{alias}_{ts_str}.log")
-    with file_lock:
-        with open(log_path, "w", encoding="utf-8") as f: f.write(_build_verify_report(alias, oob_ip, own_hostname, results))
+        with open(path, "r", encoding="utf-8") as f: data = json.load(f)
+        return data if isinstance(data, dict) and isinstance(data.get("hosts"), list) else None
+    except Exception: return None
+
+def scan_all_summary(progress):
+    """Tom tat checkpoint cho UI/CLI."""
+    if not progress: return None
+    hosts = progress["hosts"]
+    return {
+        "run_id": progress.get("run_id"), "started": progress.get("started"), "updated": progress.get("updated"),
+        "finished": progress.get("finished", False), "stopped": progress.get("stopped", False),
+        "total": len(hosts), "done": sum(1 for h in hosts if _scan_host_done(h)),
+        "scanned_ok": sum(1 for h in hosts if h.get("scan") == "ok"),
+        "failed": sum(1 for h in hosts if h.get("scan") in ("offline", "conn_failed", "no_menu")),
+        "opts_verified": sum(len(h.get("verified_keys", [])) for h in hosts),
+        "opts_total": sum(h.get("total_opts", 0) for h in hosts),
+        "in_progress": [h["alias"] for h in hosts if h.get("active")],
+    }
+
+def run_scan_all(cfg, print_fn=None, resume=False, should_stop=None, path=SCAN_ALL_PROGRESS_FILE):
+    """Scan TOAN BO danh sach OOB: lay menu (luu baseline ngay tung OOB) roi
+    Deep Verify desc tung line (luu ngay tung option). Tien do ghi vao `path`
+    sau MOI buoc - resume=True bo qua OOB/option da xong o lan chay truoc.
+    Tra ve dict checkpoint cuoi."""
+    if print_fn is None: print_fn = log_verify
+    should_stop = should_stop or (lambda: False)
+    hosts_now = [(h[0], h[1]) for h in load_ip_list_cached(cfg["ip_list"])]
+    lock = threading.Lock()
+
+    prev = load_scan_all_progress(path) if resume else None
+    if prev:
+        by_ip = {h["ip"]: h for h in prev["hosts"]}
+        hosts = []
+        for ip, alias in hosts_now:   # dong bo voi danh sach hien tai (them/xoa IP)
+            h = by_ip.get(ip) or {"ip": ip, "alias": alias}
+            h["alias"], h["active"] = alias, False
+            hosts.append(h)
+        progress = dict(prev, hosts=hosts, finished=False, stopped=False)
+    else:
+        progress = {"run_id": datetime.now().strftime("%Y%m%d_%H%M%S"), "started": time.time(),
+                    "finished": False, "stopped": False,
+                    "hosts": [{"ip": ip, "alias": alias} for ip, alias in hosts_now]}
+
+    def _save():
+        with lock:
+            progress["updated"] = time.time()
+            text = json.dumps(progress, ensure_ascii=False, indent=1)
+        _atomic_write_text(path, text)
+
+    pending = [h for h in progress["hosts"] if not _scan_host_done(h)]
+    skipped = len(progress["hosts"]) - len(pending)
+    print_fn(f"[*] SCAN TAT CA: {len(pending)} OOB can xu ly"
+             + (f" (bo qua {skipped} OOB da xong o lan truoc)" if skipped else "") + ".")
+    _save()
+
+    def _one(h):
+        if should_stop(): return
+        ip, alias = h["ip"], h["alias"]
+        with lock: h["active"] = True
+        _save()
         try:
-            with open(log_path.replace(".log", ".json"), "w", encoding="utf-8") as f: json.dump(results, f, ensure_ascii=False, indent=2)
-        except Exception: pass
-    return results
+            if h.get("scan") != "ok":
+                st = scan_and_save_host(cfg, ip, alias, print_fn)
+                with lock: h["scan"] = st
+                _save()
+                if st != "ok": return
+            if should_stop(): return
+            _, _, bl = get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+            wanted = {k: v for k, v in (bl or {}).items() if v.get("description")}
+            done_keys = set(h.get("verified_keys", []))
+            todo = {k: v for k, v in wanted.items() if k not in done_keys}
+            with lock: h["total_opts"] = len(wanted)
+            if todo:
+                print_fn(f"  [VERIFY] {alias} ({ip}): {len(todo)} option"
+                         + (f" (da xong {len(done_keys & set(wanted))} o lan truoc)" if done_keys else ""))
+
+                def _on_result(key, _res):
+                    with lock: h.setdefault("verified_keys", []).append(key)
+                    _save()
+
+                run_deep_verify(cfg, alias, ip, todo, print_fn=print_fn, on_result=_on_result, should_stop=should_stop)
+            with lock:
+                h["verify"] = "done" if set(wanted) <= set(h.get("verified_keys", [])) else "partial"
+        except Exception as e:
+            with lock: h["error"] = f"{type(e).__name__}: {e}"
+            print_fn(f"  [LOI] {alias}: {e}")
+        finally:
+            with lock: h["active"] = False
+            _save()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(cfg.get("verify_max_workers", 5)))) as ex:
+        list(ex.map(_one, pending))
+
+    with lock:
+        if should_stop(): progress["stopped"] = True
+        else: progress["finished"] = True
+    _save()
+    s = scan_all_summary(progress)
+    print_fn(f"[OK] SCAN TAT CA {'DA DUNG' if progress['stopped'] else 'HOAN THANH'}: {s['done']}/{s['total']} OOB xong, "
+             f"{s['opts_verified']}/{s['opts_total']} option da verify.")
+    return progress
 
 def _thread_verify_only(cfg, alias, ip, snapshot, pfx="", prog_state=None):
     if prog_state:

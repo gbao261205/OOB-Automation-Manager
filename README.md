@@ -256,7 +256,12 @@ Hostname, hãng sản xuất (Cisco/Vertiv), toàn bộ option/port trong baseli
 
 ### Trang "Vận hành Tức thì" (chỉ Admin)
 
-- **Lưu ý an toàn:** Tính năng chạy hàng loạt (all) cho toàn bộ danh sách thiết bị đã được lược bỏ hoàn toàn.
+- **Scan tất cả thiết bị** (nút ở đây và ở Dashboard): lấy menu toàn bộ OOB (lưu baseline), rồi Deep Verify description từng line. Chỉ đọc, **không Push** gì tới thiết bị.
+  - **Lưu ngay khi xong từng phần:** baseline lưu sau mỗi OOB, kết quả verify lưu sau mỗi line (`verify-logs/`). Tiến độ ghi vào `scan_all_progress.json`.
+  - **Dừng/chạy tiếp:** dừng giữa chừng (nút **⏹ Dừng**, tắt server, mất điện...) không mất phần đã xong. Bấm **⏯ Chạy tiếp lần dở** để bỏ qua các OOB/line đã xong và làm nốt phần còn lại. **Scan tất cả (từ đầu)** chạy lại toàn bộ.
+  - **Bỏ qua khi chạy tiếp:** OOB offline, lỗi kết nối hoặc không có menu được tính là đã xong. Muốn thử lại các OOB này thì chạy từ đầu.
+  - Mỗi lúc chỉ chạy được 1 lần Scan tất cả.
+- **Lưu ý an toàn:** Push/Verify hàng loạt qua `/api/action` (ip=`all`) vẫn bị tắt; chỉ có Scan tất cả ở trên.
 - Khu vực thao tác "Chạy cho thiết bị cụ thể": Nhập IP hoặc Alias để chạy lệnh Scan/Verify/Push cho duy nhất thiết bị đó.
 - Khu vực Live Console.
 
@@ -294,6 +299,8 @@ Hostname, hãng sản xuất (Cisco/Vertiv), toàn bộ option/port trong baseli
 | `/api/credentials` | GET/POST/DELETE | Admin | Quản lý tài khoản phụ |
 | `/api/device` | POST / DELETE | Admin | Thêm / xoá thiết bị |
 | `/api/action` | POST | Admin | Chạy `scan`/`verify`/`push` nền (chỉ định 1 IP) |
+| `/api/scan-all` | POST (`{"resume": bool}`) | Admin | Scan tất cả OOB (menu + verify desc), `resume=true` chạy tiếp lần dở |
+| `/api/scan-all/stop`, `/api/scan-all/status` | POST / GET | Admin | Dừng / xem tiến độ Scan tất cả |
 | `/api/revert` | POST | Admin | Chạy lại lệnh REVERT từ 1 push-log |
 | `/api/import` | POST | Admin | Import danh sách IP từ file `.xlsx` |
 | `/api/change-password` | POST | Admin | Đổi mật khẩu tài khoản đang đăng nhập |
