@@ -138,7 +138,7 @@ def _run_scan(tid, target_ip=None):
         cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
         if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
         pfn = _make_print_fn(tid, target_ip)
-        pfn("Bat dau SCAN " + str(len(hosts)) + " thiet bi (5 threads)...")
+        pfn("Bat dau SCAN " + str(len(hosts)) + " thiet bi (toi da " + str(cfg.get("scan_max_workers", 10)) + " luong song song)...")
         def _scan_single(h):
             oob_monitor.scan_and_save_host(cfg, h[0], h[1], pfn)
 
@@ -152,7 +152,7 @@ def _run_verify(tid, target_ip=None):
         cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
         if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
         pfn = _make_print_fn(tid, target_ip)
-        pfn("Bat dau VERIFY " + str(len(hosts)) + " thiet bi (5 threads)...")
+        pfn("Bat dau VERIFY " + str(len(hosts)) + " thiet bi (toi da " + str(cfg.get("verify_max_workers", 10)) + " luong song song)...")
         def _verify_single(h):
             ip, alias = h[0], h[1]
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
@@ -184,7 +184,7 @@ def _run_push(tid, target_ip=None):
         cfg = _cfg(); hosts = oob_monitor.load_ip_list_cached(cfg["ip_list"])
         if target_ip: hosts = [h for h in hosts if h[0] == target_ip]
         pfn = _make_print_fn(tid, target_ip)
-        pfn("Bat dau PUSH " + str(len(hosts)) + " thiet bi (5 threads)...")
+        pfn("Bat dau PUSH " + str(len(hosts)) + " thiet bi (toi da " + str(cfg.get("verify_max_workers", 10)) + " luong song song)...")
         def _push_single(h):
             ip, alias = h[0], h[1]
             _,_,bl = oob_monitor.get_options_by_host(cfg["baseline_db"],"baseline_menu",ip)
