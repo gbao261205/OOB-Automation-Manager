@@ -64,6 +64,7 @@ Tài liệu này mô tả chi tiết tất cả các endpoint (API) hiện có t
   - **GET**: Trả về cấu hình hệ thống hiện tại (bỏ qua `credentials`; các field nhạy cảm như `password`, `enable_password`, `vertiv_connect_password`, `vertiv_admin_password` trả về `"******"` nếu đã đặt, không trả mật khẩu thật).
   - **POST**: Cập nhật cấu hình hệ thống (interval, ports, schedules, `push_live_mode`...). Gửi lại đúng chuỗi `"******"` cho field nhạy cảm sẽ được bỏ qua (giữ nguyên giá trị cũ), không ghi đè bằng chuỗi mask.
 - **Payload (POST)**: JSON các khóa cần cập nhật.
+- **Kiểm tra dữ liệu (POST)**: các khoá dạng số phải đúng kiểu và trong khoảng, nếu sai trả `400` kèm danh sách khoá lỗi và **không lưu gì**: `ssh_port`/`telnet_port` 1–65535, `interval`/`verify_interval` ≥ 1, `max_verify_duration` ≥ 30, `verify_wait_after_connect*` 0–60 (số thực), `scan_max_workers`/`verify_max_workers` 1–50, `*_schedule_day_of_month` 1–31, `vertiv_prompt_timeout` 5–120, `vertiv_wake_enters` 1–20. `push_live_mode` phải là boolean JSON thật (chuỗi `"false"` bị bỏ qua).
 - **Lưu ý an toàn**: `push_live_mode` (mặc định `false`) quyết định `/api/action {"action":"push"}` và `/api/revert` gửi lệnh thật hay chỉ mô phỏng — xem mục 4.
 
 ### `[GET, POST, DELETE] /api/credentials`
@@ -131,6 +132,7 @@ Tài liệu này mô tả chi tiết tất cả các endpoint (API) hiện có t
 
 ### `[GET] /api/events`
 - **Chức năng**: Luồng Server-Sent Events (SSE) để theo dõi real-time console output của các tác vụ (scan, verify, push, revert, live-debug).
+- **Lưu ý bảo mật**: endpoint này **không yêu cầu đăng nhập** (mọi client mở Dashboard đều nhận được log realtime, gồm hostname/IP/mô tả port). Mật khẩu không bao giờ xuất hiện trong luồng này (lệnh gửi mật khẩu Vertiv khi Live Debug chỉ hiện `******`). Nếu mạng quản trị không tin cậy, cân nhắc thêm `@login_required` cho route này.
 
 ### `[GET] /api/logs` & `[GET] /api/logs/<path:fn>`
 - **Chức năng**: Liệt kê 50 file log Verify mới nhất, và xem nội dung chi tiết của một file Verify Log.

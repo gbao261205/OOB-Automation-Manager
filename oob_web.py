@@ -582,10 +582,38 @@ def api_export_excel():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fn = "OOB_Report_" + ts + ".xlsx"; fp = os.path.join("reports",fn)
     wb.save(fp)
-    return send_file(fp,as_attachment=True,download_name=fn,mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # send_file() giai duong dan TUONG DOI theo thu muc chua code (app.root_path),
+    # con file vua luu theo thu muc HIEN HANH -> 500 khi Web chay voi cwd khac
+    # (service/Task Scheduler). Truyen duong dan tuyet doi.
+    return send_file(os.path.abspath(fp),as_attachment=True,download_name=fn,mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # CÁC API KHÓA HÀNH ĐỘNG THAY ĐỔI DỮ LIỆU (Action / Quản trị)
 _CONFIG_MASK = "******"
+
+# Khoa cau hinh dang so: (kieu, min, max). Gia tri rac (chuoi, 0, so am...) qua
+# API truoc day duoc luu thang: vd verify_max_workers=0 lam ThreadPoolExecutor
+# nem loi va GIET vong lap daemon; vertiv_wake_enters="abc" lam MOI port Vertiv
+# bao TIMEOUT. UI Web luon gui so hop le - check nay chan API goi truc tiep.
+_NUMERIC_CONFIG = {
+    "ssh_port": (int, 1, 65535), "telnet_port": (int, 1, 65535),
+    "interval": (int, 1, None), "verify_interval": (int, 1, None),
+    "max_verify_duration": (int, 30, None),
+    "verify_wait_after_connect": (float, 0, 60),
+    "verify_wait_after_connect_telnet": (float, 0, 60),
+    "verify_wait_after_connect_ssh": (float, 0, 60),
+    "scan_max_workers": (int, 1, 50), "verify_max_workers": (int, 1, 50),
+    "verify_schedule_day_of_month": (int, 1, 31), "scan_schedule_day_of_month": (int, 1, 31),
+    "vertiv_prompt_timeout": (int, 5, 120), "vertiv_wake_enters": (int, 1, 20),
+}
+
+def _valid_number(v, typ, lo, hi):
+    if isinstance(v, bool):
+        return False
+    if typ is int and not isinstance(v, int):
+        return False
+    if typ is float and not isinstance(v, (int, float)):
+        return False
+    return (lo is None or v >= lo) and (hi is None or v <= hi)
 
 @app.route("/api/config", methods=["GET","POST"])
 @login_required
@@ -606,8 +634,13 @@ def api_config():
                "verify_wait_after_connect_telnet","verify_wait_after_connect_ssh","max_verify_duration",
                "push_live_mode","scan_max_workers","verify_max_workers",
                "verify_schedule_day_of_month","verify_schedule_once_datetime",
-               "scan_schedule_day_of_month","scan_schedule_once_datetime"]
+               "scan_schedule_day_of_month","scan_schedule_once_datetime",
+               "vertiv_prompt_timeout","vertiv_wake_enters"]
     body = request.json or {}
+    bad = [k for k, (typ, lo, hi) in _NUMERIC_CONFIG.items()
+           if k in body and not _valid_number(body[k], typ, lo, hi)]
+    if bad:
+        return jsonify({"status": "error", "msg": "Gia tri khong hop le (sai kieu/ngoai khoang): " + ", ".join(bad)}), 400
     for k in allowed:
         if k not in body: continue
         v = body[k]
@@ -1283,6 +1316,10 @@ select.fc option{background:#1a1a2e}
               <div class="fg"><label class="fl">Số luồng song song - Scan</label><input type="number" id="csmw" class="fc" min="1" max="50" placeholder="10"></div>
               <div class="fg"><label class="fl">Số luồng song song - Verify</label><input type="number" id="cvmw" class="fc" min="1" max="50" placeholder="10"></div>
             </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              <div class="fg"><label class="fl">Vertiv - chờ Password/vào phiên (s)</label><input type="number" id="cvpt" class="fc" min="5" max="120" placeholder="15"></div>
+              <div class="fg"><label class="fl">Vertiv - số lần Enter tối đa</label><input type="number" id="cvwe" class="fc" min="1" max="20" placeholder="5"></div>
+            </div>
           </div>
           <button class="btn btn-p" onclick="saveSched()">💾 Lưu lịch</button>
         </div>
@@ -1481,14 +1518,14 @@ async function loadDash(){
     const ab2=d.alarm_count>0?'<span class="badge bp">'+(d.alarm_count)+' ⚠️</span>':d.ok_count>0?'<span class="badge bt">'+d.ok_count+' ✓</span>':'<span class="badge bm">-</span>';
     const upd=(d.updated_at||d.checked_at||'-').replace('T',' ').slice(0,16);
     
-    let actHtml = `<button class="btn btn-g btn-sm btn-ic" onclick="openDev('${esc(d.ip)}','${esc(d.alias)}')" title="Chi tiết Line">👁</button>`;
+    let actHtml = `<button class="btn btn-g btn-sm btn-ic" onclick="openDev(${jsArg(d.ip)},${jsArg(d.alias)})" title="Chi tiết Line">👁</button>`;
     if(isAdmin) {
         actHtml += `
-          <button class="btn btn-t btn-sm btn-ic" onclick="runAction('scan','${esc(d.ip)}')" title="Scan">🔍</button>
-          <button class="btn btn-a btn-sm btn-ic" onclick="runAction('verify','${esc(d.ip)}')" title="Verify">⚡</button>
-          <button class="btn btn-pk btn-sm btn-ic" onclick="runAction('push','${esc(d.ip)}')" title="Push">🚀</button>
-          <button class="btn btn-g btn-sm btn-ic" onclick="openEditDevice('${esc(d.ip)}','${esc(d.alias)}')" title="Sửa">✏️</button>
-          <button class="btn btn-d btn-sm btn-ic" onclick="delDev('${esc(d.ip)}')" title="Xóa">🗑</button>
+          <button class="btn btn-t btn-sm btn-ic" onclick="runAction('scan',${jsArg(d.ip)})" title="Scan">🔍</button>
+          <button class="btn btn-a btn-sm btn-ic" onclick="runAction('verify',${jsArg(d.ip)})" title="Verify">⚡</button>
+          <button class="btn btn-pk btn-sm btn-ic" onclick="runAction('push',${jsArg(d.ip)})" title="Push">🚀</button>
+          <button class="btn btn-g btn-sm btn-ic" onclick="openEditDevice(${jsArg(d.ip)},${jsArg(d.alias)})" title="Sửa">✏️</button>
+          <button class="btn btn-d btn-sm btn-ic" onclick="delDev(${jsArg(d.ip)})" title="Xóa">🗑</button>
         `;
     }
 
@@ -1583,8 +1620,8 @@ async function loadDevOpts(ip){
     else if(o.verify_status==='YEU CAU DANG NHAP')vb='<span class="badge ba">🔑 Auth</span>';
     const ah=o.act_host?'<span class="text-t fw6">'+esc(o.act_host)+'</span>':'<span class="text-m">-</span>';
     const vendorBadge = o.vendor === 'vertiv' ? '<span class="badge ba">VERTIV</span>' : '<span class="badge bt">CISCO</span>';
-    const debugBtn = isAdmin ? `<button class="btn btn-a btn-sm" onclick="runLiveDebug('${esc(ip)}','${esc(o.key)}')" title="Live Debug Real-time">🐛 Debug</button>` : '';
-    const copyBtn = `<button class="btn btn-g btn-sm" onclick="copyConnCmd('${esc(o.vendor)}','${esc(o.description)}','${esc(o.ip)}',${o.port},'${esc(o.protocol)}')" title="Sao chép lệnh kết nối">📋 Copy</button>`;
+    const debugBtn = isAdmin ? `<button class="btn btn-a btn-sm" onclick="runLiveDebug(${jsArg(ip)},${jsArg(o.key)})" title="Live Debug Real-time">🐛 Debug</button>` : '';
+    const copyBtn = `<button class="btn btn-g btn-sm" onclick="copyConnCmd(${jsArg(o.vendor)},${jsArg(o.description)},${jsArg(o.ip)},${Number(o.port)||0},${jsArg(o.protocol)})" title="Sao chép lệnh kết nối">📋 Copy</button>`;
     return`<tr>
         <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
         <td>${esc(o.description)}</td>
@@ -1706,7 +1743,7 @@ async function doSearch(){
       <td>${item.act_host?'<span class="text-g fw6">'+esc(item.act_host)+'</span>':'<span class="text-m">-</span>'}</td>
       <td><span class="mono text-m" style="font-size:11px">${esc(item.protocol)}://${esc(item.target_ip)}:${item.target_port}</span></td>
       <td>${vbadge(item.verify_status)}</td>
-      <td style="padding-right:18px"><button class="btn btn-g btn-sm" onclick="cModal('searchMod');openDev('${esc(item.oob_ip)}','${esc(item.oob_alias)}')">Đi tới →</button></td>
+      <td style="padding-right:18px"><button class="btn btn-g btn-sm" onclick="cModal('searchMod');openDev(${jsArg(item.oob_ip)},${jsArg(item.oob_alias)})">Đi tới →</button></td>
     </tr>`).join('');
 }
 
@@ -1773,6 +1810,7 @@ async function loadSettings(){
            'interval':'ci','verify_interval':'cvi','ip_list':'cil','baseline_db':'cbd','snapshot_db':'csd',
            'verify_wait_after_connect_telnet':'cvwact','verify_wait_after_connect_ssh':'cvwacs','max_verify_duration':'cmvd',
            'scan_max_workers':'csmw','verify_max_workers':'cvmw',
+           'vertiv_prompt_timeout':'cvpt','vertiv_wake_enters':'cvwe',
            'scan_schedule_time':'cst','scan_schedule_weekday':'csw','verify_schedule_time':'cvt','verify_schedule_weekday':'cvw',
            'scan_schedule_day_of_month':'csdm','verify_schedule_day_of_month':'cvdm',
            'scan_schedule_once_datetime':'csod','verify_schedule_once_datetime':'cvod'};
@@ -1804,7 +1842,7 @@ async function saveCfg(){
              telnet_port:parseInt(g('ctp').value)||23,menu_name_override:g('cmno').value,
              auto_verify:g('cav').checked,push_live_mode:wantLive};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
-  if(r.ok)toast('Đã lưu cài đặt!','success');else toast('Lỗi lưu!','error');
+  if(r.ok)toast('Đã lưu cài đặt!','success');else toast((await r.json().catch(()=>({}))).msg||'Lỗi lưu!','error');
 }
 
 async function saveSched(){
@@ -1821,16 +1859,18 @@ async function saveSched(){
              verify_wait_after_connect_ssh:parseFloat(g('cvwacs').value)||3.0,
              max_verify_duration:parseInt(g('cmvd').value)||300,
              scan_max_workers:parseInt(g('csmw').value)||10,
+             vertiv_prompt_timeout:parseInt(g('cvpt').value)||15,
+             vertiv_wake_enters:parseInt(g('cvwe').value)||5,
              verify_max_workers:parseInt(g('cvmw').value)||10};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
-  if(r.ok)toast('Đã lưu lịch!','success');else toast('Lỗi!','error');
+  if(r.ok)toast('Đã lưu lịch!','success');else toast((await r.json().catch(()=>({}))).msg||'Lỗi!','error');
 }
 
 async function saveFiles(){
   if(!isAdmin) return;
   const pay={ip_list:g('cil').value,baseline_db:g('cbd').value,snapshot_db:g('csd').value};
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pay)});
-  if(r.ok)toast('Đã lưu!','success');else toast('Lỗi!','error');
+  if(r.ok)toast('Đã lưu!','success');else toast((await r.json().catch(()=>({}))).msg||'Lỗi!','error');
 }
 
 async function loadCreds(){
@@ -1873,7 +1913,7 @@ async function doImportExcel() {
         toast(`Import thành công ${res.added} thiết bị!`, 'success');
         fileInput.value = ''; // Reset input
     } else {
-        el.innerHTML = `<span style="color:var(--red)">✗ ${res?.msg || 'Lỗi xử lý file!'}</span>`;
+        el.innerHTML = `<span style="color:var(--red)">✗ ${esc(res?.msg || 'Lỗi xử lý file!')}</span>`;
         toast('Lỗi tải lên!', 'error');
     }
 }
@@ -1897,7 +1937,12 @@ function toast(msg,type='info'){
   c.appendChild(t);setTimeout(()=>{t.style.opacity='0';t.style.transform='translateX(20px)';t.style.transition='.3s';setTimeout(()=>t.remove(),300);},4000);
 }
 
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+// Tham so JS an toan de nhung vao onclick="...": esc() (HTML entity) KHONG du
+// cho ngu canh chuoi JS - trinh duyet giai ma entity truoc khi chay handler,
+// nen alias/description chua dau ' van thoat khoi chuoi va chay ma (stored
+// XSS; description lay tu cau hinh menu tren chinh thiet bi mang).
+function jsArg(s){return esc(JSON.stringify(String(s??'')));}
 function nw(){return new Date().toLocaleTimeString('vi-VN');}
 function g(id){return document.getElementById(id);}
 

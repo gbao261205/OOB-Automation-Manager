@@ -51,6 +51,44 @@ SE   = 240
 # khong phai 1 doan text nam giua noi dung dang doc.
 PROMPT_TAIL_RE = re.compile(r'(?:^|[\r\n])[\w\-\.\(\)]{1,64}[>#]\s*$')
 
+# Prompt user-mode kieu Cisco ("HOSTNAME>") chiem TRON dong cuoi. Vertiv ACS
+# ("--:- / cli->" hoac banner "Welcome to ACS8000 <host>") cung ket thuc
+# bang '>' nhung KHONG khop - tranh gui 'enable' vo nghia roi cho '#' het 8s
+# moi lan ket noi Vertiv (Deep Verify Vertiv ket noi lai cho TUNG port).
+CISCO_USER_PROMPT_RE = re.compile(r'(?:^|[\r\n])[\w\-\.]{1,64}>\s*$')
+
+
+def _take_match(session, patterns):
+    """Neu 1 trong patterns DA nam san trong session.buffer (phan du cua lan
+    doc truoc), cat va tra ve ngay. read_until() goi ham nay TRUOC khi cho
+    recv() - truoc day no chi kiem tra buffer SAU khi nhan them du lieu moi,
+    nen neu pattern da co san trong phan du ma thiet bi khong gui gi them, no
+    ngoi cho het timeout (vd dong hot key Vertiv: 2s/port, 'cli->': 1.5s)."""
+    for p in patterns:
+        idx = session.buffer.find(p)
+        if idx != -1:
+            matched = session.buffer[: idx + len(p)]
+            session.buffer = session.buffer[idx + len(p):]
+            return matched.decode(errors="ignore")
+    return None
+
+
+def _take_prompt(session):
+    """Nhu _take_match() nhung cho read_until_prompt(): neu buffer da ket thuc
+    bang PROMPT THAT thi tra ve ngay, khong ngoi cho recv() het timeout."""
+    text = session.buffer.decode(errors="ignore")
+    if PROMPT_TAIL_RE.search(text):
+        session.buffer = b""
+        return text
+    return None
+
+
+# Gioi han tong thoi gian 1 lan drain. Drain doc cho toi khi IM LANG 0.15s -
+# neu console thiet bi dich lien tuc xa log (vd Cisco 'logging console' mac
+# dinh BAT) thi khong bao gio im lang, write() se treo VINH VIEN (giu luon
+# host lock, overlap guard chan moi chu ky sau do).
+DRAIN_MAX_SECONDS = 2.0
+
 
 # ---------------------------------------------------------------------------
 # MiniTelnet — Telnet client toi gian (du phong khi SSH khong duoc)
@@ -106,6 +144,9 @@ class MiniTelnet:
         if isinstance(patterns, (str, bytes)):
             patterns = [patterns]
         patterns = [p.encode() if isinstance(p, str) else p for p in patterns]
+        hit = _take_match(self, patterns)
+        if hit is not None:
+            return hit
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(0.3, deadline - time.time()))
@@ -118,12 +159,9 @@ class MiniTelnet:
             if not chunk:
                 break
             self.buffer += self._strip_iac(chunk)
-            for p in patterns:
-                idx = self.buffer.find(p)
-                if idx != -1:
-                    matched      = self.buffer[: idx + len(p)]
-                    self.buffer  = self.buffer[idx + len(p):]
-                    return matched.decode(errors="ignore")
+            hit = _take_match(self, patterns)
+            if hit is not None:
+                return hit
         data, self.buffer = self.buffer, b""
         return data.decode(errors="ignore")
 
@@ -139,6 +177,9 @@ class MiniTelnet:
                      that bai / mat ket noi giua chung).
             False -> Da doc du toi prompt, du lieu tra ve day du va dang tin cay."""
         self.last_read_timed_out = False
+        hit = _take_prompt(self)
+        if hit is not None:
+            return hit
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(0.3, deadline - time.time()))
@@ -151,15 +192,35 @@ class MiniTelnet:
             if not chunk:
                 break
             self.buffer += self._strip_iac(chunk)
-            text = self.buffer.decode(errors="ignore")
-            if PROMPT_TAIL_RE.search(text):
-                self.buffer = b""
-                return text
+            hit = _take_prompt(self)
+            if hit is not None:
+                return hit
         data, self.buffer = self.buffer, b""
         self.last_read_timed_out = True
         return data.decode(errors="ignore")
 
+    def _drain_pending(self):
+        """Giong MiniSSH._drain_pending(): bo du lieu ton dong (prompt thua,
+        echo cu) truoc khi gui lenh moi. Truoc day MiniTelnet KHONG drain trong
+        khi MiniSSH co - ma moi call site deu viet theo gia dinh cua SSH. Hau
+        qua: tren Telnet, write("\\r\\n") (= 2 lan Enter) sinh 2 prompt, prompt
+        thua bi lenh KE TIEP doc nham lam ket qua -> moi lan doc sau do lech 1
+        nhip -> Scan tra 'no_menu' cho thiet bi chi co Telnet. Van chay qua
+        _strip_iac() de khong bo sot viec tra loi IAC negotiation."""
+        self.buffer = b""
+        self.sock.settimeout(0.15)
+        deadline = time.time() + DRAIN_MAX_SECONDS
+        try:
+            while time.time() < deadline:
+                pending = self.sock.recv(4096)
+                if not pending:
+                    break
+                self._strip_iac(pending)
+        except (socket.timeout, OSError):
+            pass
+
     def write(self, text: str):
+        self._drain_pending()
         self.sock.sendall((text + "\r\n").encode())
 
     def write_cr(self, text: str):
@@ -171,17 +232,17 @@ class MiniTelnet:
         - dan den bi tinh la "nhap mat khau rong" va bi tu choi, khien thiet
         bi hoi lai Password: mac du mat khau ban dau la CHINH XAC. Go tay chi
         gui 1 Enter (\\r) nen khong gap loi nay."""
+        self._drain_pending()
         self.sock.sendall((text + "\r").encode())
 
     def write_no_drain(self, text: str):
-        """Giong write(), nhung ten ham nay khang dinh RO RANG la KHONG duoc
-        xoa buffer dang cho truoc khi gui (xem MiniSSH.write_no_drain() de biet
-        ly do). Voi MiniTelnet thi write() von da khong drain nen day chi la alias,
-        nhung dung ham nay o noi can "go phim danh thuc ma khong mat du lieu cu"
-        de code chay dung ca tren duong SSH lan Telnet."""
-        self.write(text)
+        """Giong write() nhung KHONG xoa buffer/du lieu dang cho truoc khi gui
+        (xem MiniSSH.write_no_drain() de biet ly do) - dung o noi can "go phim
+        danh thuc ma khong mat du lieu cu"."""
+        self.sock.sendall((text + "\r\n").encode())
 
     def write_raw(self, data: bytes):
+        self._drain_pending()
         self.sock.sendall(data)
 
     def close(self):
@@ -239,6 +300,9 @@ class MiniSSH:
         if isinstance(patterns, (str, bytes)):
             patterns = [patterns]
         patterns = [p.encode() if isinstance(p, str) else p for p in patterns]
+        hit = _take_match(self, patterns)
+        if hit is not None:
+            return hit
         deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = max(0.3, deadline - time.time())
@@ -252,12 +316,9 @@ class MiniSSH:
             if not chunk:
                 break
             self.buffer += self._strip_ansi(chunk)
-            for p in patterns:
-                idx = self.buffer.find(p)
-                if idx != -1:
-                    matched     = self.buffer[: idx + len(p)]
-                    self.buffer = self.buffer[idx + len(p):]
-                    return matched.decode(errors="ignore")
+            hit = _take_match(self, patterns)
+            if hit is not None:
+                return hit
         data, self.buffer = self.buffer, b""
         return data.decode(errors="ignore")
 
@@ -271,6 +332,9 @@ class MiniSSH:
         Sau khi goi ham nay, kiem tra self.last_read_timed_out (xem giai thich
         chi tiet o MiniTelnet.read_until_prompt())."""
         self.last_read_timed_out = False
+        hit = _take_prompt(self)
+        if hit is not None:
+            return hit
         deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = max(0.3, deadline - time.time())
@@ -284,10 +348,9 @@ class MiniSSH:
             if not chunk:
                 break
             self.buffer += self._strip_ansi(chunk)
-            text = self.buffer.decode(errors="ignore")
-            if PROMPT_TAIL_RE.search(text):
-                self.buffer = b""
-                return text
+            hit = _take_prompt(self)
+            if hit is not None:
+                return hit
         data, self.buffer = self.buffer, b""
         self.last_read_timed_out = True
         return data.decode(errors="ignore")
@@ -298,8 +361,9 @@ class MiniSSH:
         gay nhieu loan cho read_until tiep theo."""
         self.buffer = b""
         self._shell.settimeout(0.15)
+        deadline = time.time() + DRAIN_MAX_SECONDS
         try:
-            while True:
+            while time.time() < deadline:
                 pending = self._shell.recv(4096)
                 if not pending:
                     break
@@ -312,11 +376,13 @@ class MiniSSH:
         self._shell.send((text + "\n").encode())
 
     def write_cr(self, text: str):
-        """Giong write() nhung CHI gui '\\n' (khong co '\\r'). Xem giai thich
-        chi tiet o MiniTelnet.write_cr() - dung cho o nhap MAT KHAU de tranh
-        ky tu thua bi hieu nham thanh 1 lan Enter rong ke tiep."""
+        """Giong write() nhung ket thuc bang '\\r' - DUNG phim Enter ma 1 SSH
+        client go tay (PuTTY/OpenSSH) gui. Dung cho o nhap MAT KHAU (vd port
+        authentication cua Vertiv ACS sau 'connect <line>'): truoc day ham nay
+        van gui '\\n' (giong het write()) nen mat khau chua bao gio duoc gui
+        nhu nguoi go tay. Xem them MiniTelnet.write_cr()."""
         self._drain_pending()
-        self._shell.send((text + "\n").encode())
+        self._shell.send((text + "\r").encode())
 
     def write_no_drain(self, text: str):
         """Giong write() nhung KHONG goi _drain_pending() truoc khi gui.
@@ -375,6 +441,18 @@ def ping_host(ip: str, timeout: float = 1.0) -> bool:
 # Ket noi thong nhat: SSH truoc, fallback Telnet
 # ---------------------------------------------------------------------------
 
+def _is_vertiv_cli(session, banner):
+    """True neu thiet bi la Vertiv ACS (prompt 'cli->'), ke ca khi lan doc dau
+    bi cat som tai '<host>' cua dong 'Welcome to ACS8000 <host>!'. Moi truong
+    hop khac (Cisco, ke ca banner co '>' giua dong) tra False -> giu NGUYEN
+    hanh vi cu la gui 'enable'."""
+    if "cli->" in banner:
+        return True
+    if CISCO_USER_PROMPT_RE.search(banner):
+        return False
+    return "cli->" in session.read_until(["cli->"], timeout=1.5)
+
+
 def connect_auto(host, ssh_port, telnet_port,
                  username, password, enable_password, timeout=10):
     """Ket noi vao thiet bi: thu SSH truoc (ssh_port), fallback sang Telnet (telnet_port).
@@ -388,7 +466,7 @@ def connect_auto(host, ssh_port, telnet_port,
             session._connect(host, ssh_port, username, password, timeout)
             # paramiko xu ly xac thuc username/password; doc prompt ban dau
             banner = session.read_until([">", "#"], timeout=8)
-            if banner.rstrip().endswith(">"):
+            if banner.rstrip().endswith(">") and not _is_vertiv_cli(session, banner):
                 session.write("enable")
                 resp = session.read_until(["assword:", "#"], timeout=8)
                 if "assword:" in resp:
@@ -429,9 +507,24 @@ def connect_auto(host, ssh_port, telnet_port,
 
     if "assword:" in banner:
         session.write(password)
-        banner = session.read_until([">", "#"], timeout=8)
+        banner = session.read_until([">", "#", "sername:", "assword:"], timeout=8)
+        # Thiet bi hoi LAI Username/Password = dang nhap bi tu choi. Phai nem
+        # loi (dung nhu docstring cam ket) - truoc day tra ve session "nhu da
+        # dang nhap", nen poll_host_multi()/run_deep_verify() khong bao gio thu
+        # tai khoan du phong (multi-account) tiep theo, ma cho het timeout roi
+        # bao 'fetch_failed' gay hieu nham.
+        if banner.rstrip().endswith(("sername:", "assword:")):
+            # Reprompt that thi thiet bi DUNG CHO nhap - khong gui them gi. Neu
+            # trong 1s van con prompt '>'/'#' toi thi chu "Password:" vua roi chi
+            # nam trong banner exec, khong phai bi tu choi.
+            more = session.read_until([">", "#"], timeout=1.0)
+            if more.rstrip().endswith((">", "#")):
+                banner += more
+            else:
+                session.close()
+                raise PermissionError(f"Telnet {host}:{telnet_port} tu choi dang nhap (sai username/password).")
 
-    if banner.rstrip().endswith(">"):
+    if banner.rstrip().endswith(">") and not _is_vertiv_cli(session, banner):
         session.write("enable")
         resp = session.read_until(["assword:", "#"], timeout=8)
         if "assword:" in resp:

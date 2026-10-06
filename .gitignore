@@ -13,11 +13,17 @@ verify-logs/
 debug-logs/
 baseline-logs/
 alarms/
+push-logs/
+reports/
+task_history.json
+device_status.json
+daemon.pid
 
 # --- Python ---
 __pycache__/
 *.pyc
 .pytest_cache/
+.coverage
 
 # --- IDE ---
 .vscode/

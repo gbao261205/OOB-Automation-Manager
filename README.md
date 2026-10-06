@@ -128,7 +128,7 @@ Vào **Menu Quản Lý → [3] Cấu hình** để thiết lập các thông s�
 | `[3]` Enable password | Mật khẩu Enable (Privilege EXEC, Cisco) |
 | `[5]` SSH port | Cổng SSH (ưu tiên thử trước, mặc định 22) |
 | `[6]` Telnet port | Cổng Telnet (dự phòng khi SSH thất bại, mặc định 23) |
-| `[y]` Vertiv Connect Pass | Mật khẩu xác nhận khi pivot qua thiết bị Vertiv ACS (chỉ áp dụng cho thiết bị Vertiv) |
+| `[y]` Vertiv Connect Pass | Mật khẩu xác nhận khi pivot qua thiết bị Vertiv ACS (chỉ áp dụng cho thiết bị Vertiv). Nếu ACS hỏi lại `Password:` (từ chối), lần 2 tool tự thử mật khẩu của user đang đăng nhập ACS. Nếu cả hai đều bị từ chối, các option sau của OOB đó sẽ không gửi mật khẩu nữa (tránh khoá tài khoản ACS), và kết quả `YEU CAU DANG NHAP` sẽ kèm ghi chú "Vertiv TU CHOI mat khau port" |
 
 ### Nhóm FILE DỮ LIỆU
 | Mục | Ý nghĩa |
@@ -163,6 +163,11 @@ Daemon pivot vào từng port console, lấy hostname thực để kiểm tra de
 
 - `[b]` = Bật/tắt chạy Verify ngầm tự động.
 - `[v]`/`[d]` = tần suất/lịch **pivot vật lý** vào từng port console để lấy hostname thực.
+- `[w]`/`[ws]` = thời gian chờ sau khi pivot qua Telnet / SSH trước khi đọc kết quả (SSH bắt tay chậm hơn nên tách riêng).
+- `[m]` = thời gian tối đa cho 1 lần Deep Verify 1 thiết bị; quá hạn thì dừng sớm, các port còn lại giữ kết quả lần trước.
+- `[sw]` = số luồng song song cho Scan / Verify (1–50).
+- `[vt]` = **thông số riêng cho Vertiv ACS**: Vertiv thật sau `connect <port>` mất một lúc mới hỏi `Password:`, nhập pass xong lại mất thêm một khoảng mới vào phiên, và thiết bị đích thường phải gõ Enter nhiều lần mới hiện prompt. Tool chờ tối đa *N giây* cho mỗi bước (mặc định 15s — trả về ngay khi thấy prompt nên không làm chậm thiết bị nhanh) và gõ Enter **từng lần một, dừng ngay khi thấy prompt**, tối đa *M lần* (mặc định 5). Nếu Deep Verify Vertiv vẫn báo `TIMEOUT`/`YEU CAU DANG NHAP` trong khi vào tay được, hãy tăng 2 giá trị này.
+- `[u]` = ghi log thô từng bước Deep Verify (kèm mốc thời gian `+Nms`) ra `debug-logs/` để chẩn đoán. Mật khẩu **không bao giờ** được ghi vào log này (chỉ ghi độ dài).
 - Đây là **2 luồng độc lập theo từng thiết bị** (per-host lock, không còn dùng 1 khoá toàn cục như trước), chạy song song trên 2 thread khác nhau, mỗi luồng có lịch chạy riêng (interval/daily/weekly). Scan thiết bị A và Verify thiết bị B chạy đồng thời thật sự; chỉ khi CÙNG một thiết bị thì Scan và Verify mới chờ nhau (tránh 2 phiên SSH/Telnet cùng lúc tới cùng 1 thiết bị).
 
 > ⚠️ Cả `[s]` (lịch Luồng 1) và `[v]`/`[d]` (lịch Luồng 2) **chỉ có tác dụng khi tiến trình `--daemon` đang chạy**. Ghi các giá trị này qua Web (xem mục 7, tab "Lịch chạy") vẫn lưu được xuống `oob_config.json`, nhưng **không tự kích hoạt bất kỳ vòng lặp nào ở phía Web** — xem mục 8.1.
@@ -307,18 +312,17 @@ Hệ quả:
 - Tab Settings → "Lịch chạy" cho phép chỉnh `interval`/`daily`/`weekly` và lưu xuống `oob_config.json` — **nhưng các giá trị này chỉ có ý nghĩa nếu có một tiến trình `python oob_monitor.py --daemon` chạy song song và đọc cùng file config đó.** Nếu bạn chỉ chạy `oob_web.py` một mình (không có `--daemon` nào chạy nền), thì dù có set lịch "mỗi ngày 1:00 sáng" trên web, **sẽ không có gì tự chạy lúc 1:00 sáng cả** — đây chính là điều bạn nhắc tới: "không có chức năng lặp lịch tự động đi thu thập thông tin".
 - Muốn có giám sát tự động thật sự (tự quét/tự verify theo lịch, kể cả khi không ai mở trình duyệt), **bắt buộc phải chạy thêm** `python oob_monitor.py --daemon` như một tiến trình nền riêng (systemd service, Task Scheduler, tmux, Docker container, v.v.) — Web chỉ là lớp giao diện thao tác/xem, không thay thế được daemon.
 
-### 8.2. ❌ Không có trạng thái Daemon thật (`daemon.pid`) trên giao diện Web
+### 8.2. ✅ (Đã khắc phục) Trạng thái Daemon thật trên giao diện Web
 
-- CLI: Menu Quản Lý đọc file `daemon.pid` (do `--daemon` ghi heartbeat mỗi 30s) để hiển thị chính xác `RUNNING`/`STALE`/`KHONG RO`.
-- Web: chấm tròn "Web server hoạt động" / "N task đang chạy" ở góc trên chỉ đếm số task **do chính web tạo ra** (`task_history.json`), **không đọc `daemon.pid`**. Nghĩa là dù `--daemon` CLI có đang chạy nền thật hay không, Web không hề biết và không hiển thị đúng trạng thái đó.
+Góc dưới sidebar đọc `GET /api/daemon-status` (file `daemon.pid`, heartbeat mỗi 30s của `--daemon`) và hiển thị `Daemon CLI: đang chạy` / `có thể đã dừng (heartbeat cũ)` / `chưa chạy` — cùng nguồn dữ liệu với CLI. Trước đây chỉ đếm task do chính Web tạo.
 
 ### 8.3. ❌ Không tự mở 2 cửa sổ / không có chế độ "CA HAI" như CLI option 3
 
 Web chỉ là 1 tiến trình `python oob_web.py` duy nhất — không có khái niệm mở song song 2 cửa sổ Menu + Daemon như CLI.
 
-### 8.4. ❌ Không có sửa (edit) thiết bị đã thêm, chỉ có Thêm / Xóa
+### 8.4. ✅ (Đã khắc phục) Sửa thiết bị đã thêm
 
-`/api/device` chỉ hỗ trợ `POST` (thêm) và `DELETE` (xóa). Muốn đổi alias của 1 IP đã có, phải xóa rồi thêm lại (hoặc sửa tay `oob_ips.txt` / dùng CLI).
+Nút ✏️ trên mỗi dòng thiết bị (`PUT /api/device`) sửa alias và/hoặc IP, **giữ nguyên vị trí dòng** trong `oob_ips.txt`. IP mới được kiểm tra định dạng, không cho trùng IP đã có. Alias có khoảng trắng/xuống dòng (kể cả từ Import Excel) tự được thay bằng `_`.
 
 ### 8.5. Bảng tổng hợp nhanh
 
@@ -391,3 +395,5 @@ Vẫn hoạt động được, nhưng cần hiểu rõ giới hạn: **không c�
 - 2 tiến trình `--menu` và `--daemon` (khi chạy chế độ 3) không chia sẻ bộ nhớ — đổi cấu hình ở cửa sổ Menu chỉ có hiệu lực ngay với 2 mục lịch chạy (`[s]`, `[d]`), các mục còn lại cần khởi động lại `--daemon` mới nhận.
 - `oob_web.py` là 1 tiến trình hoàn toàn riêng biệt với `--daemon`/`--menu` — cũng không chia sẻ bộ nhớ, chỉ chia sẻ file config/DB trên đĩa. Đổi cấu hình trên Web ghi xuống `oob_config.json` như CLI, áp dụng đúng quy tắc trên nếu có `--daemon` đang chạy song song.
 - `oob_web.py` mặc định tự sinh `SECRET_KEY` ngẫu nhiên mỗi lần khởi động (mất session khi restart) — xem lưu ý bảo mật ở mục 7. `oob_config.json` được mã hoá tại chỗ (field credential) và `GET /api/config` trả `"******"` cho field nhạy cảm thay vì mật khẩu thật.
+- Kết nối qua **Telnet** (dự phòng khi SSH lỗi) chỉ hỗ trợ thiết bị hỏi `Username:`/`Password:` (kiểu Cisco). Thiết bị hỏi `login:` (Linux, Vertiv qua Telnet) chưa được hỗ trợ đăng nhập qua Telnet — Vertiv nên để SSH. Sai mật khẩu qua Telnet giờ được phát hiện ngay và chuyển sang tài khoản phụ (trước đây chờ ~40s rồi báo nhầm "không lấy được menu").
+- Luồng log realtime `/api/events` không yêu cầu đăng nhập (khách xem Dashboard cũng nhận log Scan/Verify). Mật khẩu luôn bị che, nhưng nếu mạng quản trị không tin cậy hãy cân nhắc giới hạn truy cập Web.

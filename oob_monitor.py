@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
     "verify_wait_after_connect": 1.5,
     "verify_wait_after_connect_telnet": 1.5,
     "verify_wait_after_connect_ssh": 3.0,
+    "vertiv_prompt_timeout": 15,
+    "vertiv_wake_enters": 5,
     "max_verify_duration": 300,
     "debug_verify": False,
     "push_live_mode": False,
@@ -625,6 +627,7 @@ def settings_menu(cfg, config_path):
         g.add_row("\\[ws]", f"Cho sau connect-SSH   : [bold cyan]{cfg.get('verify_wait_after_connect_ssh', 3.0)}[/]s")
         g.add_row("\\[m]", f"Timeout Verify (s)    : [bold cyan]{cfg.get('max_verify_duration', 300)}[/]")
         g.add_row("\\[sw]", f"So luong song song Scan/Verify: [bold cyan]{cfg.get('scan_max_workers', 10)}[/] / [bold cyan]{cfg.get('verify_max_workers', 10)}[/]")
+        g.add_row("\\[vt]", f"Vertiv: cho Password/phien [bold cyan]{cfg.get('vertiv_prompt_timeout', 15)}[/]s, Enter toi da [bold cyan]{cfg.get('vertiv_wake_enters', 5)}[/] lan")
         dbg_on = "[green bold]BAT[/]" if cfg.get("debug_verify") else "[red bold]TAT[/]"
         g.add_row("\\[u]", f"Debug Verify (raw log): {dbg_on}  [dim]-> debug-logs/{os.path.basename(DEBUG_VERIFY_LOG)}[/]")
         g.add_row("", "")
@@ -658,6 +661,11 @@ def settings_menu(cfg, config_path):
             if val.isdigit() and 1 <= int(val) <= 50: cfg["scan_max_workers"] = int(val)
             val2 = input("  So luong thread song song cho Verify (1-50): ").strip()
             if val2.isdigit() and 1 <= int(val2) <= 50: cfg["verify_max_workers"] = int(val2)
+        elif choice == "vt":
+            val = input("  Vertiv - so giay cho hien Password / vao phien sau khi nhap pass (5-120): ").strip()
+            if val.isdigit() and 5 <= int(val) <= 120: cfg["vertiv_prompt_timeout"] = int(val)
+            val2 = input("  Vertiv - so lan go Enter toi da de danh thuc thiet bi dich (1-20): ").strip()
+            if val2.isdigit() and 1 <= int(val2) <= 20: cfg["vertiv_wake_enters"] = int(val2)
         elif choice == "pl":
             cfg["push_live_mode"] = not cfg.get("push_live_mode", False)
             state = "THAT" if cfg["push_live_mode"] else "MO PHONG"
@@ -745,7 +753,18 @@ def load_ip_list_cached(path: str) -> list:
     _ip_list_cache.update({"path": path, "mtime": mtime, "hosts": hosts})
     return hosts
 
+def _clean_alias(alias):
+    """Alias la 1 TOKEN duy nhat trong file 'ip alias' (load_ip_list() chi lay
+    token dau sau IP). Thay khoang trang/ky tu dieu khien bang '_' - truoc day
+    alias co dau cach bi cat cut am tham, con alias co xuong dong (vd o Excel
+    Alt+Enter, hoac JSON '\\n' qua API) chen them DONG MOI gia vao danh sach IP."""
+    if not alias:
+        return None
+    cleaned = re.sub(r'[\s\x00-\x1f\x7f]+', '_', str(alias).strip()).strip('_')[:64]
+    return cleaned or None
+
 def add_ip(path, ip, alias=None):
+    alias = _clean_alias(alias)
     hosts = load_ip_list(path)
     if any(h[0] == ip for h in hosts): return _con.print(f"  [yellow][!][/] IP {ip} da co.")
     with open(path, "a", encoding="utf-8") as f: f.write(f"{ip} {alias or ip}\n")
@@ -773,7 +792,7 @@ def update_ip(path, old_ip, new_alias=None, new_ip=None):
     with open(path, "w", encoding="utf-8") as f:
         for h_ip, h_alias in hosts:
             if h_ip == old_ip:
-                out_alias = (new_alias or "").strip() or h_alias
+                out_alias = _clean_alias(new_alias) or h_alias
                 f.write(f"{target_ip} {out_alias}\n")
             else:
                 f.write(f"{h_ip} {h_alias}\n")
@@ -1110,8 +1129,32 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
         if session: session.close()
         session = None
 
+    # Port authentication Vertiv ('Password:' sau 'connect <line>') dung chung cho
+    # moi option cua OOB nay: nho mat khau da duoc chap nhan de dung truoc, va
+    # neu moi mat khau deu bi tu choi thi khong gui lai o cac option sau.
+    vertiv_auth = {"ok_pass": None, "all_rejected": False, "note": {}}
+
+    def _vertiv_pw_candidates():
+        """[(nguon, mat khau)] theo thu tu thu: mat khau da thanh cong truoc do,
+        'Vertiv Connect Pass' [y], roi mat khau dang nhap ACS dang dung (port
+        auth cua ACS xac thuc lai user dang nhap - nhieu noi chinh la mat khau
+        nay). Bo trung/rong va chuoi chua giai ma (ENC:/B64:)."""
+        raw = [("mat khau da thanh cong", vertiv_auth["ok_pass"]),
+               ("Vertiv Connect Pass [y]", cfg.get("vertiv_connect_password")),
+               (f"mat khau dang nhap ACS (user {working_cred.get('username', '?')})", working_cred.get("password"))]
+        out, seen = [], set()
+        for label, pw in raw:
+            if not pw or not isinstance(pw, str) or pw in seen or pw.startswith(("ENC:", "B64:")):
+                continue
+            seen.add(pw)
+            out.append((label, pw))
+        return out
+
     def check_port_via_oob(t_ip, t_port, proto, vendor, t_desc, key="?", live_print=None):
         t_start = time.time()
+        # Chi hoi nhap mat khau thu cong khi chay Live Debug tu CLI that (co
+        # terminal) - o Web, _con.input() se treo/doc stdin cua tien trinh server.
+        _interactive = live_print is _con.print and bool(getattr(sys.stdin, "isatty", lambda: False)())
 
         def _dbg(label, text, extra=""):
             debug_dump(cfg, alias, key, label, text, extra=extra, elapsed_ms=int((time.time() - t_start) * 1000))
@@ -1133,11 +1176,15 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 live_print(f"\n[bold green]>>> SENDING:[/] {repr(text)}\n")
             s.write(text)
 
-        def _write_cr(text):
+        def _write_secret(text):
+            # Gui mat khau: KHONG in gia tri ra live_print - o Web, Live Debug phat
+            # moi dong qua SSE (/api/events khong can dang nhap) toi MOI client.
+            # Ket thuc bang Enter nhu nguoi go tay ('\r' tren SSH) - truoc day
+            # gui '\n' tren SSH, khac voi khi pivot thu cong.
             if live_print:
-                live_print(f"\n[bold green]>>> SENDING (CR):[/] {repr(text)}\n")
+                live_print(f"\n[bold green]>>> SENDING (CR):[/] '******' (mat khau - an, dai {len(text or '')} ky tu)\n")
             s.write_cr(text)
-            
+
         def _write_no_drain(text):
             if live_print:
                 live_print(f"\n[bold green]>>> SENDING (NO DRAIN):[/] {repr(text)}\n")
@@ -1148,67 +1195,93 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 live_print(f"\n[bold green]>>> SENDING (RAW):[/] {repr(b_text)}\n")
             s.write_raw(b_text)
             
-        if vendor == "vertiv": 
+        if vendor == "vertiv":
+            # Vertiv that: sau 'connect' mat 1 luc moi hien Password:, nhap pass
+            # xong lai mat them 1 khoang moi vao phien. read_until() tra ve NGAY
+            # khi thay pattern nen timeout dai khong lam cham thiet bi nhanh -
+            # chi tranh viec bo qua buoc nhap pass vi cho chua du (truoc la 5s).
+            v_timeout = float(cfg.get("vertiv_prompt_timeout", 15))
             cmd = f"connect {t_desc}"
             _write(cmd)
             _dbg("B0-CMD-SENT", cmd)
-            
+
             # Buoc 1: Cho xem thiet bi hoi Pass hay vao thang/xuat hien Prompt/Hot key
-            out_tmp = _read(["assword:", "Password:", "Type the hot key", "cli->"], timeout=5)
+            out_tmp = _read(["assword:", "Password:", "Type the hot key", "cli->"], timeout=v_timeout)
             out += out_tmp
             _dbg("B1-after-connect", out_tmp)
             
             if "assword:" in out_tmp or "Password:" in out_tmp:
-                v_pass = cfg.get("vertiv_connect_password", "")
-                if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Da thay prompt Password, gui mat khau Vertiv...")
-                time.sleep(0.3)
-                _write(v_pass)
-                # Buoc 2: Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
-                chunk = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:", "Enter your option:"], timeout=12)
-                out += chunk
-                _dbg("B2-after-vpass", chunk, extra=f"(v_pass_set={'yes' if v_pass else 'EMPTY!'}, repr={repr(v_pass)})")
+                pw_list = _vertiv_pw_candidates()
+                if vertiv_auth["all_rejected"] or not pw_list:
+                    # Khong gui gi: hoac khong co mat khau nao de gui, hoac moi mat
+                    # khau da bi tu choi o option truoc. Port auth cua ACS xac thuc
+                    # lai CHINH user dang nhap ACS - gui sai lien tuc cho tung option
+                    # (16 option x 2 lan) co the lam KHOA tai khoan ACS do.
+                    reason = ("moi mat khau da bi tu choi o option truoc - khong thu lai de tranh khoa tai khoan ACS"
+                              if vertiv_auth["all_rejected"] else
+                              "chua co mat khau nao de gui (Vertiv Connect Pass [y] trong/giai ma loi)")
+                    vertiv_auth["note"][key] = f"Vertiv hoi Password khi connect: {reason}"
+                    log_verify(f"[bold red][!!!][/] {alias} (Opt {key}): Vertiv hoi Password khi connect '{t_desc}' - {reason}.")
+                    _dbg("B2-VPASS-SKIPPED", out_tmp, extra=f"({reason})")
+                    password_rejected = True
+                else:
+                    if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Da thay prompt Password, gui mat khau Vertiv...")
+                    accepted = False
+                    for attempt in (1, 2):
+                        if attempt == 1:
+                            v_label, v_pass = pw_list[0]
+                        else:
+                            # Lan 2: thu mat khau KHAC neu co (vd mat khau dang nhap
+                            # ACS - port auth xac thuc lai user dang nhap ACS, co the
+                            # khac chu so huu 'Vertiv Connect Pass'), neu khong thi
+                            # gui lai dung mat khau cu (mot so ACS hoi Password 2 lan
+                            # lien tiep ngay ca khi dung).
+                            v_label, v_pass = pw_list[1] if len(pw_list) > 1 else pw_list[0]
+                            if _interactive:
+                                try:
+                                    _con.print("\n  [bold yellow][!][/] Mat khau Vertiv tu dong bi tu choi hoac can xac nhan lai!")
+                                    manual_p = _con.input("  [bold cyan]>> Nhap THU CONG Vertiv Connect Pass (Enter de dung mat khau tu dong)[/]: ").strip()
+                                    if manual_p:
+                                        v_label, v_pass = "nhap tay", manual_p
+                                except Exception: pass
+                            log_verify(f"[yellow][!][/] {alias} (Opt {key}): OOB Vertiv hoi lai Password: sau lan 1 - thu lai voi {v_label}...")
+                        time.sleep(0.3 if attempt == 1 else 0.5)
+                        _write_secret(v_pass)
+                        # Cho xac thuc xong (co the ra Hot key, Prompt hoac quay ve cli->)
+                        chunk = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:", "Enter your option:"], timeout=max(12.0, v_timeout))
+                        out += chunk
+                        # KHONG ghi gia tri mat khau ra log/man hinh - chi nguon + do dai.
+                        _dbg("B2-after-vpass" if attempt == 1 else "B2b-retry-vpass", chunk,
+                             extra=f"(nguon={v_label}, len={len(v_pass)})")
 
-                # Xu ly dac biet neu Vertiv ra Multi Session Menu (khi co nhieu session)
-                if "Enter your option:" in chunk:
-                    if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Vertiv hien Multi Session Menu, tu dong chon '1'...")
-                    time.sleep(0.3)
-                    _write("1")
-                    chunk_menu = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
-                    out += chunk_menu
-                    _dbg("B2m-after-menu", chunk_menu)
-                    chunk = chunk_menu  # Ghi de chunk de xu ly logic ben duoi y nhu binh thuong
+                        # Xu ly dac biet neu Vertiv ra Multi Session Menu (khi co nhieu session)
+                        if "Enter your option:" in chunk:
+                            if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Vertiv hien Multi Session Menu, tu dong chon '1'...")
+                            time.sleep(0.3)
+                            _write("1")
+                            chunk = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
+                            out += chunk
+                            _dbg("B2m-after-menu", chunk)
 
+                        # Thiet bi HOI LAI "Password:" (khong tien den Hot key/login/
+                        # cli->) nghia la mat khau vua gui bi TU CHOI.
+                        if not ("assword:" in chunk and not any(
+                            x in chunk for x in ("Type the hot key", "cli->", "login:", "Username:")
+                        )):
+                            accepted = True
+                            if "Type the hot key" in chunk:
+                                vertiv_auth["ok_pass"] = v_pass
+                            break
 
-                # Neu thiet bi HOI LAI "Password:" (khong tien den Hot key/login/cli->)
-                # nghia la mat khau "Vertiv Connect Pass" da gui bi TU CHOI. Thu gui
-                # lai DUNG 1 LAN NUA (mot so ACS hoi Password 2 lan lien tiep ngay ca
-                # khi dung), sau do neu van bi hoi lai thi bao CANH BAO ro rang ngay,
-                # thay vi de code roi vao AUTH_REQUIRED mo ho sau khi cho het timeout.
-                if ("assword:" in chunk or "Password:" in chunk) and not any(
-                    x in chunk for x in ("Type the hot key", "cli->", "login:", "Username:")
-                ):
-                    v_pass_retry = v_pass
-                    if live_print:
-                        try:
-                            _con.print("\n  [bold yellow][!][/] Mat khau Vertiv tu dong bi tu choi hoac can xac nhan lai!")
-                            manual_p = _con.input("  [bold cyan]>> Nhap THU CONG Vertiv Connect Pass (Enter de giu nguyen mat khau cu)[/]: ").strip()
-                            if manual_p:
-                                v_pass_retry = manual_p
-                        except Exception: pass
-                    else:
-                        log_verify(f"[yellow][!][/] {alias} (Opt {key}): OOB Vertiv hoi lai Password: sau lan 1 - thu lai 1 lan nua...")
-                    time.sleep(0.5)
-                    _write(v_pass_retry)
-                    chunk2 = _read(["Type the hot key", "cli->", "login:", "Username:", "Password:"], timeout=8)
-                    out += chunk2
-                    _dbg("B2b-retry-vpass", chunk2)
-                    if ("assword:" in chunk2 or "Password:" in chunk2) and not any(
-                        x in chunk2 for x in ("Type the hot key", "cli->", "login:", "Username:")
-                    ):
-                        msg = (f"[bold red][!!!][/] {alias} (Opt {key}): 'Vertiv Connect Pass' bi TU CHOI 2 lan lien tiep "
-                               f"khi connect toi '{t_desc}' - kiem tra lai muc [y] trong Cai dat!")
-                        log_verify(msg)
-                        _dbg("B2c-PASSWORD-REJECTED", out, extra="(v_pass sai hoac thiet bi tu choi)")
+                    if not accepted:
+                        tried = ", ".join(dict.fromkeys(lbl for lbl, _ in pw_list[:2]))
+                        vertiv_auth["all_rejected"] = True
+                        vertiv_auth["note"][key] = (f"Vertiv TU CHOI mat khau port khi connect '{t_desc}' (da thu: {tried}) - "
+                                                    f"kiem tra [y] Vertiv Connect Pass / mat khau user dang nhap ACS")
+                        log_verify(f"[bold red][!!!][/] {alias} (Opt {key}): Mat khau Vertiv bi TU CHOI 2 lan khi connect toi "
+                                   f"'{t_desc}' (da thu: {tried}) - kiem tra lai muc [y] trong Cai dat! "
+                                   f"Cac option sau cua OOB nay se KHONG gui mat khau nua (tranh khoa tai khoan).")
+                        _dbg("B2c-PASSWORD-REJECTED", out, extra=f"(da thu: {tried})")
                         password_rejected = True
                 
             # Đọc nốt dòng chứa Hot key để bỏ qua ký tự '>' trong <CTRL>Z
@@ -1239,19 +1312,9 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 out += chunk
                 _dbg("B3-banner-read", chunk)
 
-                # Xử lý trường hợp Vertiv báo Data Buffering Suspended cần Enter thêm để hiện prompt
-                if "Data Buffering Suspended" in out and not any(x in out for x in (">", "#", "login:", "Username:")):
-                    if not live_print: log_verify(f"[yellow][!][/] {alias} (Opt {key}): Vertiv OOB hien Data Buffering Suspended, tu dong gui Enter de danh thuc prompt...")
-                    time.sleep(0.5)
-                    _write_no_drain("") # Gui phím Enter thứ nhất
-                    time.sleep(0.3)
-                    _write_no_drain("") # Gui phím Enter thứ hai
-                    chunk = _read(["login:", "Username:", "Password:", ">", "#", "cli->", "%"], timeout=5)
-                    out += chunk
-                    _dbg("B3c-after-buffering-wake", chunk)
-
                 # Buoc 4: CHI go Enter "danh thuc" neu sau hotkey banner Vertiv (<CTRL>Z)
-                # van CHUA thay bat ky dau hieu prompt/dang nhap nào của máy đích.
+                # van CHUA thay bat ky dau hieu prompt/dang nhap nào của máy đích
+                # (bao gom ca truong hop Vertiv bao "Data Buffering Suspended").
                 target_out = out
                 if vendor == "vertiv":
                     idx_z = target_out.rfind("<CTRL>Z")
@@ -1261,15 +1324,25 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                         idx_hk = target_out.rfind("Type the hot key")
                         if idx_hk != -1: target_out = target_out[idx_hk:]
 
-                if not re.search(r'login:|Username:|Password:|Login authentication|[>#]\s*$|cli->|%', target_out, re.IGNORECASE):
+                prompt_seen_re = r'login:|Username:|Password:|Login authentication|[>#]\s*$|cli->|%'
+                if not re.search(prompt_seen_re, target_out, re.IGNORECASE):
                     if not live_print: log_verify(f"[cyan][i][/] {alias} (Opt {key}): Vertiv OOB vao session nhung chua in prompt, gui Enter danh thuc...")
+                    # Thiet bi dich qua Vertiv thuong phai go Enter NHIEU lan moi
+                    # hien prompt. Truoc day go co dinh 2 Enter roi doc 1 lan -> may
+                    # can 3+ Enter thanh TIMEOUT (ke ca khi cam SAI thiet bi - sai
+                    # lech that bi che thanh TIMEOUT). Go tung Enter (khong drain)
+                    # va DUNG NGAY khi thay prompt: khong go thua, vi Enter rong tai
+                    # 'login:' se bi tinh la gui username rong.
+                    max_enters = max(1, int(cfg.get("vertiv_wake_enters", 5)))
                     time.sleep(0.5)
-                    _write_no_drain("") # Gui phim Enter thu nhat
-                    time.sleep(0.3)
-                    _write_no_drain("") # Gui phim Enter thu hai
-                    chunk = _read(["login:", "Username:", "Password:", "Login authentication", ">", "#", "cli->", "%"], timeout=5)
-                    out += chunk
-                    _dbg("B4-wake-enter", chunk)
+                    for n_enter in range(1, max_enters + 1):
+                        _write_no_drain("")
+                        chunk = _read(["login:", "Username:", "Password:", "Login authentication", ">", "#", "cli->", "%"], timeout=3)
+                        out += chunk
+                        target_out += chunk
+                        _dbg(f"B4-wake-enter-{n_enter}", chunk)
+                        if re.search(prompt_seen_re, target_out, re.IGNORECASE):
+                            break
                 else:
                     _dbg("B4-SKIPPED", "(da thay prompt/login sau banner, khong go Enter)")
             
@@ -1388,6 +1461,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
                 else: note_parts.append("Khong clear duoc line")
             else: note_parts.append("Port la Direct/Vertiv, bo qua clear line")
 
+        if key in vertiv_auth["note"]:
+            note_parts.insert(0, vertiv_auth["note"].pop(key))
         note = "; ".join(note_parts)
         if not act_host:
             print_fn(f"[dim][-][/] {alias} (Opt {key}): TIMEOUT hoac Loi mang")
