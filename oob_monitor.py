@@ -1704,8 +1704,18 @@ def run_scan_all(cfg, print_fn=None, resume=False, should_stop=None, path=SCAN_A
             with lock: h["active"] = False
             _save()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(cfg.get("verify_max_workers", 5)))) as ex:
-        list(ex.map(_one, pending))
+    # OOB bi cat boi max_verify_duration -> "partial": tu dong chay tiep phan
+    # con lai (khong phai bam resume thu cong), dung khi xong het hoac 1 vong
+    # khong verify them duoc option nao.
+    while pending and not should_stop():
+        before = sum(len(h.get("verified_keys", [])) for h in progress["hosts"])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(cfg.get("verify_max_workers", 5)))) as ex:
+            list(ex.map(_one, pending))
+        pending = [h for h in progress["hosts"] if h.get("verify") == "partial" and not h.get("error")]
+        after = sum(len(h.get("verified_keys", [])) for h in progress["hosts"])
+        if after <= before: break
+        if pending and not should_stop():
+            print_fn(f"[*] SCAN TAT CA: chay tiep {len(pending)} OOB con option chua verify (bi cat do max_verify_duration).")
 
     with lock:
         if should_stop(): progress["stopped"] = True
