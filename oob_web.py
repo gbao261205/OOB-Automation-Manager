@@ -351,45 +351,43 @@ def api_daemon_status():
     status, pid, age = oob_monitor._read_daemon_pid_info()
     return jsonify({"status": status, "pid": pid, "age_seconds": round(age) if age is not None else None})
 
-@app.route("/api/stats")
-def api_stats():
+def _dashboard_data():
+    """Du lieu Dashboard: 1 query SQLite cho moi host + gom ket qua verify
+    theo alias 1 lan (truoc day 2 query/host + quet toan bo ket qua verify
+    cho TUNG thiet bi, lam ca 2 lan cho /api/stats va /api/devices)."""
     cfg = _cfg(); ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     ds = oob_monitor.load_device_status()
     vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
-    
-    stats = {"total": len(ips), "online": 0, "offline": 0, "has_baseline": 0, "alarms": 0}
+    summary = oob_monitor.get_all_hosts_summary(cfg["baseline_db"], "baseline_menu")
+    counts = {}
+    for (a, _k), v in vst.items():
+        c = counts.setdefault(a, [0, 0]); st = v.get("status")
+        if st == "CANH BAO": c[0] += 1
+        elif st == "OK": c[1] += 1
+    devs = []
     for ip, alias in ips:
-        st = ds.get(ip, {})
-        if st.get("ping") is True: stats["online"] += 1
-        elif st.get("ping") is False: stats["offline"] += 1
-        
-        mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-        if bl and len(bl) > 0:
-            stats["has_baseline"] += 1
-            
-        alarm_c = sum(1 for (a, k), v in vst.items() if a == alias and v.get("status") == "CANH BAO")
-        stats["alarms"] += alarm_c
-        
-    return jsonify(stats)
+        st = ds.get(ip, {}); sm = summary.get(ip, {}); alarm_c, ok_c = counts.get(alias, (0, 0))
+        devs.append({"ip": ip, "alias": alias, "ping": st.get("ping"), "menu_state": st.get("menu_state"),
+            "checked_at": st.get("checked_at", "-"), "opt_count": sm.get("opt_count", 0),
+            "device_name": sm.get("device_name") or "", "menu_name": sm.get("menu_name") or "",
+            "updated_at": sm.get("updated_at") or "", "alarm_count": alarm_c, "ok_count": ok_c})
+    stats = {"total": len(devs),
+             "online": sum(1 for d in devs if d["ping"] is True),
+             "offline": sum(1 for d in devs if d["ping"] is False),
+             "has_baseline": sum(1 for d in devs if d["opt_count"] > 0),
+             "alarms": sum(d["alarm_count"] for d in devs)}
+    return stats, devs
+
+@app.route("/api/stats")
+def api_stats():
+    return jsonify(_dashboard_data()[0])
 
 @app.route("/api/devices")
 def api_devices():
-    cfg = _cfg(); ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
-    ds = oob_monitor.load_device_status()
-    vst = oob_monitor._parse_verify_logs_for_status(max_age_hours=24.0*30)
-    devs = []
-    for ip, alias in ips:
-        st = ds.get(ip, {})
-        mn, dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
-        opt_count = len(bl) if bl else 0
-        alarm_c = sum(1 for (a, k), v in vst.items() if a == alias and v.get("status") == "CANH BAO")
-        ok_c = sum(1 for (a, k), v in vst.items() if a == alias and v.get("status") == "OK")
-        upd = oob_monitor.get_updated_at_by_host(cfg["baseline_db"], "baseline_menu", ip)
-        devs.append({"ip": ip, "alias": alias, "ping": st.get("ping"), "menu_state": st.get("menu_state"),
-            "checked_at": st.get("checked_at", "-"), "opt_count": opt_count,
-            "device_name": dn or "", "menu_name": mn or "", "updated_at": upd or "",
-            "alarm_count": alarm_c, "ok_count": ok_c})
-    return jsonify(devs)
+    if request.args.get("with_stats"):
+        stats, devs = _dashboard_data()
+        return jsonify({"stats": stats, "devices": devs})
+    return jsonify(_dashboard_data()[1])
 
 @app.route("/api/device/<ip>/options")
 def api_device_options(ip):
@@ -1596,7 +1594,7 @@ function sTab(tabId,btn){
 }
 
 async function loadDash(){
-  const[stats,devs]=await Promise.all([fetch('/api/stats').then(r=>r.json()).catch(()=>({})),fetch('/api/devices').then(r=>r.json()).catch(()=>[])]);
+  const dd=await fetch('/api/devices?with_stats=1').then(r=>r.json()).catch(()=>({}));const stats=dd.stats||{},devs=dd.devices||[];
   document.getElementById('s-total').textContent=stats.total??0;
   document.getElementById('s-online').textContent=stats.online??0;
   document.getElementById('s-baseline').textContent=stats.has_baseline??0;

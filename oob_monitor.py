@@ -838,6 +838,15 @@ def get_options_by_host(db_path, table, host):
         }
     return menu_name, device_name, options
 
+def get_all_hosts_summary(db_path, table):
+    """1 query cho TAT CA host (Dashboard Web) thay vi 2 query/host:
+    {host: {"menu_name", "device_name", "opt_count", "updated_at"}}."""
+    with db_lock:
+        conn = _init_db(db_path, table)
+        rows = conn.execute(f"SELECT host, MIN(menu_name), MIN(device_name), COUNT(*), MAX(updated_at) FROM {table} GROUP BY host").fetchall()
+        conn.close()
+    return {h: {"menu_name": mn, "device_name": dn, "opt_count": c, "updated_at": upd} for h, mn, dn, c, upd in rows}
+
 def get_updated_at_by_host(db_path, table, host):
     with db_lock:
         conn = _init_db(db_path, table)
@@ -1704,8 +1713,18 @@ def run_scan_all(cfg, print_fn=None, resume=False, should_stop=None, path=SCAN_A
             with lock: h["active"] = False
             _save()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(cfg.get("verify_max_workers", 5)))) as ex:
-        list(ex.map(_one, pending))
+    # OOB bi cat boi max_verify_duration -> "partial": tu dong chay tiep phan
+    # con lai (khong phai bam resume thu cong), dung khi xong het hoac 1 vong
+    # khong verify them duoc option nao.
+    while pending and not should_stop():
+        before = sum(len(h.get("verified_keys", [])) for h in progress["hosts"])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(cfg.get("verify_max_workers", 5)))) as ex:
+            list(ex.map(_one, pending))
+        pending = [h for h in progress["hosts"] if h.get("verify") == "partial" and not h.get("error")]
+        after = sum(len(h.get("verified_keys", [])) for h in progress["hosts"])
+        if after <= before: break
+        if pending and not should_stop():
+            print_fn(f"[*] SCAN TAT CA: chay tiep {len(pending)} OOB con option chua verify (bi cat do max_verify_duration).")
 
     with lock:
         if should_stop(): progress["stopped"] = True
@@ -2242,6 +2261,11 @@ def verify_specific_devices(cfg):
 # /api/export/excel) goi lien tuc trong vai giay.
 _verify_log_status_cache: dict = {}
 _verify_log_cache_lock = threading.Lock()
+# Cache noi dung TUNG file .json: {duong_dan_tuyet_doi: (mtime, data)}. Khi
+# Verify dang chay, file thay doi sau MOI option lam cache tong o tren mat hieu
+# luc lien tuc -> truoc day moi lan Dashboard tai lai phai doc lai TOAN BO file
+# 30 ngay. Gio chi doc lai file nao co mtime moi.
+_verify_file_cache: dict = {}
 
 def _verify_logs_dir_signature(log_dir, cutoff):
     try:
@@ -2287,10 +2311,18 @@ def _parse_verify_logs_for_status(max_age_hours: float = 24.0 * 30) -> dict:
     result: dict = {}
     for alias, file_list in alias_files_map.items():
         file_list.sort(key=lambda x: x[1])  # Sap xep mtime tang dan (cu -> moi)
-        for fpath, _ in file_list:
-            try:
-                with open(fpath, "r", encoding="utf-8") as f: data = json.load(f)
-            except Exception: continue
+        for fpath, fmtime in file_list:
+            fkey = os.path.abspath(fpath)
+            with _verify_log_cache_lock:
+                hit = _verify_file_cache.get(fkey)
+            if hit and hit[0] == fmtime:
+                data = hit[1]
+            else:
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f: data = json.load(f)
+                except Exception: continue
+                with _verify_log_cache_lock:
+                    _verify_file_cache[fkey] = (fmtime, data)
             if isinstance(data, list):
                 for item in data:
                     opt_key = str(item.get("key", ""))
@@ -2302,8 +2334,13 @@ def _parse_verify_logs_for_status(max_age_hours: float = 24.0 * 30) -> dict:
                         "act_host": act_host if act_host not in ('-', '') else None
                     }
 
+    seen = {os.path.abspath(fp) for fl in alias_files_map.values() for fp, _mt in fl}
     with _verify_log_cache_lock:
         _verify_log_status_cache[max_age_hours] = (sig, result)
+        # Bo file da xoa/qua han khoi cache (chi trong cung thu muc, tranh xoa nham)
+        base = os.path.abspath(log_dir) + os.sep
+        for k in [k for k in _verify_file_cache if k.startswith(base) and k not in seen]:
+            del _verify_file_cache[k]
     return result
 
 def search_device(cfg):
