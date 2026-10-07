@@ -1169,12 +1169,21 @@ select.fc option{background:#1a1a2e}
           <button class="btn btn-g btn-sm" onclick="loadDash()">↻ Làm mới</button>
         </div>
       </div>
+      <div class="bg2" style="flex-wrap:wrap;gap:8px;margin-bottom:10px;align-items:center">
+        <input id="dfQ" class="fc" style="margin:0;max-width:260px" placeholder="🔎 Tìm alias / IP / hostname..." oninput="dashPg=1;renderDash()">
+        <select id="dfPing" class="fc" style="margin:0;width:auto" onchange="dashPg=1;renderDash()"><option value="">Ping: Tất cả</option><option value="on">Online</option><option value="off">Offline</option><option value="none">Chưa check</option></select>
+        <select id="dfMenu" class="fc" style="margin:0;width:auto" onchange="dashPg=1;renderDash()"><option value="">Menu: Tất cả</option><option value="ok">OK</option><option value="err">Lỗi / No Menu</option><option value="nobl">Chưa có baseline</option></select>
+        <select id="dfVer" class="fc" style="margin:0;width:auto" onchange="dashPg=1;renderDash()"><option value="">Verify: Tất cả</option><option value="alarm">Có cảnh báo ⚠️</option><option value="ok">Chỉ OK ✓</option><option value="none">Chưa verify</option></select>
+        <select id="dfSize" class="fc" style="margin:0;width:auto" onchange="dashPg=1;renderDash()"><option>10</option><option selected>25</option><option>50</option><option>100</option><option value="0">Tất cả</option></select>
+        <button class="btn btn-g btn-sm" onclick="['dfQ','dfPing','dfMenu','dfVer'].forEach(i=>document.getElementById(i).value='');dashPg=1;renderDash()">✕ Xóa lọc</button>
+      </div>
       <div class="tw">
         <table id="dashTable">
           <thead><tr><th>Alias</th><th>IP</th><th>Hostname</th><th>Ping</th><th>Menu</th><th style="text-align:center">Lines</th><th>Verify</th><th>Cập nhật</th><th style="text-align:right">Hành động</th></tr></thead>
           <tbody id="dashBody"><tr class="lr"><td colspan="9"><div class="sp" style="margin:0 auto"></div></td></tr></tbody>
         </table>
       </div>
+      <div id="dashPager" class="bg2" style="justify-content:space-between;align-items:center;margin-top:10px;font-size:12px;color:var(--text3)"></div>
     </div>
 
     <!-- DEVICES -->
@@ -1609,9 +1618,36 @@ async function loadDash(){
   
   const ab=document.getElementById('sAlBadge');
   if(stats.alarms>0){ab.style.display='';ab.textContent=stats.alarms;}else ab.style.display='none';
-  const tbody=document.getElementById('dashBody');
-  if(!devs.length){tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:50px;color:var(--text3)">Chưa có thiết bị. Cần Đăng nhập Quản trị để thêm mới.</td></tr>';return;}
-  
+  dashDevs=devs;renderDash();
+}
+
+let dashDevs=[],dashPg=1;
+function dashMatch(d){
+  const v=id=>document.getElementById(id).value;
+  const q=v('dfQ').trim().toLowerCase();
+  if(q&&![d.alias,d.ip,d.device_name].some(x=>(x||'').toLowerCase().includes(q)))return false;
+  const p=v('dfPing');
+  if(p==='on'&&d.ping!==true||p==='off'&&d.ping!==false||p==='none'&&d.ping!=null)return false;
+  const m=v('dfMenu');
+  if(m==='ok'&&d.menu_state!=='ok'||m==='err'&&!['conn_failed','no_menu','fetch_failed'].includes(d.menu_state)||m==='nobl'&&d.opt_count>0)return false;
+  const r=v('dfVer');
+  if(r==='alarm'&&!(d.alarm_count>0)||r==='ok'&&!(d.ok_count>0&&!d.alarm_count)||r==='none'&&(d.alarm_count||d.ok_count))return false;
+  return true;
+}
+function dashGo(n){dashPg=n;renderDash();}
+function renderDash(){
+  const tbody=document.getElementById('dashBody'),pager=document.getElementById('dashPager');
+  if(!dashDevs.length){pager.innerHTML='';tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:50px;color:var(--text3)">Chưa có thiết bị. Cần Đăng nhập Quản trị để thêm mới.</td></tr>';return;}
+  const list=dashDevs.filter(dashMatch);
+  const size=parseInt(document.getElementById('dfSize').value)||0;
+  const pages=size?Math.max(1,Math.ceil(list.length/size)):1;
+  dashPg=Math.min(Math.max(1,dashPg),pages);
+  const from=size?(dashPg-1)*size:0,devs=size?list.slice(from,from+size):list;
+  const btn=(n,t,dis)=>`<button class="btn btn-g btn-sm" ${dis?'disabled':''} onclick="dashGo(${n})">${t}</button>`;
+  pager.innerHTML=`<span>Hiển thị ${list.length?from+1:0}–${from+devs.length} / ${list.length} thiết bị${list.length!==dashDevs.length?' (lọc từ '+dashDevs.length+')':''}</span>`
+    +(pages>1?`<div class="bg2" style="align-items:center">${btn(1,'«',dashPg===1)}${btn(dashPg-1,'‹',dashPg===1)}<span style="padding:0 8px">Trang ${dashPg}/${pages}</span>${btn(dashPg+1,'›',dashPg===pages)}${btn(pages,'»',dashPg===pages)}</div>`:'');
+  if(!list.length){tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text3)">Không có thiết bị khớp bộ lọc.</td></tr>';return;}
+
   tbody.innerHTML=devs.map(d=>{
     const pb=d.ping===true?'<span class="badge bg">● Online</span>':d.ping===false?'<span class="badge br">● Offline</span>':'<span class="badge bm">- Chưa</span>';
     const mb=d.menu_state==='ok'?'<span class="badge bg">OK</span>':d.menu_state==='conn_failed'?'<span class="badge br">Lỗi</span>':d.menu_state==='no_menu'?'<span class="badge ba">No Menu</span>':'<span class="badge bm">'+(d.menu_state||'-')+'</span>';
