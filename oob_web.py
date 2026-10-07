@@ -397,7 +397,7 @@ def api_device_options(ip):
     all_ips = oob_monitor.load_ip_list_cached(cfg["ip_list"])
     alias = next((a for i,a in all_ips if i==ip), ip)
     opts = []
-    for key in sorted(bl.keys()):
+    for key in sorted(bl.keys(), key=lambda k: (0, int(k), "") if str(k).isdigit() else (1, 0, str(k))):
         o = bl[key]; vr = vst.get((alias,key))
         opts.append({"key":key,"description":o.get("description",""),"ip":o.get("ip",""),
             "port":o.get("port",23),"protocol":o.get("protocol","telnet"),"vendor":o.get("vendor","cisco"),
@@ -1044,6 +1044,62 @@ select.fc option{background:#1a1a2e}
 .flex{display:flex}.aic{align-items:center}.ml-a{margin-left:auto}
 .mb16{margin-bottom:16px}.mb8{margin-bottom:8px}
 .trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+
+/* ===== TINH CHINH GIAO DIEN ===== */
+:root{--bg-card:rgba(255,255,255,0.035);--border:rgba(255,255,255,0.08);--text2:#b3b0cc;--text3:#7d7a94}
+body{font-size:13.5px;-webkit-font-smoothing:antialiased}
+.content{padding:24px 28px}
+.topbar{gap:10px}
+.topbar .btn-sm{height:32px}
+.tb-menu{display:none;background:none;border:1px solid var(--border);color:var(--text);border-radius:var(--rs);width:34px;height:34px;font-size:16px;cursor:pointer}
+/* the thong ke */
+.sg{grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:28px}
+.sc{padding:16px 18px;display:flex;flex-direction:column;gap:6px}
+.sc:hover{transform:none;box-shadow:0 6px 24px rgba(0,0,0,.35)}
+.sc::before{height:2px;opacity:.9}
+.sc-top{display:flex;align-items:center;justify-content:space-between}
+.sc .sl{font-size:11px;letter-spacing:.08em;color:var(--text3)}
+.sc .si2{position:static;font-size:18px;opacity:.55}
+.sc .sv{font-size:30px;margin:2px 0 0;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.ssub{font-size:12px;color:var(--text3)}.ssub span{color:var(--text2);font-weight:600}
+.sbar{height:4px;border-radius:4px;background:rgba(255,255,255,.07);overflow:hidden;margin-top:4px}
+.sbar i{display:block;height:100%;width:0;background:var(--acc);border-radius:4px;transition:width .8s ease}
+.c4 .sv{color:var(--pink)}
+/* bang */
+.tw{overflow:auto}
+thead th{position:sticky;top:0;background:#12121d;z-index:1}
+th{padding:10px 14px}
+td{padding:9px 14px;border-bottom:1px solid rgba(255,255,255,.045)}
+tbody tr{transition:background .15s}
+tbody tr:hover{background:rgba(124,58,237,.07)}
+td .btn-ic{background:transparent;border:1px solid var(--border);width:28px;height:28px;padding:0;justify-content:center;font-size:12px;opacity:.75}
+td .btn-ic:hover:not(:disabled){opacity:1;border-color:var(--border-hv);background:var(--bg-hover);box-shadow:none}
+td .bg2{gap:4px;flex-wrap:nowrap}
+.badge{padding:3px 8px;font-size:11px}
+/* nut + form */
+.btn{border-radius:8px}
+.btn-p{background:linear-gradient(135deg,#7c3aed,#6d28d9)}
+.fc{border-radius:8px}
+select.fc{appearance:none;-webkit-appearance:none;padding-right:30px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a09db8' stroke-width='2.5'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
+.fc:hover{border-color:var(--border-hv)}
+/* cai dat: gom vao the */
+#page-settings .tc2.active{max-width:880px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:24px}
+.tabs{margin-bottom:18px}
+/* dashboard filter */
+#dashPager button{min-width:30px;justify-content:center}
+/* mobile */
+.sb-back{display:none}
+@media(max-width:900px){
+  .tb-menu{display:inline-flex;align-items:center;justify-content:center}
+  .sidebar{transition:transform .25s ease}
+  body.sb-open .sidebar{transform:none}
+  body.sb-open .sb-back{display:block;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:90}
+  .tb-hide,.sw{display:none}
+  .topbar .btn-p[onclick="doSearch()"]{display:none}
+  .content{padding:16px}
+  .sg{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:600px){.sc .sv{font-size:24px}td{white-space:nowrap}}
 </style>
 </head>
 <body>
@@ -1110,8 +1166,10 @@ select.fc option{background:#1a1a2e}
   </div>
 </aside>
 
+<div class="sb-back" onclick="document.body.classList.remove('sb-open')"></div>
 <div class="main">
   <div class="topbar">
+    <button class="tb-menu" onclick="document.body.classList.toggle('sb-open')" aria-label="Menu">☰</button>
     <div class="tb-title" id="tbTitle">Dashboard</div>
     <div class="sw">
       <svg class="si" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
@@ -1123,11 +1181,11 @@ select.fc option{background:#1a1a2e}
     
     {% if is_admin %}
     <button class="btn btn-g btn-sm" onclick="oModal('addDev')">+ Thêm OOB</button>
-    <button class="btn btn-outline-info btn-sm me-2" onclick="sPage('settings')"><i class="bi bi-gear"></i> Cài đặt</button>
-    <button class="btn btn-a btn-sm" onclick="oModal('changePassMod')" style="margin-left:8px">🔑 Đổi Pass Web</button>
-    <button class="btn btn-d btn-sm" onclick="window.location.href='/logout'" style="margin-left:8px">Đăng xuất</button>
+    <button class="btn btn-g btn-sm tb-hide" onclick="sPage('settings')">⚙️ Cài đặt</button>
+    <button class="btn btn-g btn-sm tb-hide" onclick="oModal('changePassMod')">🔑 Đổi Pass Web</button>
+    <button class="btn btn-d btn-sm" onclick="window.location.href='/logout'">Đăng xuất</button>
     {% else %}
-    <button class="btn btn-p btn-sm" onclick="window.location.href='/login'" style="margin-left:8px">Đăng nhập Quản trị</button>
+    <button class="btn btn-p btn-sm" onclick="window.location.href='/login'">Đăng nhập Quản trị</button>
     {% endif %}
   </div>
   
@@ -1136,31 +1194,11 @@ select.fc option{background:#1a1a2e}
 
     <!-- DASHBOARD -->
     <div class="page active" id="page-dashboard">
-      <div style="display:flex;gap:24px;margin-bottom:24px;flex-wrap:wrap">
-        <div class="sg" style="flex:1;margin-bottom:0;min-width:400px">
-          <div class="sc c1"><div class="sv" id="s-total">-</div><div class="sl">Tổng thiết bị</div><div class="si2">🌐</div></div>
-          <div class="sc c2"><div class="sv" id="s-online">-</div><div class="sl">Đang online</div><div class="si2">📶</div></div>
-          <div class="sc c3"><div class="sv" id="s-baseline">-</div><div class="sl">Có baseline</div><div class="si2">📋</div></div>
-          <div class="sc c4"><div class="sv" id="s-alarms">-</div><div class="sl">Cảnh báo</div><div class="si2">⚠️</div></div>
-        </div>
-        <div style="display:flex;gap:16px;flex-wrap:wrap">
-          <div class="sc" style="width:200px;text-align:center;padding:15px;display:flex;flex-direction:column;align-items:center">
-            <div class="st mb8"><span class="dot" style="background:var(--teal)"></span>Ping Status</div>
-            <svg viewBox="0 0 36 36" style="width:100px;height:100px;margin-top:10px">
-              <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="3.5" />
-              <path id="svg-ping" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--teal)" stroke-width="3.5" stroke-dasharray="0, 100" style="transition:stroke-dasharray 1s ease"/>
-              <text id="svg-ping-txt" x="18" y="21.5" fill="var(--text)" font-size="9" text-anchor="middle" font-weight="600">0%</text>
-            </svg>
-          </div>
-          <div class="sc" style="width:200px;text-align:center;padding:15px;display:flex;flex-direction:column;align-items:center">
-            <div class="st mb8"><span class="dot" style="background:var(--amber)"></span>Baseline</div>
-            <svg viewBox="0 0 36 36" style="width:100px;height:100px;margin-top:10px">
-              <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="3.5" />
-              <path id="svg-baseline" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--amber)" stroke-width="3.5" stroke-dasharray="0, 100" style="transition:stroke-dasharray 1s ease"/>
-              <text id="svg-baseline-txt" x="18" y="21.5" fill="var(--text)" font-size="9" text-anchor="middle" font-weight="600">0%</text>
-            </svg>
-          </div>
-        </div>
+      <div class="sg">
+        <div class="sc c1"><div class="sc-top"><span class="sl">Tổng thiết bị</span><span class="si2">🌐</span></div><div class="sv" id="s-total">-</div><div class="ssub">OOB đang quản lý</div></div>
+        <div class="sc c2"><div class="sc-top"><span class="sl">Đang online</span><span class="si2">📶</span></div><div class="sv" id="s-online">-</div><div class="ssub"><span id="svg-ping-txt">0%</span> thiết bị ping được</div><div class="sbar"><i id="svg-ping"></i></div></div>
+        <div class="sc c3"><div class="sc-top"><span class="sl">Có baseline</span><span class="si2">📋</span></div><div class="sv" id="s-baseline">-</div><div class="ssub"><span id="svg-baseline-txt">0%</span> đã lấy menu</div><div class="sbar"><i id="svg-baseline"></i></div></div>
+        <div class="sc c4"><div class="sc-top"><span class="sl">Cảnh báo</span><span class="si2">⚠️</span></div><div class="sv" id="s-alarms">-</div><div class="ssub">line lệch description</div></div>
       </div>
       <div class="sh">
         <div class="st"><span class="dot"></span>Thiết bị OOB</div>
@@ -1531,7 +1569,7 @@ function sPage(page,btn){
   if(el)el.classList.add('active');
   if(btn)btn.classList.add('active');
   else{const n=document.querySelector('[data-page="'+page+'"]');if(n)n.classList.add('active');}
-  curPage=page;
+  curPage=page;document.body.classList.remove('sb-open');
   document.getElementById('tbTitle').textContent=ptitles[page]||page;
   if(page==='dashboard')loadDash();
   if(page==='devices')loadDevicesPage();
@@ -1610,10 +1648,10 @@ async function loadDash(){
   document.getElementById('s-alarms').textContent=stats.alarms??0;
   
   const pctPing=stats.total>0?Math.round(((stats.online||0)/stats.total)*100):0;
-  document.getElementById('svg-ping').style.strokeDasharray=pctPing+', 100';
+  document.getElementById('svg-ping').style.width=pctPing+'%';
   document.getElementById('svg-ping-txt').textContent=pctPing+'%';
   const pctBase=stats.total>0?Math.round(((stats.has_baseline||0)/stats.total)*100):0;
-  document.getElementById('svg-baseline').style.strokeDasharray=pctBase+', 100';
+  document.getElementById('svg-baseline').style.width=pctBase+'%';
   document.getElementById('svg-baseline-txt').textContent=pctBase+'%';
   
   const ab=document.getElementById('sAlBadge');
