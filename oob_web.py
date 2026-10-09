@@ -10,6 +10,7 @@ from functools import wraps
 from flask import Flask, Response, jsonify, render_template_string, request, send_file, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 import oob_monitor
+import oob_console
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24))
@@ -490,6 +491,58 @@ def api_debug_log_content(fn):
         with open(fp,"r",encoding="utf-8") as f: return jsonify({"content":f.read()})
     except Exception as e: return jsonify({"error":str(e)}),500
 
+# --- WEB CONSOLE (terminal tuong tac toi thiet bi dau xa cua 1 line) ---
+def _console_owner():
+    return session.get("username") or "admin"
+
+@app.route("/api/console/open", methods=["POST"])
+@login_required
+def api_console_open():
+    d = request.json or {}
+    ip, key = str(d.get("ip", "")).strip(), str(d.get("key", "")).strip()
+    cfg = _cfg()
+    _mn, _dn, bl = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", ip)
+    if not bl or key not in bl:
+        return jsonify({"error": f"Option '{key}' khong ton tai trong baseline cua {ip}"}), 404
+    alias = next((a for i, a in oob_monitor.load_ip_list_cached(cfg["ip_list"]) if i == ip), ip)
+    try:
+        cs = oob_console.open_console(cfg, _console_owner(), ip, key, bl[key], alias,
+                                      oob_monitor.get_all_credentials(cfg, ip))
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 429
+    return jsonify({"sid": cs.sid, "label": cs.label})
+
+@app.route("/api/console/<sid>/stream")
+@login_required
+def api_console_stream(sid):
+    cs = oob_console.get(sid, _console_owner())
+    if not cs: return jsonify({"error": "Phien khong ton tai"}), 404
+    def gen():
+        last = 0
+        while True:
+            last, data, closed = cs.read_since(last, timeout=20)
+            if data:
+                yield "data: " + json.dumps({"d": oob_console.b64(data)}) + "\n\n"
+            elif not closed:
+                yield ": hb\n\n"
+            if closed:
+                yield "data: " + json.dumps({"closed": True, "reason": cs.close_reason}) + "\n\n"
+                return
+    return Response(gen(), mimetype="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+@app.route("/api/console/<sid>/input", methods=["POST"])
+@login_required
+def api_console_input(sid):
+    cs = oob_console.get(sid, _console_owner())
+    if not cs: return jsonify({"error": "Phien khong ton tai"}), 404
+    data = (request.json or {}).get("d", "")
+    return jsonify({"ok": cs.send(data.encode("utf-8", errors="ignore"))})
+
+@app.route("/api/console/<sid>/close", methods=["POST"])
+@login_required
+def api_console_close(sid):
+    return jsonify({"ok": oob_console.close(sid, _console_owner())})
+
 @app.route("/api/live-debug", methods=["POST"])
 @login_required
 def api_live_debug():
@@ -868,6 +921,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="description" content="OOB Network Manager - Giam sat va quan ly thiet bi Out-of-Band">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/xterm/xterm.css">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1515,7 +1569,24 @@ select.fc{appearance:none;-webkit-appearance:none;padding-right:30px;background-
   </div>
 </div>
 
+<div class="mo" id="consoleMod" data-sticky="1">
+  <div class="mb xl" style="max-width:1200px;height:86vh">
+    <div class="mh">
+      <div class="mt" style="display:flex;align-items:center;gap:10px"><span class="d-dot" id="conDot"></span><span id="conTitle">💻 Console</span></div>
+      <div class="bg2" style="align-items:center">
+        <button class="btn btn-g btn-sm" onclick="conSend('\x1e')" title="Cisco: thoát reverse telnet (Ctrl+Shift+6 rồi x)">Ctrl+^</button>
+        <button class="btn btn-g btn-sm" onclick="conSend('\x1a')" title="Vertiv: hot key thoát phiên (Ctrl+Z)">Ctrl+Z</button>
+        <button class="btn btn-g btn-sm" onclick="conSend('\x03')">Ctrl+C</button>
+        <button class="btn btn-d btn-sm" onclick="closeConsole()">✕ Ngắt kết nối</button>
+      </div>
+    </div>
+    <div class="mbody" style="padding:0;background:#05050a;overflow:hidden"><div id="conTerm" style="height:100%;padding:8px 10px"></div></div>
+  </div>
+</div>
+
 <div class="tc" id="toastCnt"></div>
+<script src="/static/xterm/xterm.js"></script>
+<script src="/static/xterm/addon-fit.js"></script>
 
 <script>
 const isAdmin = {{ 'true' if is_admin else 'false' }};
@@ -1804,6 +1875,7 @@ async function loadDevOpts(ip){
     const ah=o.act_host?'<span class="text-t fw6">'+esc(o.act_host)+'</span>':'<span class="text-m">-</span>';
     const vendorBadge = o.vendor === 'vertiv' ? '<span class="badge ba">VERTIV</span>' : '<span class="badge bt">CISCO</span>';
     const debugBtn = isAdmin ? `<button class="btn btn-a btn-sm" onclick="runLiveDebug(${jsArg(ip)},${jsArg(o.key)})" title="Live Debug Real-time">🐛 Debug</button>` : '';
+    const conBtn = isAdmin ? `<button class="btn btn-t btn-sm" onclick="openConsole(${jsArg(ip)},${jsArg(o.key)},${jsArg(o.description)})" title="Mở terminal tới thiết bị đầu xa">💻 Console</button>` : '';
     const copyBtn = `<button class="btn btn-g btn-sm" onclick="copyConnCmd(${jsArg(o.vendor)},${jsArg(o.description)},${jsArg(o.ip)},${Number(o.port)||0},${jsArg(o.protocol)})" title="Sao chép lệnh kết nối">📋 Copy</button>`;
     return`<tr>
         <td><kbd style="background:rgba(124,58,237,.2);color:#c4b5fd;border-radius:4px;padding:2px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">${esc(o.key)}</kbd></td>
@@ -1815,6 +1887,7 @@ async function loadDevOpts(ip){
         <td>${vb}</td><td>${ah}</td>
         <td style="text-align:right">
           <div style="display:flex;gap:6px;justify-content:flex-end">
+            ${conBtn}
             ${copyBtn}
             ${debugBtn}
           </div>
@@ -2109,8 +2182,50 @@ function oModal(id){
     document.getElementById(id).classList.add('open');
 }
 function cModal(id){document.getElementById(id).classList.remove('open');}
-document.addEventListener('click',e=>{if(e.target.classList.contains('mo'))e.target.classList.remove('open');});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.open').forEach(m=>m.classList.remove('open'));});
+document.addEventListener('click',e=>{if(e.target.classList.contains('mo')&&!e.target.dataset.sticky)e.target.classList.remove('open');});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.open:not([data-sticky])').forEach(m=>m.classList.remove('open'));});
+
+// ---- WEB CONSOLE ----
+let conTerm=null,conFit=null,conSid=null,conES=null,conQ='',conT=null;
+function conSend(d){
+  if(!conSid)return;
+  conQ+=d; if(conT)return;
+  // gom phim go trong 15ms thanh 1 request (paste/giu phim khong ban hang tram request)
+  conT=setTimeout(async()=>{const s=conQ;conQ='';conT=null;
+    try{await fetch('/api/console/'+conSid+'/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({d:s})});}catch{}},15);
+}
+async function openConsole(ip,key,desc){
+  if(!isAdmin){toast('Cần đăng nhập Quản trị để mở Console','error');return;}
+  if(typeof Terminal==='undefined'){toast('Không tải được thư viện terminal (static/xterm)','error');return;}
+  if(conSid)await closeConsole(true);
+  oModal('consoleMod');
+  document.getElementById('conTitle').textContent='💻 '+desc+'  ('+ip+' · Opt '+key+')';
+  const dot=document.getElementById('conDot');dot.className='d-dot';
+  if(!conTerm){
+    conTerm=new Terminal({cursorBlink:true,fontFamily:"'JetBrains Mono',monospace",fontSize:13,scrollback:5000,
+      theme:{background:'#05050a',foreground:'#e6e3ff',cursor:'#a78bfa',selectionBackground:'rgba(124,58,237,.35)'}});
+    conFit=new FitAddon.FitAddon();conTerm.loadAddon(conFit);conTerm.open(document.getElementById('conTerm'));
+    conTerm.onData(d=>conSend(d));
+    window.addEventListener('resize',()=>{if(document.getElementById('consoleMod').classList.contains('open'))conFit.fit();});
+  }
+  conTerm.reset();setTimeout(()=>{conFit.fit();conTerm.focus();},60);
+  const r=await fetch('/api/console/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,key})});
+  const j=await r.json().catch(()=>({error:'Lỗi server'}));
+  if(!r.ok){conTerm.writeln('\x1b[31m'+(j.error||'Không mở được console')+'\x1b[0m');return;}
+  conSid=j.sid;dot.className='d-dot on';
+  conES=new EventSource('/api/console/'+conSid+'/stream');
+  conES.onmessage=e=>{const m=JSON.parse(e.data);
+    if(m.d){const b=atob(m.d),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);conTerm.write(u);}
+    if(m.closed){dot.className='d-dot';conES.close();conES=null;conSid=null;}};
+}
+async function closeConsole(keepOpen){
+  const sid=conSid;conSid=null;
+  if(conES){conES.close();conES=null;}
+  if(sid){try{await fetch('/api/console/'+sid+'/close',{method:'POST'});}catch{}}
+  document.getElementById('conDot').className='d-dot';
+  if(!keepOpen)cModal('consoleMod');
+}
+window.addEventListener('beforeunload',()=>{if(conSid)navigator.sendBeacon('/api/console/'+conSid+'/close');});
 
 function toast(msg,type='info'){
   const c=document.getElementById('toastCnt');
