@@ -788,7 +788,16 @@ def api_revert():
         pfn = _make_print_fn(tid, oob_ip)
         pfn(f"Bat dau {'MO PHONG' if dry_run_flag else 'THUC THI THAT'} REVERT cho {oob_ip} ({len(revert_cmds)} options)...")
         try:
-            oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10, print_fn=pfn, dry_run=dry_run_flag)
+            # Truoc day khong truyen vendor -> OOB Vertiv bi revert bang lenh
+            # Cisco ('menu ... text ...'). Lay vendor tu baseline cua OOB.
+            try:
+                _mn, _dn, _bl = oob_monitor.get_options_by_host(cfg["baseline_db"], "baseline_menu", oob_ip)
+                vendor = next(iter(_bl.values())).get("vendor", "cisco") if _bl else "cisco"
+            except Exception:
+                vendor = "cisco"
+            ok = oob_monitor.push_menu_descriptions(oob_ip, cfg.get("ssh_port",22), cfg.get("telnet_port",23), c["username"], c["password"], c["enable_password"], revert_cmds, timeout=10, vendor=vendor, cfg=cfg, print_fn=pfn, dry_run=dry_run_flag)
+            if not ok:
+                raise RuntimeError("Thiet bi tu choi hoac sai authen - xem log o tren")
             if dry_run_flag:
                 pfn("[MO PHONG] Da mo phong xong Revert - chua gui gi that toi thiet bi. Bat 'push_live_mode' trong Cai dat de revert that.")
             else:
