@@ -42,17 +42,32 @@ class FakeACS:
             else:
                 self.pending[int(self.path.split("/")[3])] = m.group(1)
         elif cmd == "commit":
-            self.names.update(self.pending); self.pending = {}
+            others = {n.lower() for p, n in self.names.items() if p not in self.pending}
+            if any(v.lower() in others for v in self.pending.values()):
+                out = "\nError: port_name already in use\n"
+            else:
+                self.names.update(self.pending); self.pending = {}
         elif cmd == "revert":
             self.pending = {}
         elif cmd == "show" and self.path.endswith("/cas"):
             port = int(self.path.split("/")[3])
             out = f"\nport: {port}\nport_name = {self.pending.get(port, self.names[port])}\nprotocol = ssh\n"
+        elif cmd == "show" and self.path == "/ports/serial_ports":
+            rows = [f"  {p:<4}  ttyS{p:<4}  {n:<40}  cas  9600 8N1 ssh local" for p, n in sorted(self.names.items())]
+            # Phan trang nhu thiet bi that: 3 dong/trang
+            pages = [rows[i:i + 3] for i in range(0, len(rows), 3)] or [[]]
+            self._pages = pages[1:]
+            self._out = cmd + "\n  port  device  name\n  ====\n" + "\n".join(pages[0]) + ("\n-- MORE --:" if self._pages else "\n" + self._prompt())
+            return
         elif cmd in ("exit",):
             pass
         else:
             out = f"\nError: Invalid command: {cmd}\n"
         self._out = cmd + out + "\n" + self._prompt()
+
+    def write_raw(self, data):
+        page = self._pages.pop(0)
+        self._out = "\n" + "\n".join(page) + ("\n-- MORE --:" if self._pages else "\n" + self._prompt())
 
     def read_until(self, pattern, timeout=5):
         out, self._out = self._out, ""
@@ -101,3 +116,25 @@ def test_push_vertiv_dry_run_sends_nothing(monkeypatch):
     assert oob_lib.push_vertiv_port_names("1.1.1.1", 22, 23, "u", "p", [("access", "15", "N")],
                                           print_fn=logs.append, dry_run=True) is True
     assert any("cd 15/" in l for l in logs) and any("commit" in l for l in logs)
+
+
+def test_push_vertiv_numbers_duplicate_name(monkeypatch):
+    # Port 31/32 (re0/re1) cung tra ve hostname "HCM-SMC-04" -> ten thu 2 phai danh so
+    acs = FakeACS({30: "HCM-SMC-04", 31: "old-31", 32: "old-32", 33: "a", 34: "b"})
+    applied = {}
+    monkeypatch.setattr(oob_lib, "connect_auto", lambda *a, **k: acs)
+    ok = oob_lib.push_vertiv_port_names("1.1.1.1", 22, 23, "u", "p",
+                                        [("access", "31", "HCM-SMC-04"), ("access", "32", "HCM-SMC-04")],
+                                        dry_run=False, applied=applied)
+    assert ok is True
+    assert acs.names[30] == "HCM-SMC-04"
+    assert acs.names[31] == "HCM-SMC-04_2"
+    assert acs.names[32] == "HCM-SMC-04_3"
+    assert applied == {"31": "HCM-SMC-04_2", "32": "HCM-SMC-04_3"}
+
+
+def test_unique_port_name_and_strip():
+    assert oob_lib.unique_port_name("X", ["A"]) == "X"
+    assert oob_lib.unique_port_name("X", ["x", "X_2"]) == "X_3"
+    assert oob_lib.strip_dup_suffix("HCM-SMC-04_2") == "HCM-SMC-04"
+    assert oob_lib.strip_dup_suffix("HCM-CGNAT-13_RE0") == "HCM-CGNAT-13_RE0"

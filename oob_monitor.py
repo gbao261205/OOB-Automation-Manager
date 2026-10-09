@@ -37,7 +37,7 @@ from rich.markup import escape as rich_escape
 from oob_lib import (
     MiniTelnet, connect_auto, fetch_hostname,
     fetch_hostname_via_auto, hostname_matches_description,
-    push_menu_descriptions, ping_host
+    push_menu_descriptions, ping_host, unique_port_name, strip_dup_suffix
 )
 
 CONFIG_FILE_DEFAULT = "oob_config.json"
@@ -1551,7 +1551,8 @@ def run_deep_verify(cfg, alias, oob_ip, options, print_fn=None, live_debug_opt=N
             if own_hostname_clean and act_host_clean == own_hostname_clean:
                 print_fn(f"[dim][-][/] {alias} (Opt {key}): Khong pivot duoc (van o console OOB)")
                 results.append({"key": key, "status": "KHONG PIVOT", "act_host": act_host, "desc": desc, "port": port, "note": note})
-            elif act_host_clean == desc_clean or hostname_matches_description(act_host, desc_clean):
+            elif (act_host_clean == desc_clean or hostname_matches_description(act_host, desc_clean)
+                  or (vendor == "vertiv" and act_host_clean == strip_dup_suffix(desc_clean))):
                 print_fn(f"[green](OK)[/] {alias} (Opt {key}): Khop ({act_host})")
                 results.append({"key": key, "status": "OK", "act_host": act_host, "desc": desc, "port": port, "note": note})
             else:
@@ -1792,6 +1793,12 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
         new_desc = act_host if is_vertiv else f"----> {act_host}"
         real_menu_name, real_key = opt.get("_menu_name"), opt.get("_raw_key")
         if not real_menu_name or not real_key: continue
+        if is_vertiv:
+            # ACS khong cho trung port_name: tranh ten cac port khac (theo
+            # baseline) va ten da chon cho cac port truoc trong lan push nay.
+            taken = [o.get("description") for k2, o in baseline.items() if k2 != key and k2 not in {e["key"] for e in push_log_entries}]
+            taken += [e["new"] for e in push_log_entries]
+            new_desc = unique_port_name(new_desc, taken)
         updates_list.append((real_menu_name, real_key, new_desc))
         push_log_entries.append({"key": key, "real_menu_name": real_menu_name, "real_key": real_key, "target_ip": target_ip, "old": w["desc"], "new": new_desc})
 
@@ -1813,7 +1820,11 @@ def process_push_and_reverify(cfg, alias, oob_ip, baseline, verify_results, prin
         if not admin_user or not admin_pass:
             print_fn(f"[red][LOI][/] {alias}: Chua cau hinh Vertiv Admin Username/Password trong Cau hinh he thong!")
             return
-        success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), admin_user, admin_pass, "", updates_list, timeout=10, vendor="vertiv", cfg=cfg, print_fn=print_fn, dry_run=dry_run_flag)
+        applied = {}
+        success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg.get("telnet_port", 23), admin_user, admin_pass, "", updates_list, timeout=10, vendor="vertiv", cfg=cfg, print_fn=print_fn, dry_run=dry_run_flag, applied=applied)
+        # Thiet bi co the da danh so khac (port ngoai baseline trung ten).
+        for e in push_log_entries:
+            if str(e["real_key"]) in applied: e["new"] = applied[str(e["real_key"])]
     else:
         for c in get_all_credentials(cfg, oob_ip):
             success = push_menu_descriptions(oob_ip, cfg.get("ssh_port", 22), cfg["telnet_port"], c["username"], c["password"], c["enable_password"], updates_list, timeout=10, vendor="cisco", cfg=cfg, print_fn=print_fn, dry_run=dry_run_flag)
