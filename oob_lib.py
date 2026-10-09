@@ -615,10 +615,10 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
         for _m_name, k, new_desc in updates_list:
             print_fn(f"  --:- / cli-> cd /")
             print_fn(f"  --:- / cli-> cd ports/serial_ports/")
-            print_fn(f"  --:- serial_ports cli-> cd {k}")
+            print_fn(f"  --:- serial_ports cli-> cd {k}/")
             print_fn(f"  --:#- [serial_ports/physical] cli-> cd cas/")
             print_fn(f'  --:#- [serial_ports/cas] cli-> set port_name="{new_desc}"')
-            print_fn(f"  --:#- [serial_ports/cas] cli-> save")
+            print_fn(f"  --:#- [serial_ports/cas] cli-> commit")
 
     if dry_run:
         return True
@@ -627,29 +627,55 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
     try:
         tn.read_until("cli->", timeout=5)
         all_success = True
+        def _bad(out):
+            low = out.lower()
+            return "error" in low or "invalid" in low or "not found" in low or "failed" in low
         for _m_name, k, new_desc in updates_list:
+            # Duong dan dung tren ACS8000 (da kiem chung tren thiet bi that):
+            #   cd /ports/serial_ports/<port>/  -> [serial_ports/physical]
+            #   cd cas/                         -> [serial_ports/cas]
+            #   set port_name="..."            (port_name chi co trong cas/)
+            # 'port' = so port vat ly (key lay tu 'show' trong /access).
             tn.write("cd /")
             tn.read_until("cli->", timeout=5)
-            tn.write("cd ports/serial_ports/")
-            tn.read_until("cli->", timeout=5)
-            tn.write(f"cd {k}")
+            tn.write(f"cd /ports/serial_ports/{k}/")
             out1 = tn.read_until("cli->", timeout=5)
-            if "not found" in out1.lower() or "error" in out1.lower() or "invalid" in out1.lower():
+            if _bad(out1) or "physical" not in out1:
+                if print_fn: print_fn(f"[red][LOI][/] Vertiv {host}: khong vao duoc port {k}: {out1.strip()[-120:]}")
                 all_success = False
                 continue
             tn.write("cd cas/")
             out2 = tn.read_until("cli->", timeout=5)
-            if "error" in out2.lower() or "invalid" in out2.lower():
+            if _bad(out2) or "serial_ports/cas" not in out2:
+                if print_fn: print_fn(f"[red][LOI][/] Vertiv {host}: khong vao duoc cas/ cua port {k}: {out2.strip()[-120:]}")
                 all_success = False
                 continue
             tn.write(f'set port_name="{new_desc}"')
             out3 = tn.read_until("cli->", timeout=5)
-            if "error" in out3.lower() or "invalid" in out3.lower():
+            if _bad(out3.replace(new_desc, "")):
+                if print_fn: print_fn(f"[red][LOI][/] Vertiv {host}: set port_name port {k} loi: {out3.strip()[-120:]}")
+                tn.write("revert")
+                tn.read_until("cli->", timeout=5)
                 all_success = False
-            tn.write("save")
-            out4 = tn.read_until("cli->", timeout=5)
-            if "error" in out4.lower() or "failed" in out4.lower():
+                continue
+            # ACS: thay doi chi la "pending" (dau '#' tren prompt) cho toi khi
+            # 'commit' - truoc day gui 'save' (khong phai lenh ACS) nen ten
+            # port khong bao gio duoc luu.
+            tn.write("commit")
+            out4 = tn.read_until("cli->", timeout=10)
+            if _bad(out4):
+                if print_fn: print_fn(f"[red][LOI][/] Vertiv {host}: commit port {k} loi: {out4.strip()[-120:]}")
                 all_success = False
+                continue
+            # Doc lai de xac nhan ten da doi that.
+            tn.write("show")
+            out5 = tn.read_until("cli->", timeout=5)
+            m = re.search(r"port_name\s*=\s*(.*)", out5)
+            if not m or m.group(1).strip() != new_desc:
+                if print_fn: print_fn(f"[red][LOI][/] Vertiv {host}: port {k} sau commit van la '{m.group(1).strip() if m else '?'}'")
+                all_success = False
+            elif print_fn:
+                print_fn(f"[green][OK][/] Vertiv {host}: port {k} -> {new_desc}")
         return all_success
     except Exception:
         return False
