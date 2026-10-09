@@ -538,6 +538,15 @@ def api_console_input(sid):
     data = (request.json or {}).get("d", "")
     return jsonify({"ok": cs.send(data.encode("utf-8", errors="ignore"))})
 
+@app.route("/api/console/<sid>/resize", methods=["POST"])
+@login_required
+def api_console_resize(sid):
+    cs = oob_console.get(sid, _console_owner())
+    if not cs: return jsonify({"error": "Phien khong ton tai"}), 404
+    d = request.json or {}
+    cs.resize(d.get("cols", 80), d.get("rows", 24))
+    return jsonify({"ok": True})
+
 @app.route("/api/console/<sid>/close", methods=["POST"])
 @login_required
 def api_console_close(sid):
@@ -1587,6 +1596,7 @@ select.fc{appearance:none;-webkit-appearance:none;padding-right:30px;background-
 <div class="tc" id="toastCnt"></div>
 <script src="/static/xterm/xterm.js"></script>
 <script src="/static/xterm/addon-fit.js"></script>
+<script src="/static/xterm/addon-webgl.js"></script>
 
 <script>
 const isAdmin = {{ 'true' if is_admin else 'false' }};
@@ -2186,13 +2196,25 @@ document.addEventListener('click',e=>{if(e.target.classList.contains('mo')&&!e.t
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.open:not([data-sticky])').forEach(m=>m.classList.remove('open'));});
 
 // ---- WEB CONSOLE ----
-let conTerm=null,conFit=null,conSid=null,conES=null,conQ='',conT=null;
-function conSend(d){
+let conTerm=null,conFit=null,conSid=null,conES=null,conQ='',conBusy=false;
+// Gui phim NGAY (khong cho), chi 1 request tai 1 thoi diem: phim go trong luc
+// request truoc dang bay duoc gom lai gui ke tiep -> giu dung thu tu phim va
+// paste/giu phim khong ban hang tram request.
+async function conSend(d){
   if(!conSid)return;
-  conQ+=d; if(conT)return;
-  // gom phim go trong 15ms thanh 1 request (paste/giu phim khong ban hang tram request)
-  conT=setTimeout(async()=>{const s=conQ;conQ='';conT=null;
-    try{await fetch('/api/console/'+conSid+'/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({d:s})});}catch{}},15);
+  conQ+=d; if(conBusy)return;
+  conBusy=true;
+  while(conQ&&conSid){
+    const s=conQ;conQ='';
+    try{await fetch('/api/console/'+conSid+'/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({d:s}),keepalive:true});}catch{}
+  }
+  conBusy=false;
+}
+let conRzT=null;
+function conFitNow(){
+  if(!conFit)return;conFit.fit();
+  clearTimeout(conRzT);
+  conRzT=setTimeout(()=>{if(conSid)fetch('/api/console/'+conSid+'/resize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cols:conTerm.cols,rows:conTerm.rows})}).catch(()=>{});},150);
 }
 async function openConsole(ip,key,desc){
   if(!isAdmin){toast('Cần đăng nhập Quản trị để mở Console','error');return;}
@@ -2205,14 +2227,16 @@ async function openConsole(ip,key,desc){
     conTerm=new Terminal({cursorBlink:true,fontFamily:"'JetBrains Mono',monospace",fontSize:13,scrollback:5000,
       theme:{background:'#05050a',foreground:'#e6e3ff',cursor:'#a78bfa',selectionBackground:'rgba(124,58,237,.35)'}});
     conFit=new FitAddon.FitAddon();conTerm.loadAddon(conFit);conTerm.open(document.getElementById('conTerm'));
+    // Ve bang GPU (WebGL) - muot hon han renderer DOM mac dinh khi output nhieu.
+    try{if(window.WebglAddon){const gl=new WebglAddon.WebglAddon();gl.onContextLoss(()=>gl.dispose());conTerm.loadAddon(gl);window._conRenderer='webgl';}}catch(e){}
     conTerm.onData(d=>conSend(d));
-    window.addEventListener('resize',()=>{if(document.getElementById('consoleMod').classList.contains('open'))conFit.fit();});
+    window.addEventListener('resize',()=>{if(document.getElementById('consoleMod').classList.contains('open'))conFitNow();});
   }
   conTerm.reset();setTimeout(()=>{conFit.fit();conTerm.focus();},60);
   const r=await fetch('/api/console/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,key})});
   const j=await r.json().catch(()=>({error:'Lỗi server'}));
   if(!r.ok){conTerm.writeln('\x1b[31m'+(j.error||'Không mở được console')+'\x1b[0m');return;}
-  conSid=j.sid;dot.className='d-dot on';
+  conSid=j.sid;dot.className='d-dot on';conFitNow();
   conES=new EventSource('/api/console/'+conSid+'/stream');
   conES.onmessage=e=>{const m=JSON.parse(e.data);
     if(m.d){const b=atob(m.d),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);conTerm.write(u);}
@@ -2282,4 +2306,8 @@ if __name__ == "__main__":
     print("  Dynamic UI: Phan quyen Guest (Read-only) / Admin (Action)")
     print("  Truy cap ngay: http://127.0.0.1:5000")
     print("=" * 60)
+    # HTTP/1.1 keep-alive: trinh duyet dung lai ket noi TCP cho cac request
+    # lien tiep (Console gui moi phim go la 1 request) thay vi mo ket noi moi.
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

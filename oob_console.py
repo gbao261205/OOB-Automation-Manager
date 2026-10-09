@@ -94,6 +94,14 @@ class ConsoleSession:
             self.close(f"Mat ket noi khi gui: {e}")
             return False
 
+    def resize(self, cols, rows):
+        """Bao kich thuoc terminal cho phien SSH (lenh dai khong bi xuong dong sai)."""
+        try:
+            if isinstance(self.sess, oob_lib.MiniSSH):
+                self.sess._shell.resize_pty(width=int(cols), height=int(rows))
+        except Exception:
+            pass
+
     # ---- doc tho tu socket ----
     def _recv_raw(self):
         s = self.sess
@@ -143,6 +151,7 @@ def _connect_and_pivot(cs, cfg, oob_ip, opt, creds):
     if cs.sess is None:
         cs.close(f"Khong dang nhap duoc OOB: {last_err}")
         return
+    _tune_socket(cs.sess)
 
     # Bo phan banner/prompt da doc trong luc dang nhap (con nam trong buffer).
     cs.sess.buffer = b""
@@ -161,6 +170,19 @@ def _connect_and_pivot(cs, cfg, oob_ip, opt, creds):
     cs.info(f"Pivot: {cmd}  (Enter neu man hinh chua hien prompt)")
     cs.send((cmd + "\r").encode())
     threading.Thread(target=cs.reader_loop, daemon=True).start()
+
+
+def _tune_socket(sess):
+    """Tat Nagle (TCP_NODELAY): moi phim go la 1 goi nho - mac dinh TCP giu lai
+    cho gom goi/ACK (40-200ms) lam go phim bi khung."""
+    try:
+        if isinstance(sess, oob_lib.MiniSSH):
+            sock = sess._client.get_transport().sock
+        else:
+            sock = sess.sock
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 
 
 def open_console(cfg, owner, oob_ip, key, opt, alias, creds):
