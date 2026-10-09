@@ -601,7 +601,48 @@ def fetch_hostname_via_auto(host, ssh_port, telnet_port,
             pass
         tn.close()
 
-def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, updates_list, timeout=10, print_fn=None, dry_run=True):
+# Vertiv ACS khong cho 2 port trung port_name (vd re0/re1 cua cung 1 thiet bi
+# deu tra ve 1 hostname) -> danh so: "X", "X_2", "X_3"...
+VERTIV_DUP_SEP = "_"
+_VERTIV_DUP_RE = re.compile(re.escape(VERTIV_DUP_SEP) + r"(\d+)$")
+
+def unique_port_name(name, taken):
+    """Tra ve `name` neu chua bi dung, nguoc lai name_2, name_3... (so sanh
+    khong phan biet hoa thuong, giong ACS)."""
+    low = {t.lower() for t in taken if t}
+    if name.lower() not in low:
+        return name
+    n = 2
+    while f"{name}{VERTIV_DUP_SEP}{n}".lower() in low:
+        n += 1
+    return f"{name}{VERTIV_DUP_SEP}{n}"
+
+def strip_dup_suffix(name):
+    """'X_2' -> 'X' (bo hau to do unique_port_name them vao)."""
+    return _VERTIV_DUP_RE.sub("", name or "")
+
+def _read_vertiv_port_names(tn):
+    """{port: port_name} tu 'show' trong /ports/serial_ports (tu qua trang
+    '-- MORE --')."""
+    tn.write("cd /ports/serial_ports/")
+    tn.read_until("cli->", timeout=5)
+    tn.write("show")
+    out = ""
+    for _ in range(30):
+        chunk = tn.read_until(["cli->", "MORE"], timeout=5)
+        out += chunk
+        if "MORE" in chunk and "cli->" not in chunk:
+            tn.write_raw(b" ")
+            continue
+        break
+    names = {}
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\d+)\s+ttyS\d+\s+(\S+)", line)
+        if m:
+            names[m.group(1)] = m.group(2)
+    return names
+
+def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, updates_list, timeout=10, print_fn=None, dry_run=True, applied=None):
     """
     Dành riêng cho Vertiv ACS8000: Đăng nhập tài khoản Administrator qua SSH,
     chuyển tới từng port và đổi port_name.
@@ -610,6 +651,9 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
     if not updates_list:
         return True
 
+    # applied (dict, tuy chon): {port: ten THUC SU da dat} - co the khac ten de
+    # nghi neu thiet bi da co port khac trung ten (danh so them).
+    if applied is None: applied = {}
     if print_fn:
         print_fn(f"[yellow][DRY-RUN / MOCK PUSH][/] Gia lap ket noi SSH Admin (User: {username}) toi Vertiv {host}...")
         for _m_name, k, new_desc in updates_list:
@@ -627,6 +671,10 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
     try:
         tn.read_until("cli->", timeout=5)
         all_success = True
+        try:
+            dev_names = _read_vertiv_port_names(tn)
+        except Exception:
+            dev_names = {}
         def _bad(out):
             low = out.lower()
             return "error" in low or "invalid" in low or "not found" in low or "failed" in low
@@ -636,6 +684,12 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
             #   cd cas/                         -> [serial_ports/cas]
             #   set port_name="..."            (port_name chi co trong cas/)
             # 'port' = so port vat ly (key lay tu 'show' trong /access).
+            k = str(k)
+            taken = [n for p, n in dev_names.items() if p != k]
+            final = unique_port_name(new_desc, taken)
+            if final != new_desc and print_fn:
+                print_fn(f"[yellow][!][/] Vertiv {host}: ten '{new_desc}' da co o port khac -> dat port {k} la '{final}'")
+            new_desc = final
             tn.write("cd /")
             tn.read_until("cli->", timeout=5)
             tn.write(f"cd /ports/serial_ports/{k}/")
@@ -674,8 +728,10 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
             if not m or m.group(1).strip() != new_desc:
                 if print_fn: print_fn(f"[red][LOI][/] Vertiv {host}: port {k} sau commit van la '{m.group(1).strip() if m else '?'}'")
                 all_success = False
-            elif print_fn:
-                print_fn(f"[green][OK][/] Vertiv {host}: port {k} -> {new_desc}")
+            else:
+                dev_names[k] = new_desc
+                applied[k] = new_desc
+                if print_fn: print_fn(f"[green][OK][/] Vertiv {host}: port {k} -> {new_desc}")
         return all_success
     except Exception:
         return False
@@ -686,7 +742,7 @@ def push_vertiv_port_names(host, ssh_port, telnet_port, username, password, upda
             pass
         tn.close()
 
-def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, updates_list, timeout=10, vendor="cisco", cfg=None, print_fn=None, dry_run=True):
+def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enable_password, updates_list, timeout=10, vendor="cisco", cfg=None, print_fn=None, dry_run=True, applied=None):
     """
     Kết nối, ghi đè cấu hình cho Cisco IOS hoặc Vertiv ACS8000.
     (Mặc định dry_run=True: Chỉ IN RA màn hình câu lệnh dự định gửi chứ KHÔNG gửi thật)
@@ -701,7 +757,7 @@ def push_menu_descriptions(host, ssh_port, telnet_port, username, password, enab
             if print_fn:
                 print_fn(f"[red][LOI][/] Chua cau hinh Vertiv Admin Username/Password trong Cau hinh he thong!")
             return False
-        return push_vertiv_port_names(host, ssh_port, telnet_port, admin_user, admin_pass, updates_list, timeout=timeout, print_fn=print_fn, dry_run=dry_run)
+        return push_vertiv_port_names(host, ssh_port, telnet_port, admin_user, admin_pass, updates_list, timeout=timeout, print_fn=print_fn, dry_run=dry_run, applied=applied)
 
     if print_fn:
         print_fn(f"[yellow][DRY-RUN / MOCK PUSH][/] Gia lap ket noi ({username}) toi Cisco {host}...")
